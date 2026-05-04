@@ -115,10 +115,21 @@ int main(int argc, char* argv[])
         anim.SetConstantPosition(ctrl, 15 + 5 * i, 10);
     }
 
-    // Ping from H0 to H3
-    PingHelper pingHelper(Ipv4Address(hostIpIfaces.GetAddress(3)));
-    pingHelper.SetAttribute("VerboseMode", EnumValue(Ping::VERBOSE));
-    ApplicationContainer pingApps = pingHelper.Install(hosts.Get(0));
+    // Each host pings a random other host
+    Ptr<UniformRandomVariable> rand = CreateObject<UniformRandomVariable>();
+    ApplicationContainer pingApps;
+    for (uint32_t i = 0; i < hosts.GetN(); ++i)
+    {
+        uint32_t dst = i;
+        while (dst == i)
+        {
+            dst = rand->GetInteger(0, hosts.GetN() - 1);
+        }
+
+        PingHelper pingHelper(Ipv4Address(hostIpIfaces.GetAddress(dst)));
+        pingHelper.SetAttribute("VerboseMode", EnumValue(Ping::VERBOSE));
+        pingApps.Add(pingHelper.Install(hosts.Get(i)));
+    }
     pingApps.Start(Seconds(2.0));
     pingApps.Stop(Seconds(simTime - 1.0));
     
