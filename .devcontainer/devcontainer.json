@@ -1,0 +1,47 @@
+{
+  "name": "ns-3 OFSwitch13",
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "context": ".."
+  },
+  "workspaceFolder": "/workspace/ns-3.40",
+  "workspaceMount": "source=${localWorkspaceFolder}/src,target=/workspace/ns-3.40/scratch,type=bind,consistency=cached",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cpptools-extension-pack"
+      ],
+      "settings": {
+        "C_Cpp.default.configurationProvider": "ms-vscode.cpptools",
+        // "C_Cpp.default.intelliSenseMode": "linux-gcc-arm64",
+        // "C_Cpp.default.cppStandard": "c++17",
+        "C_Cpp.default.compilerPath": "/usr/bin/g++",
+        "C_Cpp.default.includePath": [
+          "/workspace/ns-3.40/build/include",
+          "/workspace/ns-3.40/src",
+          "/workspace/ns-3.40/contrib/ofswitch13",
+          "/workspace/ns-3.40/contrib/ofswitch13/lib/bofuss/include",
+          "/usr/include"
+        ],
+        "C_Cpp.default.defines": [
+          "NS3_ASSERT_ENABLE",
+          "NS3_LOG_ENABLE",
+          "HAVE_GSL",
+          "HAVE_LIBXML2",
+          "HAVE_SQLITE3",
+          "NS3_OFSWITCH13"
+        ],
+        "C_Cpp.default.browse": {
+          "path": [
+            "/workspace/ns-3.40/src",
+            "/workspace/ns-3.40/contrib",
+            "/workspace/ns-3.40/build/include"
+          ],
+          "limitSymbolsToIncludedHeaders": true
+        }
+      }
+    }
+  },
+  "remoteUser": "root"
+}

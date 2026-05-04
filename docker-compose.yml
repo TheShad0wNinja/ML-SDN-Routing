@@ -1,0 +1,12 @@
+version: "3.8"
+services:
+  ns3:
+    build: .
+    image: ns3-ofswitch13
+    container_name: ns3-sdn
+    volumes:
+      - ./src:/workspace/ns-3.40/scratch
+    working_dir: /workspace/ns-3.40/scratch
+    stdin_open: true
+    tty: true
+    command: /bin/bash
