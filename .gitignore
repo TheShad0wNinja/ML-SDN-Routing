@@ -1,0 +1,35 @@
+
+# macOS
+# Icon must end with two question marks to match the Finder-created file
+Icon?
+
+# General macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Thumbnails, resource forks
+._*
+
+# Spotlight, Time Machine and other system files
+.Spotlight-V100/
+.Trashes/
+.fseventsd/
+.TemporaryItems/
+.DocumentRevisions-V100/
+
+# Volume icon
+.VolumeIcon.icns
+
+# Apple specific folders
+.AppleDB/
+.AppleDesktop/
+Network Trash Folder/
+Temporary Items/
+.apdisk
+
+# macOS metadata files created by editors/processes
+.HotFiles.btree
+
+
+**pycache**

@@ -6,6 +6,11 @@
   },
   "workspaceFolder": "/workspace/ns-3.40",
   "workspaceMount": "source=${localWorkspaceFolder}/src,target=/workspace/ns-3.40/scratch,type=bind,consistency=cached",
+  "runArgs": [
+    "--cap-add=NET_ADMIN",
+    "--privileged",
+    "--device=/dev/net/tun"
+  ],
   "customizations": {
     "vscode": {
       "extensions": [
@@ -14,8 +19,6 @@
       ],
       "settings": {
         "C_Cpp.default.configurationProvider": "ms-vscode.cpptools",
-        // "C_Cpp.default.intelliSenseMode": "linux-gcc-arm64",
-        // "C_Cpp.default.cppStandard": "c++17",
         "C_Cpp.default.compilerPath": "/usr/bin/g++",
         "C_Cpp.default.includePath": [
           "/workspace/ns-3.40/build/include",

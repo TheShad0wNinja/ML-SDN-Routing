@@ -9,4 +9,7 @@ services:
     working_dir: /workspace/ns-3.40/scratch
     stdin_open: true
     tty: true
+    cap_add:
+      - NET_ADMIN
+    privileged: true
     command: /bin/bash

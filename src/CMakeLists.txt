@@ -1,27 +1,3 @@
-# file(GLOB scratch_sources ${CMAKE_CURRENT_SOURCE_DIR}/*.cc)
-
-# foreach(source ${scratch_sources})
-#   get_filename_component(name ${source} NAME_WE)
-#   build_exec(
-#     NAME ${name}
-#     SOURCE_FILES ${source}
-#     LIBRARIES_TO_LINK
-#       ${libcore}
-#       ${libnetwork}
-#       ${libinternet}
-#       ${libinternet-apps}
-#       ${libofswitch13}
-#       ${libcsma}
-#       ${libpoint-to-point}
-#       ${libvirtual-net-device}
-#       ${libbridge}
-#       ${libtraffic-control}
-#       ${libapplications}
-#       ${libstats}
-#       ${libmobility}
-#   )
-# endforeach()
-
 set(target_prefix scratch_)
 
 function(create_scratch source_files)
@@ -82,7 +58,7 @@ function(create_scratch source_files)
           EXECNAME ${scratch_name}
           EXECNAME_PREFIX ${target_prefix}
           SOURCE_FILES "${source_files}"
-          LIBRARIES_TO_LINK "${ns3-libs}" "${ns3-contrib-libs}"
+          LIBRARIES_TO_LINK "${ns3-libs}" "${ns3-contrib-libs}" zmq
           EXECUTABLE_DIRECTORY_PATH ${scratch_directory}/
   )
 endfunction()

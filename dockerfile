@@ -7,7 +7,7 @@ ENV LC_ALL=C.UTF-8
 # Install dependencies
 RUN apt-get update && apt-get install -y \
     build-essential g++ gcc \
-    python3 python3-dev python3-pip \
+    python3 python3-dev python3-pip python3-setuptools \
     cmake ninja-build \
     git wget vim \
     pkg-config autoconf libtool \
@@ -15,8 +15,22 @@ RUN apt-get update && apt-get install -y \
     libgsl-dev libgtk-3-dev \
     sqlite3 libsqlite3-dev \
     libxml2 libxml2-dev \
+    libpcap-dev \
     tcpdump \
+    libzmq3-dev \ 
+    iproute2 uml-utilities bridge-utils \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Ryu with pinned compatible versions
+RUN pip3 install --no-cache-dir \
+    werkzeug==2.0.3 \
+    eventlet==0.41.0 \
+    dnspython==2.8.0 \
+    ryu==4.34 \
+    pyzmq==27.1.0
+
+# Patch eventless
+RUN sed -i -e 's/from eventlet.wsgi import ALREADY_HANDLED/import eventlet.wsgi/g' -e 's/_ALREADY_HANDLED = ALREADY_HANDLED/_ALREADY_HANDLED = getattr(getattr(eventlet.wsgi, "WSGI_LOCAL", None), "already_handled", None)/g' $(python3 -c "import ryu.app.wsgi as w; print(w.__file__)")
 
 WORKDIR /workspace
 
