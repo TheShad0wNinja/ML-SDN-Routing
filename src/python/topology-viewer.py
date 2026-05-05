@@ -11,6 +11,10 @@ import os
 import time
 from datetime import datetime
 
+_SCRATCH_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_DEFAULT_STATE = os.path.join(_SCRATCH_ROOT, "data", "state", "sdn_state.json")
+_DEFAULT_HTML = os.path.join(_SCRATCH_ROOT, "data", "html", "topology.html")
+
 # ---------------------------------------------------------------------------
 # HTML template using vis-network (cdnjs - stable CDN)
 # ---------------------------------------------------------------------------
@@ -409,8 +413,8 @@ def generate_html(state, output_path):
 
 def main():
     parser = argparse.ArgumentParser(description="SDN topology HTML generator")
-    parser.add_argument("--input", default="./sdn_state.json", help="Path to controller state JSON")
-    parser.add_argument("--output", default="./topology.html", help="Path to write HTML")
+    parser.add_argument("--input", default=_DEFAULT_STATE, help="Path to controller state JSON")
+    parser.add_argument("--output", default=_DEFAULT_HTML, help="Path to write HTML")
     parser.add_argument("--watch", action="store_true", help="Regenerate HTML every 2 seconds")
     args = parser.parse_args()
 

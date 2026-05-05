@@ -9,6 +9,8 @@ from collections import defaultdict
 from ryu.ofproto import ofproto_v1_3
 from ryu.ofproto import ofproto_v1_3_parser
 
+_SCRATCH_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 
 class DummyDatapath:
     ofproto = ofproto_v1_3
@@ -52,7 +54,7 @@ class SDNController:
     LLDP_DST = bytes.fromhex("0180c200000e")
     LLDP_ETH = 0x88cc
     ETH_IPV4 = 0x0800
-    _STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sdn_state.json")
+    _STATE_PATH = os.path.join(_SCRATCH_ROOT, "data", "state", "sdn_state.json")
     # Stable vis-network node id for the logical control plane (Python + ZMQ bridge).
     _CONTROLLER_NODE_ID = "sdn-controller"
 
@@ -247,7 +249,7 @@ class SDNController:
             "controller": {
                 "id": self._CONTROLLER_NODE_ID,
                 "label": "SDN Controller",
-                "detail": "External Python controller (Ryu) via ZMQ; ns-3 ZmqOpenFlowController bridge to switches.",
+                "detail": "External Python controller (Ryu) via ZMQ; ns3 ZmqOpenFlowController bridge to switches.",
             },
             "control_links": [{"dpid": d} for d in sorted(self.registered_dpids)],
             "stats": {
@@ -259,6 +261,7 @@ class SDNController:
             "timestamp": now,
         }
         try:
+            os.makedirs(os.path.dirname(self._STATE_PATH) or ".", exist_ok=True)
             with open(self._STATE_PATH, "w", encoding="utf-8") as f:
                 json.dump(state, f)
         except OSError:

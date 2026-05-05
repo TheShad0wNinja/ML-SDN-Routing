@@ -58,7 +58,7 @@ function(create_scratch source_files)
           EXECNAME ${scratch_name}
           EXECNAME_PREFIX ${target_prefix}
           SOURCE_FILES "${source_files}"
-          LIBRARIES_TO_LINK "${ns3-libs}" "${ns3-contrib-libs}" zmq
+          LIBRARIES_TO_LINK "${ns3-libs}" "${ns3-contrib-libs}"
           EXECUTABLE_DIRECTORY_PATH ${scratch_directory}/
   )
 endfunction()
@@ -85,6 +85,17 @@ foreach(entry ${scratch_subdirectories})
 endforeach()
 
 foreach(subdir ${scratch_subdirectories})
+  # libs + scenarios are added in deterministic order at the end of this file
+  if(subdir STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}/libs")
+    continue()
+  endif()
+  if(subdir STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}/scenarios")
+    continue()
+  endif()
+  string(FIND "${subdir}" "${CMAKE_CURRENT_SOURCE_DIR}/scenarios/" _sc_pos)
+  if(NOT _sc_pos EQUAL -1)
+    continue()
+  endif()
   if(EXISTS ${subdir}/CMakeLists.txt)
     # If the subdirectory contains a CMakeLists.txt file
     # we let the CMake file manage the source files
@@ -99,3 +110,10 @@ foreach(subdir ${scratch_subdirectories})
     create_scratch("${scratch_sources}")
   endif()
 endforeach()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libs/CMakeLists.txt")
+  add_subdirectory(libs)
+endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/scenarios/CMakeLists.txt")
+  add_subdirectory(scenarios)
+endif()

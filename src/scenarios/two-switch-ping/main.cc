@@ -3,10 +3,10 @@
 #include <ns3/csma-module.h>
 #include <ns3/internet-apps-module.h>
 #include <ns3/internet-module.h>
+#include <ns3/mobility-module.h>
+#include <ns3/netanim-module.h>
 #include <ns3/network-module.h>
 #include <ns3/ofswitch13-module.h>
-#include <ns3/netanim-module.h>
-#include <ns3/mobility-module.h>
 
 using namespace ns3;
 
@@ -22,49 +22,49 @@ int main(int argc, char* argv[])
     cmd.Parse(argc, argv);
 
     NS_LOG_INFO("Creating nodes...");
-    
+
     NodeContainer hosts;
-    hosts.Create(4); 
-    
+    hosts.Create(4);
+
     NodeContainer switches;
-    switches.Create(2); 
-    
+    switches.Create(2);
+
     NodeContainer controllers;
-    controllers.Create(1); 
+    controllers.Create(1);
 
     NS_LOG_INFO("Building topology...");
-    
+
     CsmaHelper csma;
     csma.SetChannelAttribute("DataRate", StringValue("100Mbps"));
     csma.SetChannelAttribute("Delay", StringValue("1ms"));
-    
-    NetDeviceContainer swPorts[2]; 
+
+    NetDeviceContainer swPorts[2];
     NetDeviceContainer hostPorts;
     NetDeviceContainer dev;
 
     // h0 to sw0
     dev = csma.Install(NodeContainer(hosts.Get(0), switches.Get(0)));
-    hostPorts.Add(dev.Get(0)); 
+    hostPorts.Add(dev.Get(0));
     swPorts[0].Add(dev.Get(1));
 
     // h1 to sw0
     dev = csma.Install(NodeContainer(hosts.Get(1), switches.Get(0)));
-    hostPorts.Add(dev.Get(0)); 
+    hostPorts.Add(dev.Get(0));
     swPorts[0].Add(dev.Get(1));
 
     // h2 to sw1
     dev = csma.Install(NodeContainer(hosts.Get(2), switches.Get(1)));
-    hostPorts.Add(dev.Get(0)); 
+    hostPorts.Add(dev.Get(0));
     swPorts[1].Add(dev.Get(1));
 
     // h3 to sw1
     dev = csma.Install(NodeContainer(hosts.Get(3), switches.Get(1)));
-    hostPorts.Add(dev.Get(0)); 
+    hostPorts.Add(dev.Get(0));
     swPorts[1].Add(dev.Get(1));
 
     // sw0 to sw1
     dev = csma.Install(NodeContainer(switches.Get(0), switches.Get(1)));
-    swPorts[0].Add(dev.Get(0)); 
+    swPorts[0].Add(dev.Get(0));
     swPorts[1].Add(dev.Get(1));
 
     // Install TCP/IP stack into hosts
@@ -79,14 +79,14 @@ int main(int argc, char* argv[])
 
     Ptr<OFSwitch13InternalHelper> internal = CreateObject<OFSwitch13InternalHelper>();
     Ptr<ZmqOpenFlowController> controllerApp = CreateObject<ZmqOpenFlowController>();
-    
+
     // Install the controller app on the controller node
     controllers.Get(0)->AddApplication(controllerApp);
     controllerApp->SetStartTime(Seconds(0));
-    
+
     // Register the node as the OpenFlow controller
     internal->InstallController(controllers.Get(0));
-    
+
     internal->InstallSwitch(switches.Get(0), swPorts[0]);
     internal->InstallSwitch(switches.Get(1), swPorts[1]);
     internal->CreateOpenFlowChannels();
@@ -98,20 +98,23 @@ int main(int argc, char* argv[])
     mobility.Install(switches);
     mobility.Install(controllers);
 
-    AnimationInterface anim("scratch/zmq-controller.xml");
-    for(uint32_t i=0; i<hosts.GetN(); i++) {
+    AnimationInterface anim("scratch/data/traces/netanim-zmq.xml");
+    for (uint32_t i = 0; i < hosts.GetN(); i++)
+    {
         auto host = hosts.Get(i);
-        anim.UpdateNodeColor(host, 255,255,255);
+        anim.UpdateNodeColor(host, 255, 255, 255);
         anim.SetConstantPosition(host, 5 + 10 * i, 30);
     }
-    for(uint32_t i=0; i<switches.GetN(); i++) {
+    for (uint32_t i = 0; i < switches.GetN(); i++)
+    {
         auto sw = switches.Get(i);
-        anim.UpdateNodeColor(sw , 0,255,255);
+        anim.UpdateNodeColor(sw, 0, 255, 255);
         anim.SetConstantPosition(sw, 10 + 10 * i, 20);
     }
-    for(uint32_t i=0; i<controllers.GetN(); i++) {
+    for (uint32_t i = 0; i < controllers.GetN(); i++)
+    {
         auto ctrl = controllers.Get(i);
-        anim.UpdateNodeColor(ctrl, 255,255,0);
+        anim.UpdateNodeColor(ctrl, 255, 255, 0);
         anim.SetConstantPosition(ctrl, 15 + 5 * i, 10);
     }
 
@@ -132,8 +135,9 @@ int main(int argc, char* argv[])
     }
     pingApps.Start(Seconds(2.0));
     pingApps.Stop(Seconds(simTime - 1.0));
-    
-    if (trace) {
+
+    if (trace)
+    {
         internal->EnableOpenFlowPcap("of13");
         internal->EnableDatapathStats("of13-stats");
     }
