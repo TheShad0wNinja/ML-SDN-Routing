@@ -197,7 +197,7 @@ const options = {
     width: 2,
     color: { color: '#475569', highlight: '#38bdf8', hover: '#94a3b8' },
     smooth: { type: 'continuous' },
-    font: { color: '#94a3b8', size: 11, align: 'middle', background: { enabled: true, color: '#0f172a' } }
+    font: { color: '#111', size: 14, align: 'middle', background: { enabled: true, color: '#00f' } }
   },
   physics: {
     stabilization: { iterations: 200 },
