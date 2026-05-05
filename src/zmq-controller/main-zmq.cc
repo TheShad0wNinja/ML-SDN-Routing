@@ -15,7 +15,7 @@ NS_LOG_COMPONENT_DEFINE("ZmqControllerMain");
 int main(int argc, char* argv[])
 {
     bool trace = false;
-    double simTime = 30.0;
+    double simTime = 300;
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("trace", "Enable pcap and datapath stats traces", trace);
