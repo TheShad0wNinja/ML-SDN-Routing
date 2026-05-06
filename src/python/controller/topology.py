@@ -10,6 +10,16 @@ class Topology:
         self.links.add((d1, p1, d2, p2))
         self.links.add((d2, p2, d1, p1))
 
+    def remove_port(self, dpid: int, port: int) -> None:
+        self.links = {
+            link
+            for link in self.links
+            if not (
+                (link[0] == dpid and link[1] == port)
+                or (link[2] == dpid and link[3] == port)
+            )
+        }
+
     def shortest_path(self, src: int, dst: int) -> list[int] | None:
         graph: dict[int, set[int]] = defaultdict(set)
         for d1, p1, d2, p2 in self.links:

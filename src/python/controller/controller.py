@@ -4,6 +4,7 @@ import struct
 from collections import defaultdict
 
 import zmq
+from ryu.ofproto import ofproto_v1_3
 from ryu.ofproto import ofproto_v1_3_parser
 
 from . import constants as C
@@ -14,6 +15,7 @@ from .ipv4 import learn_src_ipv4
 from .lldp import build_lldp_frame, parse_lldp_frame
 from .openflow_builders import (
     build_flow_mod,
+    build_flow_delete,
     build_flood_packet_out,
     build_lldp_packet_out,
     build_packet_out,
@@ -77,8 +79,15 @@ class SDNController:
             return wire.pack_reply([])
 
         name = msg.__class__.__name__
+
+        # Log packet type to a simple text file
+        with open("packet_types.log", "a") as f:
+            f.write(f"{name}\n")
+
         if name == "OFPPacketIn":
             return self._handle_packet_in(dpid, msg)
+        if name == "OFPPortStatus":
+            return self._handle_port_status(dpid, msg)
         if name == "OFPPortStatsReply":
             return self._handle_port_stats(dpid, msg)
         return wire.pack_reply([])
@@ -192,6 +201,50 @@ class SDNController:
                 "tx_bytes": stat.tx_bytes,
             }
         print(f"[STATS] DPID {dpid} — {len(msg.body)} ports")
+        self.state.maybe_dump(
+            topo_links=self.topo.links,
+            registered_dpids=self.registered_dpids,
+            mac_to_loc=self.mac_to_loc,
+            mac_to_ip=self.mac_to_ip,
+            port_stats=self.port_stats,
+        )
+        return wire.pack_reply([])
+
+    def _handle_port_status(self, dpid: int, msg) -> bytes:
+        desc = getattr(msg, "desc", None)
+        port_no = getattr(desc, "port_no", None)
+        if port_no is None:
+            return wire.pack_reply([])
+
+        reason = getattr(msg, "reason", None)
+        port_is_down = bool(getattr(desc, "state", 0) & ofproto_v1_3.OFPPS_LINK_DOWN)
+        port_was_removed = reason == ofproto_v1_3.OFPPR_DELETE or port_is_down
+
+        if port_was_removed:
+            self.topo.remove_port(dpid, port_no)
+
+            stale_macs = [mac for mac, loc in self.mac_to_loc.items() if loc == (dpid, port_no)]
+            for mac in stale_macs:
+                self.mac_to_loc.pop(mac, None)
+                self.mac_to_ip.pop(mac, None)
+
+            if dpid in self.port_stats:
+                self.port_stats[dpid].pop(port_no, None)
+
+            self.switch_ports[dpid].discard(port_no)
+
+            print(f"[PORT] Removed dpid={dpid} port={port_no} reason={reason}")
+            self.state.maybe_dump(
+                topo_links=self.topo.links,
+                registered_dpids=self.registered_dpids,
+                mac_to_loc=self.mac_to_loc,
+                mac_to_ip=self.mac_to_ip,
+                port_stats=self.port_stats,
+            )
+            return wire.pack_reply([(dpid, build_flow_delete())])
+
+        self.switch_ports[dpid].add(port_no)
+        print(f"[PORT] Added/updated dpid={dpid} port={port_no} reason={reason}")
         self.state.maybe_dump(
             topo_links=self.topo.links,
             registered_dpids=self.registered_dpids,

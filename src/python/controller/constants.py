@@ -1,7 +1,7 @@
 import os
 
 
-_SCRATCH_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_SCRATCH_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # -----------------------------
 # ZMQ wire / trigger messages
@@ -52,7 +52,7 @@ OF_BUFFER_ID_NO_BUFFER_U32 = 0xFFFFFFFF
 # -----------------------------
 # Controller behavior defaults
 # -----------------------------
-STATE_DUMP_MIN_INTERVAL_SECONDS = 0.25
+STATE_DUMP_MIN_INTERVAL_SECONDS = 1
 STATE_PATH = os.path.join(_SCRATCH_ROOT, "data", "state", "sdn_state.json")
 
 # Stable vis-network node id for the logical control plane (Python + ZMQ bridge).

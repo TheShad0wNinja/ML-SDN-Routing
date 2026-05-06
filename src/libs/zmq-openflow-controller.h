@@ -26,6 +26,10 @@ protected:
                            Ptr<const RemoteSwitch> swtch,
                            uint32_t xid) override;
 
+    ofl_err HandlePortStatus(struct ofl_msg_port_status* msg,
+                             Ptr<const RemoteSwitch> swtch,
+                             uint32_t xid) override;
+
     ofl_err HandleMultipartReply(struct ofl_msg_multipart_reply_header* msg,
                                  Ptr<const RemoteSwitch> swtch,
                                  uint32_t xid) override;

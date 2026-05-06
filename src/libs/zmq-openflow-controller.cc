@@ -132,6 +132,27 @@ ofl_err ZmqOpenFlowController::HandlePacketIn(struct ofl_msg_packet_in* msg,
     return 0;
 }
 
+ofl_err ZmqOpenFlowController::HandlePortStatus(struct ofl_msg_port_status* msg,
+                                                Ptr<const RemoteSwitch> swtch,
+                                                uint32_t xid) {
+    uint64_t dpid = swtch->GetDpId();
+    uint8_t* tx_buf = nullptr;
+    size_t tx_len = 0;
+
+    ofl_err pack_err = ofl_msg_pack((struct ofl_msg_header*)msg,
+                                    xid,
+                                    &tx_buf,
+                                    &tx_len,
+                                    nullptr);
+
+    if (!pack_err) {
+        ExchangeWithPython(dpid, tx_buf, tx_len);
+        free(tx_buf);
+    }
+
+    return OFSwitch13Controller::HandlePortStatus(msg, swtch, xid);
+}
+
 ofl_err ZmqOpenFlowController::HandleMultipartReply(
     struct ofl_msg_multipart_reply_header* msg,
     Ptr<const RemoteSwitch> swtch,

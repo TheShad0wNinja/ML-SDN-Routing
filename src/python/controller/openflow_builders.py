@@ -48,6 +48,22 @@ def build_flow_mod(eth_dst: str, out_port: int, defaults: FlowDefaults = FlowDef
     return fm.buf
 
 
+def build_flow_delete() -> bytes:
+    parser = ofproto_v1_3_parser
+    ofp = ofproto_v1_3
+
+    fm = parser.OFPFlowMod(
+        datapath=DummyDatapath(),
+        command=ofp.OFPFC_DELETE,
+        table_id=C.OF_FLOW_TABLE_ID,
+        out_port=ofp.OFPP_ANY,
+        out_group=ofp.OFPG_ANY,
+        match=parser.OFPMatch(),
+    )
+    fm.serialize()
+    return fm.buf
+
+
 def build_packet_out(msg, out_port: int) -> bytes:
     parser = ofproto_v1_3_parser
     ofp = ofproto_v1_3
