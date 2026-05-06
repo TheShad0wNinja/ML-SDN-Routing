@@ -4,7 +4,7 @@ string(REPLACE "${PROJECT_SOURCE_DIR}" "${CMAKE_OUTPUT_DIRECTORY}"
 )
 
 build_exec(
-  EXECNAME main-zmq
+  EXECNAME two-switch-ping
   SOURCE_FILES main.cc
   LIBRARIES_TO_LINK scratch_zmq_openflow
   EXECUTABLE_DIRECTORY_PATH ${_scenario_out_dir}/

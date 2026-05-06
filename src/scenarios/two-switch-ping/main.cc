@@ -14,8 +14,8 @@ NS_LOG_COMPONENT_DEFINE("ZmqControllerMain");
 
 int main(int argc, char* argv[])
 {
-    bool trace = false;
-    double simTime = 600;
+    bool trace = true;
+    double simTime = 3600;
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("trace", "Enable pcap and datapath stats traces", trace);
@@ -130,7 +130,7 @@ int main(int argc, char* argv[])
         // }
 
         PingHelper pingHelper(Ipv4Address(hostIpIfaces.GetAddress(dst)));
-        pingHelper.SetAttribute("VerboseMode", EnumValue(Ping::VERBOSE));
+        pingHelper.SetAttribute("VerboseMode", EnumValue(Ping::QUIET));
         pingApps.Add(pingHelper.Install(hosts.Get(i)));
     }
     pingApps.Start(Seconds(2.0));
