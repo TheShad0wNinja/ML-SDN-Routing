@@ -1,16 +1,9 @@
 {
   "name": "ns-3 OFSwitch13",
-  "build": {
-    "dockerfile": "../Dockerfile",
-    "context": ".."
-  },
+  "dockerComposeFile": "../docker-compose.yml",
+  "service": "ns3",
   "workspaceFolder": "/workspace/ns-3.40",
-  "workspaceMount": "source=${localWorkspaceFolder}/src,target=/workspace/ns-3.40/scratch,type=bind,consistency=cached",
-  "runArgs": [
-    "--cap-add=NET_ADMIN",
-    "--privileged",
-    "--device=/dev/net/tun"
-  ],
+  "shutdownAction": "stopCompose",
   "customizations": {
     "vscode": {
       "extensions": [

@@ -4,10 +4,14 @@
 #include "ns3/ofswitch13-controller.h"
 #include "ns3/simulator.h"
 #include "ns3/nstime.h"
+#include "topology.h"
 #include <zmq.hpp>
 #include <memory>
 #include <map>
 #include <cstdint>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 
 namespace ns3 {
 
@@ -44,6 +48,14 @@ private:
     std::unique_ptr<zmq::context_t> m_zmqContext;
     std::unique_ptr<zmq::socket_t>  m_socket; // REQ
     std::map<uint64_t, Ptr<const RemoteSwitch>> m_switchMap;
+    // Controller-side topology and learned state
+    Topology m_topology;
+    // MAC (48-bit) -> (dpid, port)
+    std::unordered_map<uint64_t, std::pair<uint64_t, uint32_t>> m_macToLoc;
+    // switch dpid -> set of known link ports
+    std::unordered_map<uint64_t, std::unordered_set<uint32_t>> m_switchPorts;
+    // per-switch per-port stats (placeholder store): dpid -> (port -> value)
+    std::unordered_map<uint64_t, std::unordered_map<uint32_t, uint64_t>> m_portStats;
 };
 
 } // namespace ns3

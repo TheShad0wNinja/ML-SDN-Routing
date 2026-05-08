@@ -30,7 +30,7 @@ RUN pip3 install --no-cache-dir \
     pyzmq==27.1.0
 
 # Patch eventless
-RUN sed -i -e 's/from eventlet.wsgi import ALREADY_HANDLED/import eventlet.wsgi/g' -e 's/_ALREADY_HANDLED = ALREADY_HANDLED/_ALREADY_HANDLED = getattr(getattr(eventlet.wsgi, "WSGI_LOCAL", None), "already_handled", None)/g' $(python3 -c "import ryu.app.wsgi as w; print(w.__file__)")
+# RUN sed -i -e 's/from eventlet.wsgi import ALREADY_HANDLED/import eventlet.wsgi/g' -e 's/_ALREADY_HANDLED = ALREADY_HANDLED/_ALREADY_HANDLED = getattr(getattr(eventlet.wsgi, "WSGI_LOCAL", None), "already_handled", None)/g' $(python3 -c "import ryu.app.wsgi as w; print(w.__file__)")
 
 WORKDIR /workspace
 
@@ -53,7 +53,7 @@ RUN set -e; \
     patch -p1 < contrib/ofswitch13/utils/ofswitch13-3_39.patch
 
 # Configure and build
-RUN ./ns3 configure --enable-examples --enable-tests
+RUN ./ns3 configure --disable-examples --disable-tests
 RUN ./ns3 build
 
 WORKDIR /workspace/ns-3.40/scratch
