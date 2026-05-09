@@ -264,4 +264,59 @@ std::vector<Topology::LinkInfo> Topology::GetAllLinks() const
     return result;
 }
 
+std::unordered_map<uint64_t, std::unordered_set<uint32_t>>
+Topology::ComputeSpanningTree() const
+{
+    std::unordered_map<uint64_t, std::unordered_set<uint32_t>> result;
+    if (m_graph.empty()) return result;
+
+    uint64_t root = m_graph.begin()->first;
+    for (const auto& kv : m_graph) root = std::min(root, kv.first);
+
+    std::unordered_set<uint64_t> visited;
+    std::queue<uint64_t> q;
+    visited.insert(root);
+    q.push(root);
+
+    while (!q.empty()) {
+        uint64_t u = q.front(); q.pop();
+        auto it = m_graph.find(u);
+        if (it == m_graph.end()) continue;
+        for (uint64_t v : it->second) {
+            if (visited.count(v)) continue;
+            visited.insert(v);
+            q.push(v);
+            auto uIt = m_routing.find(u);
+            if (uIt != m_routing.end()) {
+                auto pIt = uIt->second.find(v);
+                if (pIt != uIt->second.end()) result[u].insert(pIt->second);
+            }
+            auto vIt = m_routing.find(v);
+            if (vIt != m_routing.end()) {
+                auto pIt = vIt->second.find(u);
+                if (pIt != vIt->second.end()) result[v].insert(pIt->second);
+            }
+        }
+    }
+    return result;
+}
+
+std::optional<uint64_t> Topology::GetPeerDpid(uint64_t dpid, uint32_t port) const
+{
+    auto it = m_links.find(dpid);
+    if (it == m_links.end()) return std::nullopt;
+    auto pit = it->second.find(port);
+    if (pit == it->second.end()) return std::nullopt;
+    return pit->second.peerDpid;
+}
+
+std::optional<uint32_t> Topology::GetPeerPort(uint64_t dpid, uint32_t port) const
+{
+    auto it = m_links.find(dpid);
+    if (it == m_links.end()) return std::nullopt;
+    auto pit = it->second.find(port);
+    if (pit == it->second.end()) return std::nullopt;
+    return pit->second.peerPort;
+}
+
 } // namespace ns3

@@ -118,22 +118,28 @@ int main(int argc, char* argv[])
         anim.SetConstantPosition(ctrl, 15 + 5 * i, 10);
     }
 
-    // Each host pings a random other host
-    Ptr<UniformRandomVariable> rand = CreateObject<UniformRandomVariable>();
-    ApplicationContainer pingApps;
-    for (uint32_t i = 1; i < hosts.GetN(); ++i)
-    {
-        uint32_t dst = 0;
-        // while (dst == i)
-        // {
-            // dst = rand->GetInteger(0, hosts.GetN() - 1);
-        // }
-
-        PingHelper pingHelper(Ipv4Address(hostIpIfaces.GetAddress(dst)));
+    // Have all nodes seen by controller
+    ApplicationContainer discoveryApps;
+    for (uint32_t i = 0; i < hosts.GetN(); i++) {
+        uint32_t dest = (i + 1) % hosts.GetN();
+        PingHelper pingHelper(Ipv4Address(hostIpIfaces.GetAddress(dest)));
         pingHelper.SetAttribute("VerboseMode", EnumValue(Ping::QUIET));
+        pingHelper.SetAttribute("Count", UintegerValue(1));
+        discoveryApps.Add(pingHelper.Install(hosts.Get(i)));
+    }
+    discoveryApps.Start(Seconds(2.0));
+    discoveryApps.Stop(Seconds(5.0));
+
+    // Actual ping test
+    ApplicationContainer pingApps;
+    for (uint32_t i = 1; i < hosts.GetN(); i++) {
+        uint32_t dest = 0;
+        PingHelper pingHelper(Ipv4Address(hostIpIfaces.GetAddress(dest)));
+        pingHelper.SetAttribute("VerboseMode", EnumValue(Ping::QUIET));
+        pingHelper.SetAttribute("Count", UintegerValue(0));
         pingApps.Add(pingHelper.Install(hosts.Get(i)));
     }
-    pingApps.Start(Seconds(2.0));
+    pingApps.Start(Seconds(5.0));
     pingApps.Stop(Seconds(simTime - 1.0));
 
     if (trace)

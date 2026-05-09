@@ -145,65 +145,17 @@ int main(int argc, char* argv[]) {
 
     internal->CreateOpenFlowChannels();
 
-    // NS_LOG_INFO("Configuring Mobility and NetAnim...");
-    // MobilityHelper mobility;
-    // mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
-    // mobility.Install(hosts);
-    // mobility.Install(switches);
-    // mobility.Install(controllers);
-
-    // Geographic-like coordinates
-    // Switches
-    // Ptr<ListPositionAllocator> positionAlloc = CreateObject<ListPositionAllocator>();
-    // positionAlloc->Add(Vector(10.0, 30.0, 0.0)); // S0
-    // positionAlloc->Add(Vector(30.0, 30.0, 0.0)); // S1
-    // positionAlloc->Add(Vector(50.0, 30.0, 0.0)); // S2
-    // positionAlloc->Add(Vector(70.0, 0.0, 0.0));  // S3
-    // positionAlloc->Add(Vector(50.0, 10.0, 0.0)); // S4
-    // positionAlloc->Add(Vector(70.0, 30.0, 0.0)); // S5
-
-    // // Hosts
-    // positionAlloc->Add(Vector(0.0, 30.0, 0.0));  // H0
-    // positionAlloc->Add(Vector(80.0, 0.0, 0.0));  // H1
-    // positionAlloc->Add(Vector(30.0, 40.0, 0.0)); // H2
-    // positionAlloc->Add(Vector(50.0, 0.0, 0.0));  // H3
-    
-    // // Controller
-    // positionAlloc->Add(Vector(40.0, 50.0, 0.0)); // C0
-
-    // mobility.SetPositionAllocator(positionAlloc);
-    // mobility.Install(hosts);
-    // mobility.Install(switches);
-    // mobility.Install(controllers);
-
-    // AnimationInterface anim("mini-geant.xml");
-    // Switch icons (optional but helpful)
-    // for (uint32_t i = 0; i < 6; ++i) {
-    //     anim.SetConstantPosition(switches.Get(i), positionAlloc->GetNext().x, positionAlloc->GetNext().y);
-    // }
-    // Re-doing it properly to match Node pointers or IDs if needed, 
-    // but anim.SetConstantPosition is redundant if Mobility is installed correctly and updated.
-    // However, for NetAnim, it's often better to just let it pick up from Mobility.
-
-    // if (trace)
-    // {
-    //     internal->EnableOpenFlowPcap("mini-geant-of");
-    //     csmaEdge.EnablePcapAll("mini-geant-host");
-    // }
-
-    // H0 to H1 ping
-    // V4PingHelper pingH0H1(hostIpIfaces.GetAddress(1));
-    // pingH0H1.SetAttribute("Verbose", BooleanValue(true));
-    // ApplicationContainer apps = pingH0H1.Install(hosts.Get(0));
-    // apps.Start(Seconds(1.0));
-    // apps.Stop(Seconds(simTime));
-
-    // // H2 to H3 ping
-    // V4PingHelper pingH2H3(hostIpIfaces.GetAddress(3));
-    // pingH2H3.SetAttribute("Verbose", BooleanValue(true));
-    // apps = pingH2H3.Install(hosts.Get(2));
-    // apps.Start(Seconds(2.0));
-    // apps.Stop(Seconds(simTime));
+    // Advertising nodes
+    ApplicationContainer discoveryApps;
+    for (uint32_t i = 0; i < hosts.GetN(); i++) {
+        uint32_t dest = (i + 1) % hosts.GetN();
+        PingHelper pingHelper(Ipv4Address(hostIpIfaces.GetAddress(dest)));
+        pingHelper.SetAttribute("VerboseMode", EnumValue(Ping::QUIET));
+        pingHelper.SetAttribute("Count", UintegerValue(1));
+        discoveryApps.Add(pingHelper.Install(hosts.Get(i)));
+    }
+    discoveryApps.Start(Seconds(2.0));
+    discoveryApps.Stop(Seconds(5.0));
 
     NS_LOG_INFO("Configuring Traffic (Ping)...");
     ApplicationContainer pingApps;
@@ -215,7 +167,7 @@ int main(int argc, char* argv[]) {
         pingHelper.SetAttribute("Count", UintegerValue(0));
         pingApps.Add(pingHelper.Install(hosts.Get(i)));
     }
-    pingApps.Start(Seconds(2.0));
+    pingApps.Start(Seconds(5.0));
     pingApps.Stop(Seconds(simTime - 1.0));
 
     

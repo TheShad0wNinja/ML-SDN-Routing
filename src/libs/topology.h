@@ -31,6 +31,12 @@ public:
   };
   std::vector<LinkInfo> GetAllLinks() const;
 
+  // Returns: dpid -> set of ports that are on the BFS spanning tree
+  std::unordered_map<uint64_t, std::unordered_set<uint32_t>> ComputeSpanningTree() const;
+
+  std::optional<uint64_t> GetPeerDpid(uint64_t dpid, uint32_t port) const;
+  std::optional<uint32_t> GetPeerPort(uint64_t dpid, uint32_t port) const;
+
 private:
   struct LinkEndpoint {
     uint64_t peerDpid;

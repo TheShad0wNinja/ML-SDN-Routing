@@ -65,6 +65,9 @@ private:
 
     void SendSingleLldp(Ptr<const RemoteSwitch> swtch, uint64_t dpid, uint32_t port);
     void TriggerEcho();
+    void RebuildSpanningTree();
+    void FloodViaST(Ptr<const RemoteSwitch> inSwtch, uint32_t inPort,
+                    uint32_t bufferId, const uint8_t* data, size_t dataLen);
 
     static constexpr uint32_t kMaxLldpProbe   = 8;
     static constexpr double   kEchoIntervalSec = 60;
@@ -90,6 +93,10 @@ private:
     std::unordered_map<uint64_t, uint64_t> m_echoRttNs;
     // Liveness: dpid -> consecutive echo requests without a reply
     std::unordered_map<uint64_t, uint32_t> m_echoMissCount;
+    // IP (host byte order) -> MAC reverse map; updated alongside m_hostIpMap
+    std::unordered_map<uint32_t, uint64_t> m_ipToMac;
+    // Spanning tree: dpid -> set of inter-switch ports on the spanning tree
+    std::unordered_map<uint64_t, std::unordered_set<uint32_t>> m_spanningTree;
 };
 
 } // namespace ns3

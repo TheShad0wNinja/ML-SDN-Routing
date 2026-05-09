@@ -43,6 +43,8 @@ void ZmqOpenFlowController::DoDispose() {
     m_switchPorts.clear();
     m_portStats.clear();
     m_hostIpMap.clear();
+    m_ipToMac.clear();
+    m_spanningTree.clear();
     m_lldpSendNs.clear();
     m_topology = Topology();
 
@@ -199,6 +201,7 @@ ZmqOpenFlowController::HandleLldpPacket(uint64_t dpid, uint32_t inPort,
     }
 
     m_topology.AddLink(chassis_id, port_id, dpid, inPort, costMs);
+    RebuildSpanningTree();
     NS_LOG_INFO("[TOPO] Link: " << chassis_id << ":" << port_id
         << " <-> " << dpid << ":" << inPort
         << " cost=" << costMs << "ms");
@@ -217,8 +220,7 @@ ZmqOpenFlowController::HandleLldpPacket(uint64_t dpid, uint32_t inPort,
 // ------------------------------------------------------------------
 //  ARP handler — extract sender IP for host IP map
 // ------------------------------------------------------------------
-void
-ZmqOpenFlowController::HandleArpPacket(const uint8_t* data, size_t len) {
+void ZmqOpenFlowController::HandleArpPacket(const uint8_t* data, size_t len) {
     // Ethernet (14) + ARP (28) = 42 bytes minimum
     if (len < 42)
         return;
@@ -243,8 +245,36 @@ ZmqOpenFlowController::HandleArpPacket(const uint8_t* data, size_t len) {
         ((uint32_t)arp[16] << 8) |
         (uint32_t)arp[17];
 
+    // Target IP: bytes 24-27 of ARP header
+    uint32_t targetIp = ((uint32_t)arp[24] << 24) |
+        ((uint32_t)arp[25] << 16) |
+        ((uint32_t)arp[26] << 8) |
+        (uint32_t)arp[27];
+
+    // ARP operation: bytes 6-7
+    uint16_t arpOp = (uint16_t)arp[6] << 8 | arp[7];
+
+    // Log ARP requests and replies
+    if (arpOp == 1 || arpOp == 2) {
+        uint8_t s0 = (senderIp >> 24) & 0xFF;
+        uint8_t s1 = (senderIp >> 16) & 0xFF;
+        uint8_t s2 = (senderIp >> 8) & 0xFF;
+        uint8_t s3 = senderIp & 0xFF;
+
+        uint8_t t0 = (targetIp >> 24) & 0xFF;
+        uint8_t t1 = (targetIp >> 16) & 0xFF;
+        uint8_t t2 = (targetIp >> 8) & 0xFF;
+        uint8_t t3 = targetIp & 0xFF;
+
+        NS_LOG_INFO("[ARP] " << (arpOp == 1 ? "Request" : "Reply") << " from "
+            << (uint32_t)s0 << "." << (uint32_t)s1 << "." << (uint32_t)s2 << "." << (uint32_t)s3
+            << " to " << (uint32_t)t0 << "." << (uint32_t)t1 << "." << (uint32_t)t2 << "." << (uint32_t)t3);
+    }
+    
+
     if (senderMac != 0 && senderIp != 0) {
         m_hostIpMap[senderMac] = senderIp;
+        m_ipToMac[senderIp] = senderMac;
     }
 }
 
@@ -260,7 +290,7 @@ ZmqOpenFlowController::ForwardPacket(Ptr<const RemoteSwitch> swtch,
 
     auto dstIt = m_macToLoc.find(dstMac);
     if (dstIt == m_macToLoc.end()) {
-        SendPacketOut(swtch, inPort, msg->buffer_id, msg->data, msg->data_length, OFPP_FLOOD);
+        FloodViaST(swtch, inPort, msg->buffer_id, msg->data, msg->data_length);
         return;
     }
 
@@ -275,7 +305,7 @@ ZmqOpenFlowController::ForwardPacket(Ptr<const RemoteSwitch> swtch,
 
     auto opt_path = m_topology.ShortestPath(dpid, dst_dpid);
     if (!opt_path || opt_path->size() < 2) {
-        SendPacketOut(swtch, inPort, msg->buffer_id, msg->data, msg->data_length, OFPP_FLOOD);
+        FloodViaST(swtch, inPort, msg->buffer_id, msg->data, msg->data_length);
         return;
     }
 
@@ -321,13 +351,58 @@ ZmqOpenFlowController::HandlePacketIn(struct ofl_msg_packet_in* msg,
 
         if (ethertype == 0x0806) {
             HandleArpPacket(data, msg->data_length);
+
+            // Smart ARP forwarding: for ARP requests with a known target, go direct.
+            if (msg->data_length >= 42) {
+                const uint8_t* arp = data + 14;
+                uint16_t arpOp = (uint16_t)arp[6] << 8 | arp[7];
+                if (arpOp == 1) {
+                    uint32_t targetIp = ((uint32_t)arp[24] << 24) |
+                                        ((uint32_t)arp[25] << 16) |
+                                        ((uint32_t)arp[26] << 8)  |
+                                        (uint32_t)arp[27];
+                    auto ipIt = m_ipToMac.find(targetIp);
+                    if (ipIt != m_ipToMac.end()) {
+                        auto locIt = m_macToLoc.find(ipIt->second);
+                        if (locIt != m_macToLoc.end()) {
+                            uint64_t tDpid = locIt->second.first;
+                            uint32_t tPort = locIt->second.second;
+                            if (tDpid == dpid) {
+                                SendPacketOut(swtch, inPort, msg->buffer_id,
+                                              msg->data, msg->data_length, tPort);
+                            } else {
+                                auto opt = m_topology.ShortestPath(dpid, tDpid);
+                                if (opt && opt->size() >= 2) {
+                                    auto fp = m_topology.GetOutPort((*opt)[0], (*opt)[1]);
+                                    if (fp)
+                                        SendPacketOut(swtch, inPort, msg->buffer_id,
+                                                      msg->data, msg->data_length, *fp);
+                                    else
+                                        FloodViaST(swtch, inPort, msg->buffer_id,
+                                                   msg->data, msg->data_length);
+                                } else {
+                                    FloodViaST(swtch, inPort, msg->buffer_id,
+                                               msg->data, msg->data_length);
+                                }
+                            }
+                            ofl_msg_free((struct ofl_msg_header*)msg, nullptr);
+                            return 0;
+                        }
+                    }
+                    // Target unknown — flood via spanning tree and return early.
+                    FloodViaST(swtch, inPort, msg->buffer_id, msg->data, msg->data_length);
+                    ofl_msg_free((struct ofl_msg_header*)msg, nullptr);
+                    return 0;
+                }
+                // ARP reply: fall through to normal ForwardPacket (dst MAC is unicast).
+            }
         }
     }
 
     struct ofl_match_tlv* ethSrc = oxm_match_lookup(OXM_OF_ETH_SRC, (struct ofl_match*)msg->match);
     struct ofl_match_tlv* ethDst = oxm_match_lookup(OXM_OF_ETH_DST, (struct ofl_match*)msg->match);
     if (!ethSrc || !ethDst || !ethSrc->value || !ethDst->value) {
-        SendPacketOut(swtch, inPort, msg->buffer_id, msg->data, msg->data_length, OFPP_FLOOD);
+        FloodViaST(swtch, inPort, msg->buffer_id, msg->data, msg->data_length);
         ofl_msg_free((struct ofl_msg_header*)msg, nullptr);
         return 0;
     }
@@ -476,6 +551,80 @@ ZmqOpenFlowController::HandleEchoReply(struct ofl_msg_echo* msg,
         NS_LOG_INFO("[ECHO] Switch " << dpid << " RTT=" << (rttNs / 1e6) << "ms");
     }
     return OFSwitch13Controller::HandleEchoReply(msg, swtch, xid);
+}
+
+void
+ZmqOpenFlowController::RebuildSpanningTree() {
+    m_spanningTree = m_topology.ComputeSpanningTree();
+}
+
+void
+ZmqOpenFlowController::FloodViaST(Ptr<const RemoteSwitch> inSwtch, uint32_t inPort,
+                                   uint32_t bufferId, const uint8_t* data, size_t dataLen)
+{
+    uint64_t inDpid = inSwtch->GetDpId();
+
+    // If we have no spanning tree yet (topology not discovered), fall back to
+    // flooding only on the ingress switch's host-facing ports, or all ports if
+    // no host-facing ports are known yet.
+    if (m_spanningTree.empty() && m_switchMap.size() == 1) {
+        SendPacketOut(inSwtch, inPort, bufferId, data, dataLen, OFPP_FLOOD);
+        return;
+    }
+
+    // parentPort[dpid] = the port on dpid through which the BFS parent is reached
+    // (we skip it on output to avoid sending back the way we came).
+    std::unordered_map<uint64_t, uint32_t> parentPort;
+    std::unordered_set<uint64_t> visited;
+    std::queue<uint64_t> q;
+
+    parentPort[inDpid] = inPort;
+    visited.insert(inDpid);
+    q.push(inDpid);
+
+    while (!q.empty()) {
+        uint64_t dpid = q.front(); q.pop();
+        auto swIt = m_switchMap.find(dpid);
+        if (swIt == m_switchMap.end()) continue;
+
+        uint32_t skipPort = parentPort.count(dpid) ? parentPort.at(dpid) : 0;
+        std::vector<uint32_t> outPorts;
+
+        // Host-facing ports (known, non-switch-link), excluding the skip port.
+        auto& known = m_switchPorts[dpid];
+        for (uint32_t p : known) {
+            if (p == skipPort) continue;
+            if (!m_topology.IsSwitchLinkPort(dpid, p))
+                outPorts.push_back(p);
+        }
+
+        // Spanning-tree inter-switch ports, excluding the skip port.
+        auto stIt = m_spanningTree.find(dpid);
+        if (stIt != m_spanningTree.end()) {
+            for (uint32_t p : stIt->second) {
+                if (p == skipPort) continue;
+                outPorts.push_back(p);
+
+                auto peerDpid = m_topology.GetPeerDpid(dpid, p);
+                if (peerDpid && !visited.count(*peerDpid)) {
+                    auto peerPort = m_topology.GetPeerPort(dpid, p);
+                    if (peerPort) parentPort[*peerDpid] = *peerPort;
+                    visited.insert(*peerDpid);
+                    q.push(*peerDpid);
+                }
+            }
+        }
+
+        if (outPorts.empty()) continue;
+
+        bool isIngress = (dpid == inDpid);
+        for (uint32_t p : outPorts) {
+            if (isIngress)
+                SendPacketOut(swIt->second, inPort, bufferId, data, dataLen, p);
+            else
+                SendPacketOut(swIt->second, OFPP_CONTROLLER, OFP_NO_BUFFER, data, dataLen, p);
+        }
+    }
 }
 
 void
