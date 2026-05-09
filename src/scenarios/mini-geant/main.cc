@@ -208,17 +208,30 @@ int main(int argc, char* argv[]) {
     NS_LOG_INFO("Configuring Traffic (Ping)...");
     ApplicationContainer pingApps;
 
-    // h0 to h2
-    PingHelper pingHelper(Ipv4Address(hostIpIfaces.GetAddress(2)));
-    pingHelper.SetAttribute("VerboseMode", EnumValue(Ping::QUIET));
-    pingApps.Add(pingHelper.Install(hosts.Get(0)));
-
+    for (uint32_t i = 0; i < hosts.GetN(); i++) {
+        uint32_t dest = (i + 1) % hosts.GetN();
+        PingHelper pingHelper(Ipv4Address(hostIpIfaces.GetAddress(dest)));
+        pingHelper.SetAttribute("VerboseMode", EnumValue(Ping::QUIET));
+        pingHelper.SetAttribute("Count", UintegerValue(0));
+        pingApps.Add(pingHelper.Install(hosts.Get(i)));
+    }
     pingApps.Start(Seconds(2.0));
     pingApps.Stop(Seconds(simTime - 1.0));
 
+    
+    // After initial discovery pings, have host 0 ping host 2
+    // PingHelper pingH0H2(Ipv4Address(hostIpIfaces.GetAddress(2)));
+    // pingH0H2.SetAttribute("VerboseMode", EnumValue(Ping::QUIET));
+    // ApplicationContainer h0h2 = pingH0H2.Install(hosts.Get(0));
+    // h0h2.Start(Seconds(5.0));
+    // h0h2.Stop(Seconds(simTime - 1.0));
+
+
+    // h0 to h2
     // PingHelper pingHelper(Ipv4Address(hostIpIfaces.GetAddress(2)));
     // pingHelper.SetAttribute("VerboseMode", EnumValue(Ping::QUIET));
-    // pingApps.Add(pingHelper.Install(hosts.Get(0)))
+    // pingApps.Add(pingHelper.Install(hosts.Get(0)));
+
 
     NS_LOG_INFO("Starting simulation...");
     Simulator::Stop(Seconds(simTime));

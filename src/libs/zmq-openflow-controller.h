@@ -20,6 +20,7 @@ public:
     static TypeId GetTypeId();
     ZmqOpenFlowController();
     ~ZmqOpenFlowController() override;
+    void DoDispose() override;
 
 protected:
     void StartApplication() override;
@@ -39,23 +40,43 @@ protected:
                                  uint32_t xid) override;
 
 private:
-    void ExchangeWithPython(uint64_t dpid,
-                            const uint8_t* payload,
-                            size_t len);
+    void SendPacketOut(Ptr<const RemoteSwitch> swtch,
+                       uint32_t inPort,
+                       uint32_t bufferId,
+                       const uint8_t* data,
+                       size_t dataLen,
+                       uint32_t outPort);
     void TriggerLldp();
     void TriggerStats();
+    void WriteStateToJson();
+
+    void HandleLldpPacket(uint64_t dpid, uint32_t inPort,
+                          const uint8_t* data, size_t len);
+    void HandleArpPacket(const uint8_t* data, size_t len);
+    void ForwardPacket(Ptr<const RemoteSwitch> swtch, uint32_t inPort,
+                       struct ofl_msg_packet_in* msg,
+                       uint64_t srcMac, uint64_t dstMac);
+    void InstallFlow(uint64_t dpid, uint64_t dstMac, uint32_t outPort);
+    static std::string FormatIp(uint32_t ip);
+
+    void SendSingleLldp(Ptr<const RemoteSwitch> swtch, uint64_t dpid, uint32_t port);
+
+    static constexpr uint32_t kMaxLldpProbe = 8;
 
     std::unique_ptr<zmq::context_t> m_zmqContext;
-    std::unique_ptr<zmq::socket_t>  m_socket; // REQ
+    std::unique_ptr<zmq::socket_t>  m_socket;
     std::map<uint64_t, Ptr<const RemoteSwitch>> m_switchMap;
-    // Controller-side topology and learned state
     Topology m_topology;
     // MAC (48-bit) -> (dpid, port)
     std::unordered_map<uint64_t, std::pair<uint64_t, uint32_t>> m_macToLoc;
-    // switch dpid -> set of known link ports
+    // switch dpid -> set of known ports
     std::unordered_map<uint64_t, std::unordered_set<uint32_t>> m_switchPorts;
-    // per-switch per-port stats (placeholder store): dpid -> (port -> value)
+    // per-switch per-port stats placeholder
     std::unordered_map<uint64_t, std::unordered_map<uint32_t, uint64_t>> m_portStats;
+    // MAC -> IPv4 (host-byte-order)
+    std::unordered_map<uint64_t, uint32_t> m_hostIpMap;
+    // LLDP send timestamps: dpid -> port -> nanoseconds
+    std::unordered_map<uint64_t, std::unordered_map<uint32_t, uint64_t>> m_lldpSendNs;
 };
 
 } // namespace ns3

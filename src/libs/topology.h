@@ -1,60 +1,63 @@
-#ifndef ZMQ_TOPOLOGY_H
-#define ZMQ_TOPOLOGY_H
+#ifndef TOPOLOGY_H
+#define TOPOLOGY_H
 
 #include <cstdint>
-#include <unordered_set>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <optional>
 
 namespace ns3 {
 
-struct Link {
-    uint64_t d1;
-    uint32_t p1;
-    uint64_t d2;
-    uint32_t p2;
-    bool operator==(Link const& o) const noexcept {
-        return d1 == o.d1 && p1 == o.p1 && d2 == o.d2 && p2 == o.p2;
-    }
-};
-
-struct LinkHash {
-    size_t operator()(Link const& l) const noexcept {
-        // combine a few hashes — good-enough for small topologies
-        size_t h = std::hash<uint64_t>()(l.d1);
-        h ^= std::hash<uint32_t>()(l.p1) + 0x9e3779b97f4a7c15ULL + (h<<6) + (h>>2);
-        h ^= std::hash<uint64_t>()(l.d2) + 0x9e3779b97f4a7c15ULL + (h<<6) + (h>>2);
-        h ^= std::hash<uint32_t>()(l.p2) + 0x9e3779b97f4a7c15ULL + (h<<6) + (h>>2);
-        return h;
-    }
-};
-
 class Topology {
 public:
-    Topology() = default;
+  Topology() = default;
 
-    // Add a bidirectional link (stores both directions)
-    void AddLink(uint64_t d1, uint32_t p1, uint64_t d2, uint32_t p2);
+  void AddLink(uint64_t dpid1, uint32_t port1, uint64_t dpid2, uint32_t port2, double costMs = 1.0);
+  void RemovePort(uint64_t dpid, uint32_t port);
 
-    // Remove any links touching (dpid, port)
-    void RemovePort(uint64_t dpid, uint32_t port);
+  std::optional<std::vector<uint64_t>> ShortestPath(uint64_t src,
+                                                    uint64_t dst) const;
+  std::optional<uint32_t> GetOutPort(uint64_t src, uint64_t dst) const;
+  bool IsSwitchLinkPort(uint64_t dpid, uint32_t port) const;
+  double GetLinkCost(uint64_t dpid1, uint64_t dpid2) const;
 
-    // Return shortest path as vector of dpids, or empty optional if none
-    std::optional<std::vector<uint64_t>> ShortestPath(uint64_t src, uint64_t dst) const;
-
-    // Return output port on `src` that leads directly to `dst` (one-hop), or nullopt
-    std::optional<uint32_t> GetOutPort(uint64_t src, uint64_t dst) const;
-
-    // True if (dpid,in_port) is a link port
-    bool IsSwitchLinkPort(uint64_t dpid, uint32_t in_port) const;
+  struct LinkInfo {
+    uint64_t src_dpid;
+    uint32_t src_port;
+    uint64_t dst_dpid;
+    uint32_t dst_port;
+    double   cost_ms = 1.0;
+  };
+  std::vector<LinkInfo> GetAllLinks() const;
 
 private:
-    std::unordered_set<Link, LinkHash> m_links;
-    std::unordered_map<uint64_t, std::unordered_set<uint64_t>> m_graph;
+  struct LinkEndpoint {
+    uint64_t peerDpid;
+    uint32_t peerPort;
+  };
+
+  // Primary storage: dpid -> localPort -> {peer, localPort, peerPort}
+  std::unordered_map<uint64_t, std::unordered_map<uint32_t, LinkEndpoint>>
+      m_links;
+
+  // O(1) "is this port an inter-switch link?" lookup
+  std::unordered_map<uint64_t, std::unordered_set<uint32_t>> m_linkPorts;
+
+  // O(1) routing lookup: src -> dst -> outPort
+  std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint32_t>>
+      m_routing;
+
+  // Weighted adjacency list for Dijkstra
+  std::unordered_map<uint64_t, std::unordered_set<uint64_t>> m_graph;
+
+  // Link costs: dpid -> neighbor_dpid -> cost_ms
+  std::unordered_map<uint64_t, std::unordered_map<uint64_t, double>> m_linkCost;
+
+  void AddAdjacency(uint64_t src, uint64_t dst, uint32_t outPort);
+  void RemoveAdjacency(uint64_t src, uint64_t dst);
 };
 
 } // namespace ns3
 
-#endif // ZMQ_TOPOLOGY_H
+#endif // TOPOLOGY_H

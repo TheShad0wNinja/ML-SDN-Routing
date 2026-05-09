@@ -1,18 +1,28 @@
 #include "zmq-openflow-controller.h"
-#include "ns3/log.h"
+
 #include "openflow_builders.h"
+
+#include "ns3/log.h"
+#include "ns3/simulator.h"
+
 #include <arpa/inet.h>
-#include <cstring>
-#include <vector>
-#include <string>
-#include <sstream>
 #include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <fstream>
+#include <iomanip>
+#include <set>
+#include <sstream>
+#include <string>
+#include <sys/stat.h>
+#include <vector>
 
 namespace ns3 {
 
 NS_LOG_COMPONENT_DEFINE("ZmqOpenFlowController");
 
-TypeId ZmqOpenFlowController::GetTypeId() {
+TypeId
+ZmqOpenFlowController::GetTypeId() {
     static TypeId tid = TypeId("ns3::ZmqOpenFlowController")
         .SetParent<OFSwitch13Controller>()
         .SetGroupName("OpenFlow13")
@@ -20,447 +30,365 @@ TypeId ZmqOpenFlowController::GetTypeId() {
     return tid;
 }
 
-ZmqOpenFlowController::ZmqOpenFlowController() {}
-ZmqOpenFlowController::~ZmqOpenFlowController() {}
-
-static uint64_t Htonll(uint64_t v) {
-    uint32_t hi = htonl((uint32_t)(v >> 32));
-    uint32_t lo = htonl((uint32_t)v);
-    return ((uint64_t)hi << 32) | lo;
+ZmqOpenFlowController::ZmqOpenFlowController() {
 }
-static uint64_t Ntohll(uint64_t v) {
-    uint32_t hi = ntohl((uint32_t)(v >> 32));
-    uint32_t lo = ntohl((uint32_t)v);
-    return ((uint64_t)hi << 32) | lo;
+
+ZmqOpenFlowController::~ZmqOpenFlowController() {
+}
+
+void ZmqOpenFlowController::DoDispose() {
+    WriteStateToJson();
+    m_switchMap.clear();
+    m_macToLoc.clear();
+    m_switchPorts.clear();
+    m_portStats.clear();
+    m_hostIpMap.clear();
+    m_lldpSendNs.clear();
+    m_topology = Topology();
+
+    OFSwitch13Controller::DoDispose();
 }
 
 void ZmqOpenFlowController::StartApplication() {
-    NS_LOG_INFO("Starting ZMQ controller bridge...");
-    // m_zmqContext = std::make_unique<zmq::context_t>(1);
-    // m_socket = std::make_unique<zmq::socket_t>(*m_zmqContext, zmq::socket_type::req);
-    // m_socket->set(zmq::sockopt::rcvtimeo, 5000); // 5 s timeout
-    // m_socket->connect("tcp://127.0.0.1:5555");
-
-    // Startup sync — works regardless of who starts first
-    // zmq::message_t hello(5);
-    // memcpy(hello.data(), "HELLO", 5);
-    // m_socket->send(hello, zmq::send_flags::none);
-    // zmq::message_t ack;
-    // if (m_socket->recv(ack, zmq::recv_flags::none)) {
-    //     NS_LOG_INFO("Python controller connected.");
-    // }
-
-    // Simulated-time triggers — C++ decides WHEN, Python decides WHAT
-    Simulator::Schedule(Seconds(5), &ZmqOpenFlowController::TriggerLldp, this);
-    Simulator::Schedule(Seconds(10), &ZmqOpenFlowController::TriggerStats, this);
+    // Start LLDP early so topology is known before pings at t=2s
+    Simulator::Schedule(Seconds(0.5), &ZmqOpenFlowController::TriggerLldp, this);
+    Simulator::Schedule(Seconds(60), &ZmqOpenFlowController::TriggerStats, this);
 
     OFSwitch13Controller::StartApplication();
 }
 
 void ZmqOpenFlowController::StopApplication() {
-    m_socket->close();
-    m_zmqContext->close();
+    if (m_socket) {
+        try { m_socket->close(); }
+        catch (...) {}
+    }
+    if (m_zmqContext) {
+        try { m_zmqContext->close(); }
+        catch (...) {}
+    }
     OFSwitch13Controller::StopApplication();
 }
 
-void ZmqOpenFlowController::HandshakeSuccessful(Ptr<const RemoteSwitch> swtch) {
+void
+ZmqOpenFlowController::HandshakeSuccessful(Ptr<const RemoteSwitch> swtch) {
     NS_LOG_FUNCTION(this << swtch);
 
-    // Get the switch datapath ID
     uint64_t swDpId = swtch->GetDpId();
-
     m_switchMap[swDpId] = swtch;
-    // initialize port set for this switch
     m_switchPorts[swDpId] = std::unordered_set<uint32_t>();
 
-    // After a successful handshake, let's install the table-miss entry, setting
-    // to 128 bytes the maximum amount of data from a packet that should be sent
-    // to the controller.
     DpctlExecute(swDpId, "flow-mod cmd=add,table=0,prio=0 apply:output=ctrl:128");
-
-    // Configure te switch to buffer packets and send only the first 128 bytes
-    // of each packet sent to the controller when not using an output action to
-    // the OFPP_CONTROLLER logical port.
     DpctlExecute(swDpId, "set-config miss=128");
 }
 
 // ------------------------------------------------------------------
-//  Core: send to Python, block, unpack reply, send to switches
+//  Helper: build and send a single-action OFPT_PACKET_OUT
 // ------------------------------------------------------------------
-void ZmqOpenFlowController::ExchangeWithPython(uint64_t dpid,
-                                               const uint8_t* payload,
-                                               size_t len) {
-    // zmq::message_t req(len + 8);
-    // uint64_t dpid_nbo = Htonll(dpid);
-    // memcpy(req.data(), &dpid_nbo, 8);
-    // if (len > 0) memcpy((uint8_t*)req.data() + 8, payload, len);
-
-    // if (!m_socket->send(req, zmq::send_flags::none)) return;
-
-    // zmq::message_t reply;
-    // if (!m_socket->recv(reply, zmq::recv_flags::none)) return;
-    // if (reply.size() < 2) return;
-
-    // uint8_t* p = (uint8_t*)reply.data();
-    // size_t rem = reply.size();
-    // uint16_t count = ntohs(*(uint16_t*)p);
-    // p += 2; rem -= 2;
-
-    // for (uint16_t i = 0; i < count && rem >= 12; ++i) {
-    //     uint64_t target_dpid = Ntohll(*(uint64_t*)p);
-    //     p += 8; rem -= 8;
-    //     uint32_t msg_len = ntohl(*(uint32_t*)p);
-    //     p += 4; rem -= 4;
-    //     if (rem < msg_len) break;
-
-    //     auto it = m_switchMap.find(target_dpid);
-    //     if (it != m_switchMap.end()) {
-    //         struct ofl_msg_header* msg = nullptr;
-    //         uint32_t xid = 0;
-    //         ofl_err err = ofl_msg_unpack(p, msg_len, &msg, &xid, nullptr);
-    //         if (!err && msg) {
-    //             SendToSwitch(it->second, msg, xid);
-    //             ofl_msg_free(msg, nullptr);
-    //         }
-    //     }
-    //     p += msg_len; rem -= msg_len;
-    // }
+void
+ZmqOpenFlowController::SendPacketOut(Ptr<const RemoteSwitch> swtch,
+    uint32_t inPort,
+    uint32_t bufferId,
+    const uint8_t* data,
+    size_t dataLen,
+    uint32_t outPort) {
+    struct ofl_msg_packet_out* po = (struct ofl_msg_packet_out*)malloc(sizeof(*po));
+    memset(po, 0, sizeof(*po));
+    po->header.type = OFPT_PACKET_OUT;
+    po->buffer_id = bufferId;
+    po->in_port = inPort;
+    if (bufferId == OFP_NO_BUFFER && data && dataLen > 0) {
+        po->data_length = dataLen;
+        po->data = (uint8_t*)malloc(dataLen);
+        memcpy(po->data, data, dataLen);
+    }
+    struct ofl_action_output* a = (struct ofl_action_output*)malloc(sizeof(*a));
+    a->header.type = OFPAT_OUTPUT;
+    a->header.len = sizeof(*a);
+    a->port = outPort;
+    a->max_len = 0;
+    po->actions_num = 1;
+    po->actions = (struct ofl_action_header**)malloc(sizeof(struct ofl_action_header*));
+    po->actions[0] = (struct ofl_action_header*)a;
+    SendToSwitch(swtch, (struct ofl_msg_header*)po, 0);
+    free(po->actions);
+    free(a);
+    if (po->data)
+        free(po->data);
+    free(po);
 }
 
 // ------------------------------------------------------------------
-//  OpenFlow event handlers — HandlePacketIn implements routing logic
+//  Install a MAC-destination flow with idle timeout
 // ------------------------------------------------------------------
-ofl_err ZmqOpenFlowController::HandlePacketIn(struct ofl_msg_packet_in* msg,
-                                              Ptr<const RemoteSwitch> swtch,
-                                              uint32_t xid) {
-    uint64_t dpid = swtch->GetDpId();
+void
+ZmqOpenFlowController::InstallFlow(uint64_t dpid, uint64_t dstMac, uint32_t outPort) {
+    std::string macStr = FormatMac(dstMac);
+    std::ostringstream cmd;
+    cmd << "flow-mod cmd=add,table=0,prio=100,idle=30 eth_dst="
+        << macStr << " apply:output=" << outPort;
+    DpctlExecute(dpid, cmd.str());
+}
 
-    // Extract input port from the OpenFlow match
-    uint32_t inPort = 0;
-    size_t portLen = OXM_LENGTH(OXM_OF_IN_PORT);
-    struct ofl_match_tlv* input = oxm_match_lookup(OXM_OF_IN_PORT, (struct ofl_match*)msg->match);
-    if (input && input->value) {
-        memcpy(&inPort, input->value, portLen);
+// ------------------------------------------------------------------
+//  Format a 32-bit IPv4 address (host-byte-order) as dotted-decimal
+// ------------------------------------------------------------------
+std::string
+ZmqOpenFlowController::FormatIp(uint32_t ip) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%u.%u.%u.%u",
+        (ip >> 24) & 0xFF,
+        (ip >> 16) & 0xFF,
+        (ip >> 8) & 0xFF,
+        (ip) & 0xFF);
+    return buf;
+}
+
+// ------------------------------------------------------------------
+//  LLDP packet handler (extracted from HandlePacketIn)
+// ------------------------------------------------------------------
+void
+ZmqOpenFlowController::HandleLldpPacket(uint64_t dpid, uint32_t inPort,
+    const uint8_t* data, size_t len) {
+    size_t off = 14;
+    uint64_t chassis_id = 0;
+    uint32_t port_id = 0;
+    uint64_t sendNs = 0;
+
+    while (off + 2 <= len) {
+        uint16_t hdr = (uint16_t)data[off] << 8 | (uint16_t)data[off + 1];
+        off += 2;
+        uint16_t tlv_type = (hdr >> 9) & 0x7f;
+        uint16_t tlen = hdr & 0x1ff;
+        if (tlv_type == 0)
+            break;
+        if (off + tlen > len)
+            break;
+        const uint8_t* val = data + off;
+
+        if (tlv_type == 1 && tlen > 1) {
+            try { chassis_id = std::stoull(std::string((const char*)(val + 1), tlen - 1)); }
+            catch (...) {}
+        }
+        else if (tlv_type == 2 && tlen > 1) {
+            try { port_id = static_cast<uint32_t>(std::stoul(std::string((const char*)(val + 1), tlen - 1))); }
+            catch (...) {}
+        }
+        else if (tlv_type == 9 && tlen == 8) {
+            // LatencyTag: 8 bytes big-endian timestamp
+            for (int i = 0; i < 8; ++i)
+                sendNs = (sendNs << 8) | val[i];
+        }
+        off += tlen;
     }
 
-    // Record seen port
+    if (chassis_id == 0 || port_id == 0)
+        return;
+
+    double costMs = 1.0;
+    if (sendNs != 0) {
+        uint64_t nowNs = Simulator::Now().GetNanoSeconds();
+        if (nowNs > sendNs)
+            costMs = static_cast<double>(nowNs - sendNs) / 1e6;
+    }
+
+    m_topology.AddLink(chassis_id, port_id, dpid, inPort, costMs);
+    NS_LOG_INFO("[TOPO] Link: " << chassis_id << ":" << port_id
+        << " <-> " << dpid << ":" << inPort
+        << " cost=" << costMs << "ms");
+
+    // Flush MAC entries learned on now-confirmed switch-link ports
+    for (auto mit = m_macToLoc.begin(); mit != m_macToLoc.end();) {
+        if (m_topology.IsSwitchLinkPort(mit->second.first, mit->second.second))
+            mit = m_macToLoc.erase(mit);
+        else
+            ++mit;
+    }
+
+    // WriteStateToJson();
+}
+
+// ------------------------------------------------------------------
+//  ARP handler — extract sender IP for host IP map
+// ------------------------------------------------------------------
+void
+ZmqOpenFlowController::HandleArpPacket(const uint8_t* data, size_t len) {
+    // Ethernet (14) + ARP (28) = 42 bytes minimum
+    if (len < 42)
+        return;
+
+    const uint8_t* arp = data + 14;
+    uint16_t hw_type = (uint16_t)arp[0] << 8 | arp[1];
+    uint16_t proto = (uint16_t)arp[2] << 8 | arp[3];
+    uint8_t  hw_len = arp[4];
+    uint8_t  proto_len = arp[5];
+
+    if (hw_type != 1 || proto != 0x0800 || hw_len != 6 || proto_len != 4)
+        return;
+
+    // Sender MAC: bytes 8-13 of ARP header (offset 22 from Ethernet start)
+    uint64_t senderMac = 0;
+    for (int i = 0; i < 6; ++i)
+        senderMac = (senderMac << 8) | arp[8 + i];
+
+    // Sender IP: bytes 14-17 of ARP header (offset 28 from Ethernet start)
+    uint32_t senderIp = ((uint32_t)arp[14] << 24) |
+        ((uint32_t)arp[15] << 16) |
+        ((uint32_t)arp[16] << 8) |
+        (uint32_t)arp[17];
+
+    if (senderMac != 0 && senderIp != 0) {
+        m_hostIpMap[senderMac] = senderIp;
+    }
+}
+
+// ------------------------------------------------------------------
+//  ForwardPacket — lookup dst and route or flood
+// ------------------------------------------------------------------
+void
+ZmqOpenFlowController::ForwardPacket(Ptr<const RemoteSwitch> swtch,
+    uint32_t inPort,
+    struct ofl_msg_packet_in* msg,
+    uint64_t srcMac, uint64_t dstMac) {
+    uint64_t dpid = swtch->GetDpId();
+
+    auto dstIt = m_macToLoc.find(dstMac);
+    if (dstIt == m_macToLoc.end()) {
+        SendPacketOut(swtch, inPort, msg->buffer_id, msg->data, msg->data_length, OFPP_FLOOD);
+        return;
+    }
+
+    uint64_t dst_dpid = dstIt->second.first;
+    uint32_t dst_port = dstIt->second.second;
+
+    if (dst_dpid == dpid) {
+        InstallFlow(dpid, dstMac, dst_port);
+        SendPacketOut(swtch, inPort, msg->buffer_id, msg->data, msg->data_length, dst_port);
+        return;
+    }
+
+    auto opt_path = m_topology.ShortestPath(dpid, dst_dpid);
+    if (!opt_path || opt_path->size() < 2) {
+        SendPacketOut(swtch, inPort, msg->buffer_id, msg->data, msg->data_length, OFPP_FLOOD);
+        return;
+    }
+
+    const std::vector<uint64_t>& path = *opt_path;
+    for (size_t i = 0; i + 1 < path.size(); ++i) {
+        auto outp_opt = m_topology.GetOutPort(path[i], path[i + 1]);
+        if (outp_opt)
+            InstallFlow(path[i], dstMac, *outp_opt);
+    }
+    InstallFlow(dst_dpid, dstMac, dst_port);
+
+    auto first_out = m_topology.GetOutPort(path[0], path[1]);
+    if (first_out)
+        SendPacketOut(swtch, inPort, msg->buffer_id, msg->data, msg->data_length, *first_out);
+}
+
+// ------------------------------------------------------------------
+//  OpenFlow event handler
+// ------------------------------------------------------------------
+ofl_err
+ZmqOpenFlowController::HandlePacketIn(struct ofl_msg_packet_in* msg,
+    Ptr<const RemoteSwitch> swtch,
+    uint32_t xid) {
+    uint64_t dpid = swtch->GetDpId();
+
+    uint32_t inPort = 0;
+    struct ofl_match_tlv* input = oxm_match_lookup(OXM_OF_IN_PORT, (struct ofl_match*)msg->match);
+    if (input && input->value) {
+        memcpy(&inPort, input->value, OXM_LENGTH(OXM_OF_IN_PORT));
+    }
+
     m_switchPorts[dpid].insert(inPort);
 
-    // LLDP discovery: check payload ethertype
     if (msg->data && msg->data_length >= 14) {
         const uint8_t* data = msg->data;
         uint16_t ethertype = (uint16_t)data[12] << 8 | (uint16_t)data[13];
+
         if (ethertype == 0x88CC) {
-            // Parse TLVs to find chassis_id and port_id as integers
-            size_t off = 14;
-            uint64_t chassis_id = 0;
-            uint32_t port_id = 0;
-            while (off + 2 <= msg->data_length) {
-                uint16_t hdr = (uint16_t)data[off] << 8 | (uint16_t)data[off+1];
-                off += 2;
-                uint16_t tlv_type = (hdr >> 9) & 0x7f;
-                uint16_t ln = hdr & 0x1ff;
-                if (tlv_type == 0 || ln == 0) break;
-                if (off + ln > msg->data_length) break;
-                const uint8_t* val = data + off;
-                if (tlv_type == 1 && ln > 1) {
-                    try {
-                        std::string s((const char*)(val+1), ln-1);
-                        chassis_id = std::stoull(s);
-                    } catch (...) { }
-                } else if (tlv_type == 2 && ln > 1) {
-                    try {
-                        std::string s((const char*)(val+1), ln-1);
-                        port_id = static_cast<uint32_t>(std::stoul(s));
-                    } catch (...) { }
-                }
-                off += ln;
-            }
-            if (chassis_id != 0 && port_id != 0) {
-                m_topology.AddLink(chassis_id, port_id, dpid, inPort);
-                NS_LOG_INFO("[TOPO] Link: " << chassis_id << ":" << port_id << " -> " << dpid << ":" << inPort);
-            }
+            HandleLldpPacket(dpid, inPort, data, msg->data_length);
             ofl_msg_free((struct ofl_msg_header*)msg, nullptr);
             return 0;
         }
+
+        if (ethertype == 0x0806) {
+            HandleArpPacket(data, msg->data_length);
+        }
     }
 
-    // Normal traffic: get ethernet src/dst from match
     struct ofl_match_tlv* ethSrc = oxm_match_lookup(OXM_OF_ETH_SRC, (struct ofl_match*)msg->match);
     struct ofl_match_tlv* ethDst = oxm_match_lookup(OXM_OF_ETH_DST, (struct ofl_match*)msg->match);
     if (!ethSrc || !ethDst || !ethSrc->value || !ethDst->value) {
-        // Flood: can't parse MACs
-        struct ofl_msg_packet_out* po = (struct ofl_msg_packet_out*)malloc(sizeof(*po));
-        memset(po, 0, sizeof(*po));
-        po->header.type = OFPT_PACKET_OUT;
-        po->buffer_id = msg->buffer_id;
-        po->in_port = inPort;
-        if (msg->buffer_id == OFP_NO_BUFFER && msg->data && msg->data_length > 0) {
-            po->data_length = msg->data_length;
-            po->data = (uint8_t*)malloc(msg->data_length);
-            memcpy(po->data, msg->data, msg->data_length);
-        } else {
-            po->data_length = 0;
-            po->data = nullptr;
-        }
-        struct ofl_action_output* a = (struct ofl_action_output*)malloc(sizeof(*a));
-        a->header.type = OFPAT_OUTPUT;
-        a->header.len = sizeof(*a);
-        a->port = OFPP_FLOOD;
-        a->max_len = 0;
-        po->actions_num = 1;
-        po->actions = (struct ofl_action_header**)malloc(sizeof(struct ofl_action_header*));
-        po->actions[0] = (struct ofl_action_header*)a;
-        SendToSwitch(swtch, (struct ofl_msg_header*)po, 0);
-        free(po->actions);
-        free(a);
-        if (po->data) free(po->data);
-        free(po);
+        SendPacketOut(swtch, inPort, msg->buffer_id, msg->data, msg->data_length, OFPP_FLOOD);
         ofl_msg_free((struct ofl_msg_header*)msg, nullptr);
         return 0;
     }
 
-    // Convert MAC bytes to uint64 keys
-    uint64_t src_mac = 0;
-    uint64_t dst_mac = 0;
+    uint64_t src_mac = 0, dst_mac = 0;
     for (int i = 0; i < 6; ++i) {
         src_mac = (src_mac << 8) | (uint8_t)ethSrc->value[i];
         dst_mac = (dst_mac << 8) | (uint8_t)ethDst->value[i];
     }
 
-    // Learn host location if this port is not a switch-link port
     if (!m_topology.IsSwitchLinkPort(dpid, inPort)) {
-        m_macToLoc[src_mac] = std::make_pair(dpid, inPort);
+        m_macToLoc[src_mac] = { dpid, inPort };
     }
 
-    // Check if destination MAC is known
-    auto dstIt = m_macToLoc.find(dst_mac);
-    if (dstIt == m_macToLoc.end()) {
-        // Unknown destination — flood
-        struct ofl_msg_packet_out* po = (struct ofl_msg_packet_out*)malloc(sizeof(*po));
-        memset(po, 0, sizeof(*po));
-        po->header.type = OFPT_PACKET_OUT;
-        po->buffer_id = msg->buffer_id;
-        po->in_port = inPort;
-        if (msg->buffer_id == OFP_NO_BUFFER && msg->data && msg->data_length > 0) {
-            po->data_length = msg->data_length;
-            po->data = (uint8_t*)malloc(msg->data_length);
-            memcpy(po->data, msg->data, msg->data_length);
-        } else {
-            po->data_length = 0;
-            po->data = nullptr;
-        }
-        struct ofl_action_output* a = (struct ofl_action_output*)malloc(sizeof(*a));
-        a->header.type = OFPAT_OUTPUT;
-        a->header.len = sizeof(*a);
-        a->port = OFPP_FLOOD;
-        a->max_len = 0;
-        po->actions_num = 1;
-        po->actions = (struct ofl_action_header**)malloc(sizeof(struct ofl_action_header*));
-        po->actions[0] = (struct ofl_action_header*)a;
-        SendToSwitch(swtch, (struct ofl_msg_header*)po, 0);
-        free(po->actions);
-        free(a);
-        if (po->data) free(po->data);
-        free(po);
-        ofl_msg_free((struct ofl_msg_header*)msg, nullptr);
-        return 0;
-    }
-
-    // Destination known
-    uint64_t dst_dpid = dstIt->second.first;
-    uint32_t dst_port = dstIt->second.second;
-
-    if (dst_dpid == dpid) {
-        // Local destination: install flow and send packet_out
-        char macbuf[32];
-        snprintf(macbuf, sizeof(macbuf), "%02x:%02x:%02x:%02x:%02x:%02x",
-                 (int)ethDst->value[0], (int)ethDst->value[1], (int)ethDst->value[2],
-                 (int)ethDst->value[3], (int)ethDst->value[4], (int)ethDst->value[5]);
-        std::ostringstream cmd;
-        cmd << "flow-mod cmd=add,table=0,prio=100 eth_dst=" << macbuf << ",apply:output=" << dst_port;
-        DpctlExecute(dst_dpid, cmd.str());
-
-        struct ofl_msg_packet_out* po = (struct ofl_msg_packet_out*)malloc(sizeof(*po));
-        memset(po, 0, sizeof(*po));
-        po->header.type = OFPT_PACKET_OUT;
-        po->buffer_id = msg->buffer_id;
-        po->in_port = inPort;
-        if (msg->buffer_id == OFP_NO_BUFFER && msg->data && msg->data_length > 0) {
-            po->data_length = msg->data_length;
-            po->data = (uint8_t*)malloc(msg->data_length);
-            memcpy(po->data, msg->data, msg->data_length);
-        } else {
-            po->data_length = 0;
-            po->data = nullptr;
-        }
-        struct ofl_action_output* a = (struct ofl_action_output*)malloc(sizeof(*a));
-        a->header.type = OFPAT_OUTPUT;
-        a->header.len = sizeof(*a);
-        a->port = dst_port;
-        a->max_len = 0;
-        po->actions_num = 1;
-        po->actions = (struct ofl_action_header**)malloc(sizeof(struct ofl_action_header*));
-        po->actions[0] = (struct ofl_action_header*)a;
-        SendToSwitch(swtch, (struct ofl_msg_header*)po, 0);
-        free(po->actions);
-        free(a);
-        if (po->data) free(po->data);
-        free(po);
-        ofl_msg_free((struct ofl_msg_header*)msg, nullptr);
-        return 0;
-    }
-
-    // Multi-hop path computation
-    auto opt_path = m_topology.ShortestPath(dpid, dst_dpid);
-    if (!opt_path || opt_path->size() < 2) {
-        // No path found: flood
-        struct ofl_msg_packet_out* po = (struct ofl_msg_packet_out*)malloc(sizeof(*po));
-        memset(po, 0, sizeof(*po));
-        po->header.type = OFPT_PACKET_OUT;
-        po->buffer_id = msg->buffer_id;
-        po->in_port = inPort;
-        if (msg->buffer_id == OFP_NO_BUFFER && msg->data && msg->data_length > 0) {
-            po->data_length = msg->data_length;
-            po->data = (uint8_t*)malloc(msg->data_length);
-            memcpy(po->data, msg->data, msg->data_length);
-        } else {
-            po->data_length = 0;
-            po->data = nullptr;
-        }
-        struct ofl_action_output* a = (struct ofl_action_output*)malloc(sizeof(*a));
-        a->header.type = OFPAT_OUTPUT;
-        a->header.len = sizeof(*a);
-        a->port = OFPP_FLOOD;
-        a->max_len = 0;
-        po->actions_num = 1;
-        po->actions = (struct ofl_action_header**)malloc(sizeof(struct ofl_action_header*));
-        po->actions[0] = (struct ofl_action_header*)a;
-        SendToSwitch(swtch, (struct ofl_msg_header*)po, 0);
-        free(po->actions);
-        free(a);
-        if (po->data) free(po->data);
-        free(po);
-        ofl_msg_free((struct ofl_msg_header*)msg, nullptr);
-        return 0;
-    }
-
-    std::vector<uint64_t> path = *opt_path;
-    // Install flows along path
-    for (size_t i = 0; i + 1 < path.size(); ++i) {
-        uint64_t u = path[i];
-        uint64_t v = path[i+1];
-        auto outp_opt = m_topology.GetOutPort(u, v);
-        if (!outp_opt) continue;
-        uint32_t outp = *outp_opt;
-        char macbuf[32];
-        snprintf(macbuf, sizeof(macbuf), "%02x:%02x:%02x:%02x:%02x:%02x",
-                 (int)ethDst->value[0], (int)ethDst->value[1], (int)ethDst->value[2],
-                 (int)ethDst->value[3], (int)ethDst->value[4], (int)ethDst->value[5]);
-        std::ostringstream cmd;
-        cmd << "flow-mod cmd=add,table=0,prio=100 eth_dst=" << macbuf << ",apply:output=" << outp;
-        DpctlExecute(u, cmd.str());
-    }
-
-    // Send packet_out from source to first next-hop
-    auto first_out_opt = m_topology.GetOutPort(path[0], path[1]);
-    if (first_out_opt) {
-        uint32_t first_out = *first_out_opt;
-        struct ofl_msg_packet_out* po = (struct ofl_msg_packet_out*)malloc(sizeof(*po));
-        memset(po, 0, sizeof(*po));
-        po->header.type = OFPT_PACKET_OUT;
-        po->buffer_id = msg->buffer_id;
-        po->in_port = inPort;
-        if (msg->buffer_id == OFP_NO_BUFFER && msg->data && msg->data_length > 0) {
-            po->data_length = msg->data_length;
-            po->data = (uint8_t*)malloc(msg->data_length);
-            memcpy(po->data, msg->data, msg->data_length);
-        } else {
-            po->data_length = 0;
-            po->data = nullptr;
-        }
-        struct ofl_action_output* a = (struct ofl_action_output*)malloc(sizeof(*a));
-        a->header.type = OFPAT_OUTPUT;
-        a->header.len = sizeof(*a);
-        a->port = first_out;
-        a->max_len = 0;
-        po->actions_num = 1;
-        po->actions = (struct ofl_action_header**)malloc(sizeof(struct ofl_action_header*));
-        po->actions[0] = (struct ofl_action_header*)a;
-        SendToSwitch(swtch, (struct ofl_msg_header*)po, 0);
-        free(po->actions);
-        free(a);
-        if (po->data) free(po->data);
-        free(po);
-    }
+    ForwardPacket(swtch, inPort, msg, src_mac, dst_mac);
 
     ofl_msg_free((struct ofl_msg_header*)msg, nullptr);
     return 0;
 }
 
-ofl_err ZmqOpenFlowController::HandlePortStatus(struct ofl_msg_port_status* msg,
-                                                Ptr<const RemoteSwitch> swtch,
-                                                uint32_t xid) {
+ofl_err
+ZmqOpenFlowController::HandlePortStatus(struct ofl_msg_port_status* msg,
+    Ptr<const RemoteSwitch> swtch,
+    uint32_t xid) {
     uint64_t dpid = swtch->GetDpId();
-    uint8_t* tx_buf = nullptr;
-    size_t tx_len = 0;
 
-    ofl_err pack_err = ofl_msg_pack((struct ofl_msg_header*)msg,
-                                    xid,
-                                    &tx_buf,
-                                    &tx_len,
-                                    nullptr);
+    if (msg && msg->desc) {
+        uint32_t port_no = msg->desc->port_no;
 
-    if (!pack_err) {
-        // Before forwarding to Python, update local controller state
-        if (msg && msg->desc) {
-            uint32_t port_no = msg->desc->port_no;
-            // reason: OFPPR_ADD=0, OFPPR_DELETE=1, OFPPR_MODIFY=2
-            if (msg->reason == 1) { // delete
-                // remove from switch ports and topology
-                auto it = m_switchPorts.find(dpid);
-                if (it != m_switchPorts.end()) {
-                    it->second.erase(port_no);
+        if (msg->reason == OFPPR_DELETE) {
+            auto it = m_switchPorts.find(dpid);
+            if (it != m_switchPorts.end())
+                it->second.erase(port_no);
+
+            m_topology.RemovePort(dpid, port_no);
+
+            for (auto mit = m_macToLoc.begin(); mit != m_macToLoc.end();) {
+                if (mit->second.first == dpid && mit->second.second == port_no)
+                    mit = m_macToLoc.erase(mit);
+                else
+                    ++mit;
+            }
+            // WriteStateToJson();
+        }
+        else if (msg->reason == OFPPR_ADD) {
+            m_switchPorts[dpid].insert(port_no);
+            // Probe the new port immediately for LLDP
+            auto swIt = m_switchMap.find(dpid);
+            if (swIt != m_switchMap.end()) {
+                uint64_t nowNs = Simulator::Now().GetNanoSeconds();
+                m_lldpSendNs[dpid][port_no] = nowNs;
+                auto frame = BuildLldpFrame(dpid, port_no, nowNs);
+                auto* po = BuildLldpPacketOut(port_no, frame.data(), frame.size());
+                if (po) {
+                    SendToSwitch(swIt->second, po, 0);
+                    ofl_msg_free(po, nullptr);
                 }
-                m_topology.RemovePort(dpid, port_no);
-
-                // remove any MAC mappings pointing to this (dpid,port)
-                for (auto mit = m_macToLoc.begin(); mit != m_macToLoc.end();) {
-                    if (mit->second.first == dpid && mit->second.second == port_no) {
-                        mit = m_macToLoc.erase(mit);
-                    } else {
-                        ++mit;
-                    }
-                }
-            } else {
-                // add/modify -> record port as known link port (LLDP will discover peers)
-                m_switchPorts[dpid].insert(port_no);
             }
         }
-
-        ExchangeWithPython(dpid, tx_buf, tx_len);
-        free(tx_buf);
     }
 
     return OFSwitch13Controller::HandlePortStatus(msg, swtch, xid);
 }
 
-ofl_err ZmqOpenFlowController::HandleMultipartReply(
-    struct ofl_msg_multipart_reply_header* msg,
+ofl_err
+ZmqOpenFlowController::HandleMultipartReply(struct ofl_msg_multipart_reply_header* msg,
     Ptr<const RemoteSwitch> swtch,
     uint32_t xid) {
-    uint64_t dpid = swtch->GetDpId();
-    uint8_t* tx_buf = nullptr;
-    size_t tx_len = 0;
-
-    ofl_err pack_err = ofl_msg_pack(
-        (struct ofl_msg_header*)msg, xid, &tx_buf, &tx_len, nullptr);
-
-    if (!pack_err) {
-        ExchangeWithPython(dpid, tx_buf, tx_len);
-        free(tx_buf);
-    }
-
     return OFSwitch13Controller::HandleMultipartReply(msg, swtch, xid);
 }
 
@@ -468,77 +396,179 @@ ofl_err ZmqOpenFlowController::HandleMultipartReply(
 //  Simulated-time triggers
 // ------------------------------------------------------------------
 void ZmqOpenFlowController::TriggerLldp() {
-    std::vector<uint8_t> buf{'L', 'L', 'D', 'P'};
-    uint16_t n = static_cast<uint16_t>(m_switchMap.size());
-    uint16_t n_bo = htons(n);
-    buf.insert(buf.end(), reinterpret_cast<uint8_t*>(&n_bo),
-               reinterpret_cast<uint8_t*>(&n_bo) + sizeof n_bo);
-    for (const auto& kv : m_switchMap)
-    {
-        uint64_t d_bo = Htonll(kv.first);
-        buf.insert(buf.end(), reinterpret_cast<uint8_t*>(&d_bo),
-                   reinterpret_cast<uint8_t*>(&d_bo) + sizeof d_bo);
-    }
-    ExchangeWithPython(0, buf.data(), buf.size());
+    bool hasLinks = !m_topology.GetAllLinks().empty();
+    int switchIdx = 0;
 
-    // Also generate LLDP Ethernet frames locally and send PacketOuts
     for (const auto& kv : m_switchMap) {
         uint64_t src_dpid = kv.first;
         Ptr<const RemoteSwitch> sw = kv.second;
 
-        auto it = m_switchPorts.find(src_dpid);
-        if (it == m_switchPorts.end() || it->second.empty()) {
-            // fallback ports 1..4 when no inventory
-            for (uint32_t p = 1; p <= 4; ++p) {
-                std::vector<uint8_t> frame = BuildLldpFrame(src_dpid, p);
-                struct ofl_msg_header* po = BuildLldpPacketOut(p, frame.data(), frame.size());
-                if (po) {
-                    SendToSwitch(sw, po, 0);
-                    ofl_msg_free(po, nullptr);
-                }
+        // Stagger switches by 2ms so their pipelines don't convoy
+        Time baseOffset = MilliSeconds(switchIdx * 2);
+
+        for (uint32_t p = 1; p <= kMaxLldpProbe; ++p) {
+            // Once topology is stable, skip confirmed host-facing ports
+            if (hasLinks
+                && m_switchPorts[src_dpid].count(p)
+                && !m_topology.IsSwitchLinkPort(src_dpid, p)) {
+                continue;
             }
-        } else {
-            for (uint32_t p : it->second) {
-                std::vector<uint8_t> frame = BuildLldpFrame(src_dpid, p);
-                struct ofl_msg_header* po = BuildLldpPacketOut(p, frame.data(), frame.size());
-                if (po) {
-                    SendToSwitch(sw, po, 0);
-                    ofl_msg_free(po, nullptr);
-                }
-            }
+
+            // Stagger ports by 100 µs
+            Time portOffset = MicroSeconds(p * 100);
+            Simulator::Schedule(baseOffset + portOffset, &ZmqOpenFlowController::SendSingleLldp, this, sw, src_dpid, p);
         }
+        switchIdx++;
     }
 
-    Simulator::Schedule(Seconds(5), &ZmqOpenFlowController::TriggerLldp, this);
+    // 5 s until topology is complete, then back off to 30 s
+    double nextLldp = hasLinks ? 30.0 : 5.0;
+    Simulator::Schedule(Seconds(nextLldp), &ZmqOpenFlowController::TriggerLldp, this);
 }
 
-void ZmqOpenFlowController::TriggerStats() {
-    std::vector<uint8_t> buf{'S', 'T', 'A', 'T', 'S'};
-    uint16_t n = static_cast<uint16_t>(m_switchMap.size());
-    uint16_t n_bo = htons(n);
-    buf.insert(buf.end(), reinterpret_cast<uint8_t*>(&n_bo),
-               reinterpret_cast<uint8_t*>(&n_bo) + sizeof n_bo);
-    for (const auto& kv : m_switchMap)
-    {
-        uint64_t d_bo = Htonll(kv.first);
-        buf.insert(buf.end(), reinterpret_cast<uint8_t*>(&d_bo),
-                   reinterpret_cast<uint8_t*>(&d_bo) + sizeof d_bo);
-    }
-    ExchangeWithPython(0, buf.data(), buf.size());
+void ZmqOpenFlowController::SendSingleLldp(Ptr<const RemoteSwitch> swtch, uint64_t dpid, uint32_t port) {
+    uint64_t nowNs = Simulator::Now().GetNanoSeconds();
+    m_lldpSendNs[dpid][port] = nowNs;
 
-    // Additionally, send a native PORT_STATS request directly from C++ to
-    // each registered switch. This reduces turnaround time for stats replies
-    // and allows the controller to maintain port stats without a Python
-    // round-trip. We still call ExchangeWithPython above for existing behavior.
+    auto frame = BuildLldpFrame(dpid, port, nowNs);
+    auto* po = BuildLldpPacketOut(port, frame.data(), frame.size());
+    if (po) {
+        SendToSwitch(swtch, po, 0);
+        ofl_msg_free(po, nullptr);
+    }
+}
+
+void
+ZmqOpenFlowController::TriggerStats() {
     for (const auto& kv : m_switchMap) {
-        Ptr<const RemoteSwitch> sw = kv.second;
         struct ofl_msg_header* req = BuildPortStatsRequest();
         if (req) {
-            SendToSwitch(sw, req, 0);
+            SendToSwitch(kv.second, req, 0);
             ofl_msg_free(req, nullptr);
         }
     }
-    Simulator::Schedule(Seconds(10), &ZmqOpenFlowController::TriggerStats, this);
+    Simulator::Schedule(Seconds(60), &ZmqOpenFlowController::TriggerStats, this);
+}
+
+// ------------------------------------------------------------------
+//  State serialization
+// ------------------------------------------------------------------
+void
+ZmqOpenFlowController::WriteStateToJson() {
+    std::string state_dir = "scratch/data/state";
+    mkdir("scratch/data", 0755);
+    mkdir(state_dir.c_str(), 0755);
+
+    std::string output_file = state_dir + "/sdn_state.json";
+
+    std::ostringstream json;
+    json << std::fixed << std::setprecision(3);
+    json << "{\n";
+
+    auto now = std::time(nullptr);
+    json << "  \"timestamp\": " << now << ",\n";
+
+    json << "  \"controller\": {\n";
+    json << "    \"id\": \"sdn-controller\",\n";
+    json << "    \"label\": \"SDN Controller\",\n";
+    json << "    \"detail\": \"OpenFlow 1.3 Controller\"\n";
+    json << "  },\n";
+
+    // Switches: array of {dpid, name} objects (name = "S{dpid-1}")
+    json << "  \"switches\": [";
+    bool first = true;
+    for (const auto& kv : m_switchMap) {
+        if (!first) json << ", ";
+        json << "\n    {\"dpid\": " << kv.first
+            << ", \"name\": \"S" << (kv.first - 1) << "\"}";
+        first = false;
+    }
+    if (!first) json << "\n  ";
+    json << "],\n";
+
+    // Hosts with colon-separated MAC and optional IP
+    json << "  \"hosts\": [";
+    first = true;
+    for (const auto& kv : m_macToLoc) {
+        uint64_t mac = kv.first;
+        uint64_t dpid = kv.second.first;
+        uint32_t port = kv.second.second;
+
+        if (!first) json << ", ";
+        json << "\n    {\n";
+        json << "      \"mac\": \"" << FormatMac(mac) << "\",\n";
+        json << "      \"dpid\": " << dpid << ",\n";
+        json << "      \"port\": " << port;
+
+        auto ipIt = m_hostIpMap.find(mac);
+        if (ipIt != m_hostIpMap.end()) {
+            json << ",\n      \"ip\": \"" << FormatIp(ipIt->second) << "\"";
+        }
+        json << "\n    }";
+        first = false;
+    }
+    if (!first) json << "\n  ";
+    json << "],\n";
+
+    // Links with cost_ms
+    json << "  \"links\": [";
+    first = true;
+    for (const auto& link : m_topology.GetAllLinks()) {
+        if (!first) json << ", ";
+        json << "\n    {\n";
+        json << "      \"src_dpid\": " << link.src_dpid << ",\n";
+        json << "      \"src_port\": " << link.src_port << ",\n";
+        json << "      \"dst_dpid\": " << link.dst_dpid << ",\n";
+        json << "      \"dst_port\": " << link.dst_port << ",\n";
+        json << "      \"cost_ms\": " << link.cost_ms << "\n";
+        json << "    }";
+        first = false;
+    }
+    if (!first) json << "\n  ";
+    json << "],\n";
+
+    // Port statistics
+    json << "  \"stats\": {";
+    first = true;
+    for (const auto& sw_kv : m_portStats) {
+        if (!first) json << ", ";
+        json << "\n    \"" << sw_kv.first << "\": {";
+        bool first_port = true;
+        for (const auto& port_kv : sw_kv.second) {
+            if (!first_port) json << ", ";
+            json << "\n      \"" << port_kv.first << "\": {"
+                << "\"rx_packets\": 0, \"tx_packets\": 0, "
+                << "\"rx_bytes\": 0, \"tx_bytes\": " << port_kv.second << "}";
+            first_port = false;
+        }
+        if (!first_port) json << "\n    ";
+        json << "}";
+        first = false;
+    }
+    if (!first) json << "\n  ";
+    json << "},\n";
+
+    // Control links
+    json << "  \"control_links\": [";
+    first = true;
+    for (const auto& kv : m_switchMap) {
+        if (!first) json << ", ";
+        json << "\n    {\"dpid\": " << kv.first << "}";
+        first = false;
+    }
+    if (!first) json << "\n  ";
+    json << "]\n";
+
+    json << "}\n";
+
+    std::ofstream file(output_file);
+    if (file.is_open()) {
+        file << json.str();
+        NS_LOG_DEBUG("Wrote state to " << output_file);
+    }
+    else {
+        NS_LOG_WARN("Failed to open " << output_file);
+    }
 }
 
 } // namespace ns3

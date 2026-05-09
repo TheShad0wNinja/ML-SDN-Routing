@@ -306,7 +306,11 @@ def generate_html(state, output_path):
     ctrl_meta = dict(state.get("controller") or {})
     control_links = state.get("control_links")
     if control_links is None:
-        control_links = [{"dpid": d} for d in switches]
+        # Derive from switches list (handles both int and dict entries)
+        control_links = []
+        for sw in switches:
+            dpid = sw["dpid"] if isinstance(sw, dict) else sw
+            control_links.append({"dpid": dpid})
 
     # Build vis-network nodes
     node_list = []
@@ -323,11 +327,18 @@ def generate_html(state, output_path):
         })
 
     for sw in switches:
+        # Support both bare integer dpids (legacy) and {dpid, name} objects
+        if isinstance(sw, dict):
+            dpid = sw["dpid"]
+            sw_name = sw.get("name", f"S{dpid - 1}")
+        else:
+            dpid = sw
+            sw_name = f"S{dpid - 1}"
         node_list.append({
-            "id": str(sw),
-            "label": f"Switch {sw}",
+            "id": str(dpid),
+            "label": sw_name,
             "group": "switch",
-            "title": f"DPID: {sw}"
+            "title": f"DPID: {dpid}"
         })
     
     for h in hosts:
@@ -376,11 +387,12 @@ def generate_html(state, output_path):
         if key in seen:
             continue
         seen.add(key)
+        cost = lk.get("cost_ms", lk.get("cost", 1))
         edge_list.append({
             "from": src,
             "to": dst,
-            "label": f"{lk['src_port']}↔{lk['dst_port']}",
-            "title": f"Link: {lk['src_dpid']}:{lk['src_port']} ↔ {lk['dst_dpid']}:{lk['dst_port']}<br>Cost: {lk.get('cost', 1)}"
+            "label": f"{lk['src_port']}↔{lk['dst_port']} ({cost:.1f}ms)" if isinstance(cost, float) else f"{lk['src_port']}↔{lk['dst_port']}",
+            "title": f"Link: {lk['src_dpid']}:{lk['src_port']} ↔ {lk['dst_dpid']}:{lk['dst_port']}<br>Cost: {cost}ms"
         })
 
     # Attach hosts to their access switch (LLDP only discovers switch–switch links).

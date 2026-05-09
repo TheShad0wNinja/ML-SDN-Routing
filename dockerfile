@@ -48,9 +48,9 @@ RUN git clone --recurse-submodules https://github.com/ljerezchaves/ofswitch13.gi
 
 # Apply ns-3 patch for OpenFlow callback
 WORKDIR /workspace/ns-3.40
-RUN set -e; \
-    patch -p1 < contrib/ofswitch13/utils/ofswitch13-3_40.patch 2>/dev/null || \
-    patch -p1 < contrib/ofswitch13/utils/ofswitch13-3_39.patch
+RUN set -e
+RUN patch -p1 < contrib/ofswitch13/utils/ofswitch13-3_40.patch
+RUN patch -p1 < contrib/ofswitch13/utils/csma-full-duplex-3_40.patch
 
 # Configure and build
 RUN ./ns3 configure --disable-examples --disable-tests
