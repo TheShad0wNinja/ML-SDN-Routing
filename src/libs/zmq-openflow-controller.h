@@ -39,6 +39,10 @@ protected:
                                  Ptr<const RemoteSwitch> swtch,
                                  uint32_t xid) override;
 
+    ofl_err HandleEchoReply(struct ofl_msg_echo* msg,
+                            Ptr<const RemoteSwitch> swtch,
+                            uint32_t xid) override;
+
 private:
     void SendPacketOut(Ptr<const RemoteSwitch> swtch,
                        uint32_t inPort,
@@ -60,8 +64,11 @@ private:
     static std::string FormatIp(uint32_t ip);
 
     void SendSingleLldp(Ptr<const RemoteSwitch> swtch, uint64_t dpid, uint32_t port);
+    void TriggerEcho();
 
-    static constexpr uint32_t kMaxLldpProbe = 8;
+    static constexpr uint32_t kMaxLldpProbe   = 8;
+    static constexpr double   kEchoIntervalSec = 60;
+    static constexpr uint32_t kEchoMaxMissed   = 3;
 
     std::unique_ptr<zmq::context_t> m_zmqContext;
     std::unique_ptr<zmq::socket_t>  m_socket;
@@ -77,6 +84,12 @@ private:
     std::unordered_map<uint64_t, uint32_t> m_hostIpMap;
     // LLDP send timestamps: dpid -> port -> nanoseconds
     std::unordered_map<uint64_t, std::unordered_map<uint32_t, uint64_t>> m_lldpSendNs;
+    // Echo timestamps: dpid -> nanoseconds of last outgoing echo request
+    std::unordered_map<uint64_t, uint64_t> m_echoSendNs;
+    // Echo RTTs: dpid -> last measured control-plane RTT in nanoseconds
+    std::unordered_map<uint64_t, uint64_t> m_echoRttNs;
+    // Liveness: dpid -> consecutive echo requests without a reply
+    std::unordered_map<uint64_t, uint32_t> m_echoMissCount;
 };
 
 } // namespace ns3

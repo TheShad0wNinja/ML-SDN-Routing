@@ -52,6 +52,7 @@ void ZmqOpenFlowController::DoDispose() {
 void ZmqOpenFlowController::StartApplication() {
     // Start LLDP early so topology is known before pings at t=2s
     Simulator::Schedule(Seconds(0.5), &ZmqOpenFlowController::TriggerLldp, this);
+    Simulator::Schedule(Seconds(1.0), &ZmqOpenFlowController::TriggerEcho, this);
     Simulator::Schedule(Seconds(60), &ZmqOpenFlowController::TriggerStats, this);
 
     OFSwitch13Controller::StartApplication();
@@ -187,8 +188,14 @@ ZmqOpenFlowController::HandleLldpPacket(uint64_t dpid, uint32_t inPort,
     double costMs = 1.0;
     if (sendNs != 0) {
         uint64_t nowNs = Simulator::Now().GetNanoSeconds();
-        if (nowNs > sendNs)
-            costMs = static_cast<double>(nowNs - sendNs) / 1e6;
+        if (nowNs > sendNs) {
+            uint64_t totalNs    = nowNs - sendNs;
+            uint64_t halfRttA   = m_echoRttNs.count(chassis_id) ? m_echoRttNs.at(chassis_id) / 2 : 0;
+            uint64_t halfRttB   = m_echoRttNs.count(dpid)       ? m_echoRttNs.at(dpid)       / 2 : 0;
+            uint64_t correction = halfRttA + halfRttB;
+            uint64_t linkNs     = (totalNs > correction) ? totalNs - correction : totalNs;
+            costMs = std::max(0.001, static_cast<double>(linkNs) / 1e6);
+        }
     }
 
     m_topology.AddLink(chassis_id, port_id, dpid, inPort, costMs);
@@ -436,6 +443,39 @@ void ZmqOpenFlowController::SendSingleLldp(Ptr<const RemoteSwitch> swtch, uint64
         SendToSwitch(swtch, po, 0);
         ofl_msg_free(po, nullptr);
     }
+}
+
+void
+ZmqOpenFlowController::TriggerEcho() {
+    for (const auto& [dpid, swtch] : m_switchMap) {
+        auto& miss = m_echoMissCount[dpid];
+        if (miss >= kEchoMaxMissed) {
+            NS_LOG_WARN("[ECHO] Switch " << dpid << " missed " << miss
+                        << " consecutive echo replies — link may be down");
+        }
+        m_echoSendNs[dpid] = Simulator::Now().GetNanoSeconds();
+        miss++;
+        SendEchoRequest(swtch, 0);
+    }
+    Simulator::Schedule(Seconds(kEchoIntervalSec),
+                        &ZmqOpenFlowController::TriggerEcho, this);
+}
+
+ofl_err
+ZmqOpenFlowController::HandleEchoReply(struct ofl_msg_echo* msg,
+                                       Ptr<const RemoteSwitch> swtch,
+                                       uint32_t xid)
+{
+    uint64_t dpid = swtch->GetDpId();
+    auto it = m_echoSendNs.find(dpid);
+    if (it != m_echoSendNs.end()) {
+        uint64_t rttNs = Simulator::Now().GetNanoSeconds() - it->second;
+        m_echoRttNs[dpid] = rttNs;
+        m_echoMissCount[dpid] = 0;
+        m_echoSendNs.erase(it);
+        NS_LOG_INFO("[ECHO] Switch " << dpid << " RTT=" << (rttNs / 1e6) << "ms");
+    }
+    return OFSwitch13Controller::HandleEchoReply(msg, swtch, xid);
 }
 
 void

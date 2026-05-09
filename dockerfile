@@ -51,6 +51,10 @@ WORKDIR /workspace/ns-3.40
 RUN set -e
 RUN patch -p1 < contrib/ofswitch13/utils/ofswitch13-3_40.patch
 RUN patch -p1 < contrib/ofswitch13/utils/csma-full-duplex-3_40.patch
+# Apply custom patch for HandleEchoReply in base controller
+RUN sed -i \
+  's/^    ofl_err HandleEchoReply(/    virtual ofl_err HandleEchoReply(/' \
+  /workspace/ns-3.40/contrib/ofswitch13/model/ofswitch13-controller.h
 
 # Configure and build
 RUN ./ns3 configure --disable-examples --disable-tests
