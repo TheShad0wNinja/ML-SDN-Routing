@@ -51,10 +51,19 @@ WORKDIR /workspace/ns-3.40
 RUN set -e
 RUN patch -p1 < contrib/ofswitch13/utils/ofswitch13-3_40.patch
 RUN patch -p1 < contrib/ofswitch13/utils/csma-full-duplex-3_40.patch
-# Apply custom patch for HandleEchoReply in base controller
-RUN sed -i \
-  's/^    ofl_err HandleEchoReply(/    virtual ofl_err HandleEchoReply(/' \
-  /workspace/ns-3.40/contrib/ofswitch13/model/ofswitch13-controller.h
+
+# Make HandleEchoReply virtual in base controller
+RUN python3 -c "\
+import pathlib;\
+p = pathlib.Path('/workspace/ns-3.40/contrib/ofswitch13/model/ofswitch13-controller.h');\
+c = p.read_text();\
+c = c.replace('    ofl_err HandleEchoReply(', '    virtual ofl_err HandleEchoReply(');\
+p.write_text(c);\
+print('Patched ofswitch13-controller.h')\
+"
+
+# Inject real ns-3 DataRate into OpenFlow port speed fields 
+RUN  python3 -c "path='/workspace/ns-3.40/contrib/ofswitch13/model/ofswitch13-port.cc'; old='    m_swPort->conf->curr_speed = port_speed(m_swPort->conf->curr);\n    m_swPort->conf->max_speed = port_speed(m_swPort->conf->supported);'; new='    m_swPort->conf->curr_speed = port_speed(m_swPort->conf->curr);\n    m_swPort->conf->max_speed = port_speed(m_swPort->conf->supported);\n\n    // Patch: override with actual ns-3 DataRate in kbps.\n    DataRate rate;\n    Ptr<Channel> channel = m_netDev->GetChannel();\n    if (channel)\n      {\n        Ptr<CsmaChannel> csmaChannel = channel->GetObject<CsmaChannel>();\n        if (csmaChannel)\n          {\n            DataRateValue drv;\n            csmaChannel->GetAttribute(\"DataRate\", drv);\n            rate = drv.Get();\n          }\n      }\n    if (rate.GetBitRate() > 0)\n      {\n        m_swPort->conf->curr_speed = static_cast<uint32_t>(rate.GetBitRate() / 1000);\n        m_swPort->conf->max_speed = static_cast<uint32_t>(rate.GetBitRate() / 1000);\n      }'; f=open(path); c=f.read(); f.close(); c=c.replace(old,new); f=open(path,'w'); f.write(c); f.close()"
 
 # Configure and build
 RUN ./ns3 configure --disable-examples --disable-tests
