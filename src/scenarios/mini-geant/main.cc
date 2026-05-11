@@ -146,22 +146,23 @@ int main(int argc, char* argv[]) {
     internal->CreateOpenFlowChannels();
 
     // Advertising nodes
-    ApplicationContainer discoveryApps;
-    for (uint32_t i = 0; i < hosts.GetN(); i++) {
-        uint32_t dest = (i + 1) % hosts.GetN();
-        PingHelper pingHelper(Ipv4Address(hostIpIfaces.GetAddress(dest)));
-        pingHelper.SetAttribute("VerboseMode", EnumValue(Ping::QUIET));
-        pingHelper.SetAttribute("Count", UintegerValue(1));
-        discoveryApps.Add(pingHelper.Install(hosts.Get(i)));
-    }
-    discoveryApps.Start(Seconds(2.0));
-    discoveryApps.Stop(Seconds(5.0));
+    // ApplicationContainer discoveryApps;
+    // for (uint32_t i = 0; i < hosts.GetN(); i++) {
+    //     uint32_t dest = (i + 1) % hosts.GetN();
+    //     PingHelper pingHelper(Ipv4Address(hostIpIfaces.GetAddress(dest)));
+    //     pingHelper.SetAttribute("VerboseMode", EnumValue(Ping::QUIET));
+    //     pingHelper.SetAttribute("Count", UintegerValue(1));
+    //     discoveryApps.Add(pingHelper.Install(hosts.Get(i)));
+    // }
+    // discoveryApps.Start(Seconds(2.0));
+    // discoveryApps.Stop(Seconds(5.0));
 
     NS_LOG_INFO("Configuring Traffic (Ping)...");
     ApplicationContainer pingApps;
 
-    for (uint32_t i = 0; i < hosts.GetN(); i++) {
-        uint32_t dest = (i + 1) % hosts.GetN();
+    for (uint32_t i = 1; i < hosts.GetN(); i++) {
+        // uint32_t dest = (i + 1) % hosts.GetN();
+        uint32_t dest = 0;
         PingHelper pingHelper(Ipv4Address(hostIpIfaces.GetAddress(dest)));
         pingHelper.SetAttribute("VerboseMode", EnumValue(Ping::QUIET));
         pingHelper.SetAttribute("Count", UintegerValue(0));

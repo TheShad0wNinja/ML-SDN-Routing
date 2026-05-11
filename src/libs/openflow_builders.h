@@ -61,6 +61,7 @@ struct ofl_msg_header* BuildLldpPacketOut(uint32_t portNo,
                                           std::size_t frameLen);
 
 struct ofl_msg_header* BuildPortStatsRequest();
+struct ofl_msg_header* BuildPortDescRequest();
 
 } // namespace ns3
 

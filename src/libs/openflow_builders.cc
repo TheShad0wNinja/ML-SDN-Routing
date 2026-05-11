@@ -176,4 +176,18 @@ BuildPortStatsRequest()
     return reinterpret_cast<struct ofl_msg_header*>(req);
 }
 
+struct ofl_msg_header*
+BuildPortDescRequest()
+{
+    struct ofl_msg_multipart_request_header* req =
+        static_cast<struct ofl_msg_multipart_request_header*>(
+            std::malloc(sizeof(*req)));
+    if (!req) return nullptr;
+    std::memset(req, 0, sizeof(*req));
+    req->header.type = OFPT_MULTIPART_REQUEST;
+    req->type        = OFPMP_PORT_DESC;
+    req->flags       = 0;
+    return reinterpret_cast<struct ofl_msg_header*>(req);
+}
+
 } // namespace ns3

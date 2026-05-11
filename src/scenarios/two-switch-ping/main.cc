@@ -14,7 +14,7 @@ NS_LOG_COMPONENT_DEFINE("ZmqControllerMain");
 
 int main(int argc, char* argv[])
 {
-    bool trace = true;
+    bool trace = false;
     double simTime = 3600;
 
     CommandLine cmd(__FILE__);
@@ -119,16 +119,16 @@ int main(int argc, char* argv[])
     }
 
     // Have all nodes seen by controller
-    ApplicationContainer discoveryApps;
-    for (uint32_t i = 0; i < hosts.GetN(); i++) {
-        uint32_t dest = (i + 1) % hosts.GetN();
-        PingHelper pingHelper(Ipv4Address(hostIpIfaces.GetAddress(dest)));
-        pingHelper.SetAttribute("VerboseMode", EnumValue(Ping::QUIET));
-        pingHelper.SetAttribute("Count", UintegerValue(1));
-        discoveryApps.Add(pingHelper.Install(hosts.Get(i)));
-    }
-    discoveryApps.Start(Seconds(2.0));
-    discoveryApps.Stop(Seconds(5.0));
+    // ApplicationContainer discoveryApps;
+    // for (uint32_t i = 0; i < hosts.GetN(); i++) {
+    //     uint32_t dest = (i + 1) % hosts.GetN();
+    //     PingHelper pingHelper(Ipv4Address(hostIpIfaces.GetAddress(dest)));
+    //     pingHelper.SetAttribute("VerboseMode", EnumValue(Ping::QUIET));
+    //     pingHelper.SetAttribute("Count", UintegerValue(1));
+    //     discoveryApps.Add(pingHelper.Install(hosts.Get(i)));
+    // }
+    // discoveryApps.Start(Seconds(2.0));
+    // discoveryApps.Stop(Seconds(5.0));
 
     // Actual ping test
     ApplicationContainer pingApps;

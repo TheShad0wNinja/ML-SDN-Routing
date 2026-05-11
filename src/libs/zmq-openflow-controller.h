@@ -66,6 +66,7 @@ private:
     void SendSingleLldp(Ptr<const RemoteSwitch> swtch, uint64_t dpid, uint32_t port);
     void TriggerEcho();
     void RebuildSpanningTree();
+    void HandlePortDescReply(struct ofl_msg_multipart_reply_port_desc* reply, uint64_t dpid);
     void FloodViaST(Ptr<const RemoteSwitch> inSwtch, uint32_t inPort,
                     uint32_t bufferId, const uint8_t* data, size_t dataLen);
 
