@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -39,6 +40,11 @@ void ZmqOpenFlowController::DoDispose() {
   m_macToLoc.clear();
   m_switchPorts.clear();
   m_portStats.clear();
+  m_portSpeeds.clear();
+  m_switchObs.clear();
+  m_hostAnnotations.clear();
+  m_switchEnergyModel.clear();
+  m_switchResidualEnergy.clear();
   m_hostIpMap.clear();
   m_ipToMac.clear();
   m_spanningTree.clear();
@@ -65,13 +71,30 @@ void ZmqOpenFlowController::StartApplication() {
   // Start LLDP early so topology is known before pings at t=2s
   Simulator::Schedule(Seconds(0.5), &ZmqOpenFlowController::TriggerLldp, this);
   Simulator::Schedule(Seconds(1.0), &ZmqOpenFlowController::TriggerEcho, this);
-  Simulator::Schedule(Seconds(60), &ZmqOpenFlowController::TriggerStats, this);
+  Simulator::Schedule(Seconds(m_statsIntervalS), &ZmqOpenFlowController::TriggerStats, this);
 
   OFSwitch13Controller::StartApplication();
 }
 
 void ZmqOpenFlowController::StopApplication() {
   OFSwitch13Controller::StopApplication();
+}
+
+void ZmqOpenFlowController::SetHostAnnotation(uint64_t mac,
+                                               const HostAnnotation& ann) {
+  m_hostAnnotations[mac] = ann;
+}
+
+void ZmqOpenFlowController::SetSwitchEnergyModel(uint64_t dpid,
+                                                   double initial_j,
+                                                   double per_byte_j) {
+  m_switchEnergyModel[dpid] = {initial_j, per_byte_j};
+  if (initial_j >= 0)
+    m_switchResidualEnergy[dpid] = initial_j;
+}
+
+void ZmqOpenFlowController::SetStatsInterval(double seconds) {
+  m_statsIntervalS = seconds;
 }
 
 // Handles initial connection with an OF Switch
@@ -479,8 +502,12 @@ void ZmqOpenFlowController::HandlePortDescReply(
     uint32_t pno = reply->stats[i]->port_no;
     if (pno < OFPP_MAX) {
       m_switchPorts[dpid].insert(pno);
+      uint32_t kbps = reply->stats[i]->curr_speed;
+      m_portSpeeds[dpid][pno] = kbps;
+      m_portStats[dpid][pno].speed_kbps = kbps;
       NS_LOG_INFO("[PORT-DESC]   port " << pno
-                  << " name=" << (reply->stats[i]->name ? reply->stats[i]->name : "?"));
+                  << " name=" << (reply->stats[i]->name ? reply->stats[i]->name : "?")
+                  << " speed=" << kbps << " kbps");
     }
   }
 }
@@ -488,12 +515,138 @@ void ZmqOpenFlowController::HandlePortDescReply(
 ofl_err ZmqOpenFlowController::HandleMultipartReply(
     struct ofl_msg_multipart_reply_header* msg, Ptr<const RemoteSwitch> swtch,
     uint32_t xid) {
-  if (msg->type == OFPMP_PORT_DESC)
+  uint64_t dpid = swtch->GetDpId();
+  if (msg->type == OFPMP_PORT_DESC) {
     HandlePortDescReply(
-        reinterpret_cast<struct ofl_msg_multipart_reply_port_desc*>(msg),
-        swtch->GetDpId());
-
+        reinterpret_cast<struct ofl_msg_multipart_reply_port_desc*>(msg), dpid);
+  } else if (msg->type == OFPMP_PORT_STATS) {
+    HandlePortStatsReply(
+        reinterpret_cast<struct ofl_msg_multipart_reply_port*>(msg), dpid);
+  }
   return OFSwitch13Controller::HandleMultipartReply(msg, swtch, xid);
+}
+
+void ZmqOpenFlowController::HandlePortStatsReply(
+    struct ofl_msg_multipart_reply_port* reply, uint64_t dpid) {
+  double nowSec = Simulator::Now().GetSeconds();
+  NS_LOG_INFO("[PORT-STATS] Switch " << dpid << ": " << reply->stats_num << " ports");
+
+  for (size_t i = 0; i < reply->stats_num; ++i) {
+    const struct ofl_port_stats* s = reply->stats[i];
+    uint32_t pno = s->port_no;
+    if (pno >= OFPP_MAX) continue;
+
+    PortStatsEntry& ps = m_portStats[dpid][pno];
+
+    // Compute instantaneous bit rates
+    double dt = (ps.prev_time_s > 0) ? (nowSec - ps.prev_time_s) : 0;
+    if (dt > 0) {
+      ps.rx_rate_bps = static_cast<double>(s->rx_bytes - ps.prev_rx_bytes) * 8.0 / dt;
+      ps.tx_rate_bps = static_cast<double>(s->tx_bytes - ps.prev_tx_bytes) * 8.0 / dt;
+      ps.rx_rate_bps = std::max(0.0, ps.rx_rate_bps);
+      ps.tx_rate_bps = std::max(0.0, ps.tx_rate_bps);
+    }
+
+    // Update snapshot for next interval
+    ps.prev_rx_bytes = s->rx_bytes;
+    ps.prev_tx_bytes = s->tx_bytes;
+    ps.prev_time_s   = nowSec;
+
+    // Store all raw counters
+    ps.rx_packets  = s->rx_packets;
+    ps.tx_packets  = s->tx_packets;
+    ps.rx_bytes    = s->rx_bytes;
+    ps.tx_bytes    = s->tx_bytes;
+    ps.rx_dropped  = s->rx_dropped;
+    ps.tx_dropped  = s->tx_dropped;
+    ps.rx_errors   = s->rx_errors;
+    ps.tx_errors   = s->tx_errors;
+    ps.duration_sec = s->duration_sec;
+
+    // Backfill speed from PORT_DESC cache
+    auto spIt = m_portSpeeds.find(dpid);
+    if (spIt != m_portSpeeds.end()) {
+      auto pIt = spIt->second.find(pno);
+      if (pIt != spIt->second.end()) ps.speed_kbps = pIt->second;
+    }
+
+    NS_LOG_INFO("[PORT-STATS]   port " << pno
+                << " rx=" << s->rx_bytes << "B tx=" << s->tx_bytes
+                << "B rx_rate=" << ps.rx_rate_bps / 1e6 << " Mbps"
+                << " tx_rate=" << ps.tx_rate_bps / 1e6 << " Mbps");
+  }
+
+  ComputeSwitchObservations(dpid);
+}
+
+void ZmqOpenFlowController::ComputeSwitchObservations(uint64_t dpid) {
+  SwitchObservation obs;
+  obs.K = 64; // OFSwitch13 default FIFO queue depth
+
+  auto psIt = m_portStats.find(dpid);
+  if (psIt == m_portStats.end()) {
+    m_switchObs[dpid] = obs;
+    return;
+  }
+
+  double dropRateBps = 0;
+  for (const auto& [pno, ps] : psIt->second) {
+    bool isHostPort = !m_topology.IsSwitchLinkPort(dpid, pno);
+    if (isHostPort) {
+      obs.lambda_bps += ps.rx_rate_bps;
+      obs.mu_max_bps += static_cast<double>(ps.speed_kbps) * 1000.0;
+    }
+    // Loss rate summed over all ports
+    dropRateBps += (ps.rx_rate_bps > 0 && ps.rx_dropped > 0)
+                       ? ps.rx_rate_bps * (static_cast<double>(ps.rx_dropped) /
+                                           std::max((uint64_t)1, ps.rx_packets))
+                       : 0;
+  }
+
+  obs.L_bps = dropRateBps;
+  obs.rbw_bps = std::max(0.0, obs.mu_max_bps - obs.lambda_bps);
+
+  if (obs.mu_max_bps > 0) {
+    obs.rho = obs.lambda_bps / obs.mu_max_bps;
+    obs.rho = std::min(obs.rho, 0.9999); // cap for stable M/M/1
+  }
+
+  // M/M/1 queue approximations
+  if (obs.rho > 0 && obs.rho < 1) {
+    obs.N = obs.rho / (1.0 - obs.rho);
+    // Little's law: d = N/lambda (in seconds), convert to ms
+    if (obs.lambda_bps > 0)
+      obs.d_ms = (obs.N / (obs.lambda_bps / 8.0)) * 1000.0;
+  } else if (obs.rho >= 1) {
+    obs.N = obs.K;
+    obs.d_ms = 1000.0; // saturated link
+  }
+
+  // Drain switch forwarding energy based on total TX rate across all ports
+  auto emIt = m_switchEnergyModel.find(dpid);
+  if (emIt != m_switchEnergyModel.end() && emIt->second.initial_energy_j >= 0) {
+    double totalTxBps = 0.0;
+    if (psIt != m_portStats.end())
+      for (const auto& [pno2, ps2] : psIt->second)
+        totalTxBps += ps2.tx_rate_bps;
+    double bytesForwarded = (totalTxBps / 8.0) * m_statsIntervalS;
+    auto reIt = m_switchResidualEnergy.find(dpid);
+    if (reIt != m_switchResidualEnergy.end()) {
+      reIt->second = std::max(0.0, reIt->second -
+                                   bytesForwarded * emIt->second.energy_per_byte_j);
+      obs.residual_energy_j = reIt->second;
+    }
+  }
+
+  m_switchObs[dpid] = obs;
+  NS_LOG_INFO("[OBS] Switch " << dpid
+              << " λ=" << obs.lambda_bps / 1e6 << "Mbps"
+              << " μ=" << obs.mu_max_bps / 1e6 << "Mbps"
+              << " ρ=" << obs.rho
+              << " N=" << obs.N
+              << " d=" << obs.d_ms << "ms"
+              << " RBW=" << obs.rbw_bps / 1e6 << "Mbps"
+              << " E=" << obs.residual_energy_j << "J");
 }
 
 // ------------------------------------------------------------------
@@ -656,8 +809,14 @@ void ZmqOpenFlowController::TriggerStats() {
       SendToSwitch(kv.second, req, 0);
       ofl_msg_free(req, nullptr);
     }
+    struct ofl_msg_header* qreq = BuildQueueStatsRequest();
+    if (qreq) {
+      SendToSwitch(kv.second, qreq, 0);
+      ofl_msg_free(qreq, nullptr);
+    }
   }
-  Simulator::Schedule(Seconds(60), &ZmqOpenFlowController::TriggerStats, this);
+  Simulator::Schedule(Seconds(m_statsIntervalS),
+                      &ZmqOpenFlowController::TriggerStats, this);
 }
 
 // ------------------------------------------------------------------
@@ -683,7 +842,7 @@ void ZmqOpenFlowController::WriteStateToJson() {
   json << "    \"detail\": \"OpenFlow 1.3 Controller\"\n";
   json << "  },\n";
 
-  // Switches: array of {dpid, name} objects (name = "S{dpid-1}")
+  // Switches
   json << "  \"switches\": [";
   bool first = true;
   for (const auto& kv : m_switchMap) {
@@ -695,11 +854,11 @@ void ZmqOpenFlowController::WriteStateToJson() {
   if (!first) json << "\n  ";
   json << "],\n";
 
-  // Hosts with colon-separated MAC and optional IP
+  // Hosts — name and node_type for topology viewer display
   json << "  \"hosts\": [";
   first = true;
   for (const auto& kv : m_macToLoc) {
-    uint64_t mac = kv.first;
+    uint64_t mac  = kv.first;
     uint64_t dpid = kv.second.first;
     uint32_t port = kv.second.second;
 
@@ -710,16 +869,25 @@ void ZmqOpenFlowController::WriteStateToJson() {
     json << "      \"port\": " << port;
 
     auto ipIt = m_hostIpMap.find(mac);
-    if (ipIt != m_hostIpMap.end()) {
+    if (ipIt != m_hostIpMap.end())
       json << ",\n      \"ip\": \"" << FormatIp(ipIt->second) << "\"";
+
+    auto annIt = m_hostAnnotations.find(mac);
+    if (annIt != m_hostAnnotations.end()) {
+      if (!annIt->second.name.empty())
+        json << ",\n      \"name\": \"" << annIt->second.name << "\"";
+      json << ",\n      \"node_type\": \"" << annIt->second.node_type << "\"";
+    } else {
+      json << ",\n      \"node_type\": \"host\"";
     }
+
     json << "\n    }";
     first = false;
   }
   if (!first) json << "\n  ";
   json << "],\n";
 
-  // Links with cost_ms
+  // Links
   json << "  \"links\": [";
   first = true;
   for (const auto& link : m_topology.GetAllLinks()) {
@@ -736,7 +904,7 @@ void ZmqOpenFlowController::WriteStateToJson() {
   if (!first) json << "\n  ";
   json << "],\n";
 
-  // Port statistics
+  // Full port statistics
   json << "  \"stats\": {";
   first = true;
   for (const auto& sw_kv : m_portStats) {
@@ -744,10 +912,22 @@ void ZmqOpenFlowController::WriteStateToJson() {
     json << "\n    \"" << sw_kv.first << "\": {";
     bool first_port = true;
     for (const auto& port_kv : sw_kv.second) {
+      const PortStatsEntry& ps = port_kv.second;
       if (!first_port) json << ", ";
-      json << "\n      \"" << port_kv.first << "\": {"
-           << "\"rx_packets\": 0, \"tx_packets\": 0, "
-           << "\"rx_bytes\": 0, \"tx_bytes\": " << port_kv.second << "}";
+      json << "\n      \"" << port_kv.first << "\": {\n";
+      json << "        \"rx_packets\": "  << ps.rx_packets  << ",\n";
+      json << "        \"tx_packets\": "  << ps.tx_packets  << ",\n";
+      json << "        \"rx_bytes\": "    << ps.rx_bytes    << ",\n";
+      json << "        \"tx_bytes\": "    << ps.tx_bytes    << ",\n";
+      json << "        \"rx_dropped\": "  << ps.rx_dropped  << ",\n";
+      json << "        \"tx_dropped\": "  << ps.tx_dropped  << ",\n";
+      json << "        \"rx_errors\": "   << ps.rx_errors   << ",\n";
+      json << "        \"tx_errors\": "   << ps.tx_errors   << ",\n";
+      json << "        \"duration_sec\": " << ps.duration_sec << ",\n";
+      json << "        \"rx_rate_bps\": " << ps.rx_rate_bps << ",\n";
+      json << "        \"tx_rate_bps\": " << ps.tx_rate_bps << ",\n";
+      json << "        \"speed_kbps\": "  << ps.speed_kbps  << "\n";
+      json << "      }";
       first_port = false;
     }
     if (!first_port) json << "\n    ";
@@ -756,6 +936,61 @@ void ZmqOpenFlowController::WriteStateToJson() {
   }
   if (!first) json << "\n  ";
   json << "},\n";
+
+  // Per-switch DDPG observation vectors
+  json << "  \"switch_observations\": {";
+  first = true;
+  for (const auto& kv : m_switchObs) {
+    if (!first) json << ", ";
+    const SwitchObservation& o = kv.second;
+    json << "\n    \"" << kv.first << "\": {\n";
+    json << "      \"lambda_bps\": "  << o.lambda_bps << ",\n";
+    json << "      \"mu_max_bps\": "  << o.mu_max_bps << ",\n";
+    json << "      \"rho\": "         << o.rho        << ",\n";
+    json << "      \"K\": "           << o.K          << ",\n";
+    json << "      \"N\": "           << o.N          << ",\n";
+    json << "      \"d_ms\": "        << o.d_ms       << ",\n";
+    json << "      \"L_bps\": "       << o.L_bps      << ",\n";
+    json << "      \"rbw_bps\": "     << o.rbw_bps    << ",\n";
+    if (o.residual_energy_j >= 0)
+      json << "      \"residual_energy_j\": " << o.residual_energy_j << "\n";
+    else
+      json << "      \"residual_energy_j\": null\n";
+    json << "    }";
+    first = false;
+  }
+  if (!first) json << "\n  ";
+  json << "},\n";
+
+  // ATVM — inter-switch traffic volumes, both directions per link
+  // GetAllLinks() deduplicates (lower DPID first), so we emit both
+  // src→dst and dst→src explicitly to capture one-way flows correctly.
+  json << "  \"atvm\": [";
+  first = true;
+  auto emitAtvm = [&](uint64_t srcDpid, uint32_t srcPort,
+                       uint64_t dstDpid) {
+    auto psIt = m_portStats.find(srcDpid);
+    if (psIt == m_portStats.end()) return;
+    auto ppIt = psIt->second.find(srcPort);
+    if (ppIt == psIt->second.end()) return;
+    if (!first) json << ", ";
+    json << "\n    {\"src\": " << srcDpid
+         << ", \"dst\": " << dstDpid
+         << ", \"tx_bps\": " << ppIt->second.tx_rate_bps << "}";
+    first = false;
+  };
+  for (const auto& link : m_topology.GetAllLinks()) {
+    emitAtvm(link.src_dpid, link.src_port, link.dst_dpid);
+    emitAtvm(link.dst_dpid, link.dst_port, link.src_dpid);
+  }
+  if (!first) json << "\n  ";
+  json << "],\n";
+
+  // Global μ_max — maximum per-switch mu_max_bps (ATVM normalisation constant)
+  double muMaxGlobal = 0;
+  for (const auto& kv : m_switchObs)
+    muMaxGlobal = std::max(muMaxGlobal, kv.second.mu_max_bps);
+  json << "  \"mu_max_global_bps\": " << muMaxGlobal << ",\n";
 
   // Control links
   json << "  \"control_links\": [";

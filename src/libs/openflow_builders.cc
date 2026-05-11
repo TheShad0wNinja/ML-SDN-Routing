@@ -190,4 +190,19 @@ BuildPortDescRequest()
     return reinterpret_cast<struct ofl_msg_header*>(req);
 }
 
+struct ofl_msg_header*
+BuildQueueStatsRequest()
+{
+    struct ofl_msg_multipart_request_queue* req =
+        static_cast<struct ofl_msg_multipart_request_queue*>(std::malloc(sizeof(*req)));
+    if (!req) return nullptr;
+    std::memset(req, 0, sizeof(*req));
+    req->header.header.type = OFPT_MULTIPART_REQUEST;
+    req->header.type        = OFPMP_QUEUE;
+    req->header.flags       = 0;
+    req->port_no            = OFPP_ANY;
+    req->queue_id           = OFPQ_ALL;
+    return reinterpret_cast<struct ofl_msg_header*>(req);
+}
+
 } // namespace ns3
