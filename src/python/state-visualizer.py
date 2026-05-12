@@ -166,8 +166,8 @@ const options = {
     width:2,
     color:{color:'#475569',highlight:'#38bdf8',hover:'#94a3b8'},
     smooth:{type:'dynamic'},
-    font:{color:'#fff',size:12,align:'middle',
-          background:{enabled:true,color:'rgba(15,23,42,.75)'}}
+    font:{color:'#fff',size:13,align:'middle',strokeWidth:3, strokeColor: 'black'
+          }
   },
   physics:{
     stabilization:{iterations:250},
@@ -232,7 +232,8 @@ network.on('click', function(params) {
     } else {
       html += '<p><b>Type:</b> Switch ↔ Switch</p>';
       html += '<p><b>Connection:</b> Dpid: ' + edge.src_dpid + ' (port ' + edge.src_port + ') ↔ Dpid ' + edge.dst_dpid + ' (port ' + edge.dst_port + ')</p>';
-      html += '<p><b>Cost:</b> ' + edge.cost_ms + ' ms</p>';
+      html += '<p><b>Cost:</b> ' + edge.cost + ' </p>';
+      html += '<p><b>Delay:</b> ' + String(parseFloat(edge.delay_ms).toFixed(2)) + ' ms</p>';
       html += '<h4>Bandwidth & Utilization</h4>';
       html += metricRow('Capacity', fmtBps(edge.speed_bps));
       html += metricRow('Traffic dpid ' + edge.src_dpid + ' → dpid ' + edge.dst_dpid, fmtBps(edge.rate_ab));
@@ -500,7 +501,8 @@ def generate_html(state: dict, output_path: str) -> None:
         if key in seen:
             continue
         seen.add(key)
-        cost = lk.get("cost_ms", lk.get("cost", 1))
+        cost = lk.get("cost", 1.0)
+        delay_ms = lk.get("delay_ms", 1.0)
 
         # Traffic from port tx rates on both sides of the link
         src_port_stats = stats.get(str(lk["src_dpid"]), {}).get(str(lk["src_port"]), {})
@@ -520,12 +522,12 @@ def generate_html(state: dict, output_path: str) -> None:
         speed_bps  = speed_kbps * 1000
         util = min(traffic_bps / speed_bps, 1.0) if speed_bps > 0 else 0
 
-        label_cost = f"{cost:.1f}ms" if isinstance(cost, float) else str(cost)
+        label_cost = f"{cost:.1f}" if isinstance(cost, float) else str(cost)
         label_util = f" ({util*100:.0f}%)" if util > 0 else ""
 
         # Tooltip: bidirectional rates with adaptive units
         tooltip = (f"Link: {lk['src_dpid']}:{lk['src_port']} ↔ "
-                   f"{lk['dst_dpid']}:{lk['dst_port']}<br>Cost: {cost}ms")
+                   f"{lk['dst_dpid']}:{lk['dst_port']}<br>Cost: {cost}<br>Delay: {delay_ms:.2f}ms")
         if rate_ab > 0 or rate_ba > 0:
             tooltip += (f"<br>→ {_fmt_bps(rate_ab)}  ← {_fmt_bps(rate_ba)}"
                         f"  ({util*100:.1f}% util)")
@@ -533,7 +535,7 @@ def generate_html(state: dict, output_path: str) -> None:
         edge_list.append({
             "from":  src,
             "to":    dst,
-            "label": f"{lk['src_port']}↔{lk['dst_port']} {label_cost}{label_util}",
+            "label": f"{lk['src_port']}↔{lk['dst_port']} cost:{label_cost}{label_util}",
             "title": tooltip,
             "width": _link_width(util),
             "color": {
@@ -545,7 +547,8 @@ def generate_html(state: dict, output_path: str) -> None:
             "src_port": lk["src_port"],
             "dst_dpid": lk["dst_dpid"],
             "dst_port": lk["dst_port"],
-            "cost_ms": cost,
+            "cost": cost,
+            "delay_ms": delay_ms,
             "rate_ab": rate_ab,
             "rate_ba": rate_ba,
             "speed_bps": speed_bps,

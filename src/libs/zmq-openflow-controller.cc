@@ -212,7 +212,7 @@ void ZmqOpenFlowController::HandleLldpPacket(uint64_t dpid, uint32_t inPort,
 
   if (chassis_id == 0 || port_id == 0) return;
 
-  double costMs = 1.0;
+  double delayMs = 1.0;
   if (sendNs != 0) {
     uint64_t nowNs = Simulator::Now().GetNanoSeconds();
     if (nowNs > sendNs) {
@@ -223,14 +223,14 @@ void ZmqOpenFlowController::HandleLldpPacket(uint64_t dpid, uint32_t inPort,
           m_echoRttNs.count(dpid) ? m_echoRttNs.at(dpid) / 2 : 0;
       uint64_t correction = halfRttA + halfRttB;
       uint64_t linkNs = (totalNs > correction) ? totalNs - correction : totalNs;
-      costMs = std::max(0.001, static_cast<double>(linkNs) / 1e6);
+      delayMs = std::max(0.001, static_cast<double>(linkNs) / 1e6);
     }
   }
 
-  m_topology.AddLink(chassis_id, port_id, dpid, inPort, costMs);
+  m_topology.AddLink(chassis_id, port_id, dpid, inPort, delayMs, 1.0);
   RebuildSpanningTree();
   NS_LOG_INFO("[TOPO] Link: " << chassis_id << ":" << port_id << " <-> " << dpid
-                              << ":" << inPort << " cost=" << costMs << "ms");
+                              << ":" << inPort << " delay=" << delayMs << "ms cost=1.0");
 
   // Flush MAC entries learned on now-confirmed switch-link ports
   for (auto mit = m_macToLoc.begin(); mit != m_macToLoc.end();) {
@@ -912,7 +912,8 @@ void ZmqOpenFlowController::WriteStateToJson() {
     json << "      \"src_port\": " << link.src_port << ",\n";
     json << "      \"dst_dpid\": " << link.dst_dpid << ",\n";
     json << "      \"dst_port\": " << link.dst_port << ",\n";
-    json << "      \"cost_ms\": " << link.cost_ms << "\n";
+    json << "      \"delay_ms\": " << link.delay_ms << ",\n";
+    json << "      \"cost\": " << link.cost << "\n";
     json << "    }";
     first = false;
   }

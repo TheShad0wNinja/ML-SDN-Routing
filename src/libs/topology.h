@@ -13,13 +13,14 @@ class Topology {
 public:
   Topology() = default;
 
-  void AddLink(uint64_t dpid1, uint32_t port1, uint64_t dpid2, uint32_t port2, double costMs = 1.0);
+  void AddLink(uint64_t dpid1, uint32_t port1, uint64_t dpid2, uint32_t port2, double delayMs = 1.0, double cost = 1.0);
   void RemovePort(uint64_t dpid, uint32_t port);
 
   std::optional<std::vector<uint64_t>> ShortestPath(uint64_t src,
                                                     uint64_t dst) const;
   std::optional<uint32_t> GetOutPort(uint64_t src, uint64_t dst) const;
   bool IsSwitchLinkPort(uint64_t dpid, uint32_t port) const;
+  double GetLinkDelay(uint64_t dpid1, uint64_t dpid2) const;
   double GetLinkCost(uint64_t dpid1, uint64_t dpid2) const;
 
   struct LinkInfo {
@@ -27,7 +28,8 @@ public:
     uint32_t src_port;
     uint64_t dst_dpid;
     uint32_t dst_port;
-    double   cost_ms = 1.0;
+    double   delay_ms = 1.0;
+    double   cost = 1.0;
   };
   std::vector<LinkInfo> GetAllLinks() const;
 
@@ -57,7 +59,8 @@ private:
   // Weighted adjacency list for Dijkstra
   std::unordered_map<uint64_t, std::unordered_set<uint64_t>> m_graph;
 
-  // Link costs: dpid -> neighbor_dpid -> cost_ms
+  // Link costs and delays
+  std::unordered_map<uint64_t, std::unordered_map<uint64_t, double>> m_linkDelay;
   std::unordered_map<uint64_t, std::unordered_map<uint64_t, double>> m_linkCost;
 
   void AddAdjacency(uint64_t src, uint64_t dst, uint32_t outPort);

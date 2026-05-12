@@ -9,7 +9,7 @@
 namespace ns3
 {
 
-void Topology::AddLink(uint64_t dpid1, uint32_t port1, uint64_t dpid2, uint32_t port2, double costMs)
+void Topology::AddLink(uint64_t dpid1, uint32_t port1, uint64_t dpid2, uint32_t port2, double delayMs, double cost)
 {
     m_links[dpid1][port1] = {dpid2, port2};
     m_links[dpid2][port2] = {dpid1, port1};
@@ -17,8 +17,11 @@ void Topology::AddLink(uint64_t dpid1, uint32_t port1, uint64_t dpid2, uint32_t 
     m_linkPorts[dpid1].insert(port1);
     m_linkPorts[dpid2].insert(port2);
 
-    m_linkCost[dpid1][dpid2] = costMs;
-    m_linkCost[dpid2][dpid1] = costMs;
+    m_linkDelay[dpid1][dpid2] = delayMs;
+    m_linkDelay[dpid2][dpid1] = delayMs;
+
+    m_linkCost[dpid1][dpid2] = cost;
+    m_linkCost[dpid2][dpid1] = cost;
 
     AddAdjacency(dpid1, dpid2, port1);
     AddAdjacency(dpid2, dpid1, port2);
@@ -127,6 +130,17 @@ void Topology::RemoveAdjacency(uint64_t src, uint64_t dst)
             m_routing.erase(routeIt);
         }
     }
+}
+
+double Topology::GetLinkDelay(uint64_t dpid1, uint64_t dpid2) const
+{
+    auto it = m_linkDelay.find(dpid1);
+    if (it == m_linkDelay.end())
+        return 1.0;
+    auto jt = it->second.find(dpid2);
+    if (jt == it->second.end())
+        return 1.0;
+    return jt->second;
 }
 
 double Topology::GetLinkCost(uint64_t dpid1, uint64_t dpid2) const
@@ -255,8 +269,9 @@ std::vector<Topology::LinkInfo> Topology::GetAllLinks() const
 
             if (seen.insert(key).second)
             {
+                double delay = GetLinkDelay(dpid1, dpid2);
                 double cost = GetLinkCost(dpid1, dpid2);
-                result.push_back({dpid1, port1, dpid2, port2, cost});
+                result.push_back({dpid1, port1, dpid2, port2, delay, cost});
             }
         }
     }
