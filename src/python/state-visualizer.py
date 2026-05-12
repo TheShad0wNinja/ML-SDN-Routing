@@ -3,7 +3,7 @@
 SDN Topology Visualizer
 Reads controller state JSON and writes an interactive, self-contained HTML file.
 Usage:
-    python topology-viewer.py [--input PATH] [--output PATH] [--watch]
+  python state-visualizer.py [--input PATH] [--output PATH] [--watch]
 """
 import argparse
 import json
