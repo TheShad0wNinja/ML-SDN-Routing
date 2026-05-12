@@ -38,7 +38,8 @@ struct SwitchObservation {
     double mu_max_bps        = 0;  // sum of host-port link capacities (bits/s)
     double rho               = 0;  // traffic intensity = lambda / mu_max
     double K                 = 64; // system capacity (queue slots, 64-packet FIFO default)
-    double N                 = 0;  // expected queue occupancy = rho/(1-rho) [M/M/1]
+    double N                 = 0;  // expected queue occupancy [M/M/1/K]
+    double p_loss            = 0;  // M/M/1/K packet-loss probability (blocking probability P_K)
     double d_ms              = 0;  // expected delay via Little's law (ms)
     double L_bps             = 0;  // loss rate = sum of dropped-bytes rate (bits/s)
     double rbw_bps           = 0;  // residual bandwidth = mu_max - lambda

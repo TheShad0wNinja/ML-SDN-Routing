@@ -590,18 +590,19 @@ void ZmqOpenFlowController::ComputeSwitchObservations(uint64_t dpid) {
   }
 
   double dropRateBps = 0;
+  double minSpeedBps = 0; // bottleneck link speed across all ports
   for (const auto& [pno, ps] : psIt->second) {
-    bool isHostPort = !m_topology.IsSwitchLinkPort(dpid, pno);
-    if (isHostPort) {
-      obs.lambda_bps += ps.rx_rate_bps;
-      obs.mu_max_bps += static_cast<double>(ps.speed_kbps) * 1000.0;
-    }
+    obs.lambda_bps += ps.rx_rate_bps; // all incoming traffic, not just host ports
+    double portSpeedBps = static_cast<double>(ps.speed_kbps) * 1000.0;
+    if (portSpeedBps > 0 && (minSpeedBps == 0 || portSpeedBps < minSpeedBps))
+      minSpeedBps = portSpeedBps;
     // Loss rate summed over all ports
     dropRateBps += (ps.rx_rate_bps > 0 && ps.rx_dropped > 0)
                        ? ps.rx_rate_bps * (static_cast<double>(ps.rx_dropped) /
                                            std::max((uint64_t)1, ps.rx_packets))
                        : 0;
   }
+  obs.mu_max_bps = minSpeedBps;
 
   obs.L_bps = dropRateBps;
   obs.rbw_bps = std::max(0.0, obs.mu_max_bps - obs.lambda_bps);
@@ -611,15 +612,28 @@ void ZmqOpenFlowController::ComputeSwitchObservations(uint64_t dpid) {
     obs.rho = std::min(obs.rho, 0.9999); // cap for stable M/M/1
   }
 
-  // M/M/1 queue approximations
-  if (obs.rho > 0 && obs.rho < 1) {
-    obs.N = obs.rho / (1.0 - obs.rho);
-    // Little's law: d = N/lambda (in seconds), convert to ms
+  // M/M/1/K queue model (finite buffer, more accurate near saturation)
+  if (obs.rho > 0 && obs.mu_max_bps > 0) {
+    double rho = obs.rho;
+    double K   = obs.K;
+    double p0, pK;
+    if (std::abs(rho - 1.0) < 1e-9) {
+      p0 = 1.0 / (K + 1.0);
+    } else {
+      p0 = (1.0 - rho) / (1.0 - std::pow(rho, K + 1.0));
+    }
+    pK = p0 * std::pow(rho, K);
+    obs.p_loss = std::min(pK, 1.0);
+
+    if (std::abs(rho - 1.0) < 1e-9) {
+      obs.N = K / 2.0;
+    } else {
+      obs.N = rho / (1.0 - rho)
+              - (K + 1.0) * std::pow(rho, K + 1.0) / (1.0 - std::pow(rho, K + 1.0));
+    }
+    obs.N = std::max(0.0, obs.N);
     if (obs.lambda_bps > 0)
       obs.d_ms = (obs.N / (obs.lambda_bps / 8.0)) * 1000.0;
-  } else if (obs.rho >= 1) {
-    obs.N = obs.K;
-    obs.d_ms = 1000.0; // saturated link
   }
 
   // Drain switch forwarding energy based on total TX rate across all ports
@@ -645,6 +659,7 @@ void ZmqOpenFlowController::ComputeSwitchObservations(uint64_t dpid) {
               << " ρ=" << obs.rho
               << " N=" << obs.N
               << " d=" << obs.d_ms << "ms"
+              << " P_loss=" << obs.p_loss
               << " RBW=" << obs.rbw_bps / 1e6 << "Mbps"
               << " E=" << obs.residual_energy_j << "J");
 }
@@ -950,6 +965,7 @@ void ZmqOpenFlowController::WriteStateToJson() {
     json << "      \"K\": "           << o.K          << ",\n";
     json << "      \"N\": "           << o.N          << ",\n";
     json << "      \"d_ms\": "        << o.d_ms       << ",\n";
+    json << "      \"p_loss\": "      << o.p_loss     << ",\n";
     json << "      \"L_bps\": "       << o.L_bps      << ",\n";
     json << "      \"rbw_bps\": "     << o.rbw_bps    << ",\n";
     if (o.residual_energy_j >= 0)

@@ -15,6 +15,16 @@ _SCRATCH_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DEFAULT_STATE = os.path.join(_SCRATCH_ROOT, "data", "state", "sdn_state.json")
 _DEFAULT_HTML  = os.path.join(_SCRATCH_ROOT, "data", "html",  "topology.html")
 
+# Palette for controller nodes — border color cycles through this list by index
+CONTROLLER_COLORS = [
+    {"bg": "#fbbf24", "border": "#d97706"},  # amber
+    {"bg": "#f472b6", "border": "#db2777"},  # pink
+    {"bg": "#34d399", "border": "#059669"},  # green
+    {"bg": "#818cf8", "border": "#4f46e5"},  # indigo
+    {"bg": "#fb923c", "border": "#ea580c"},  # orange
+    {"bg": "#22d3ee", "border": "#0891b2"},  # cyan
+]
+
 # ---------------------------------------------------------------------------
 # HTML template
 # ---------------------------------------------------------------------------
@@ -69,7 +79,8 @@ th { color:#94a3b8; font-weight:600; }
 <div id="network"></div>
 <div class="timestamp">Last updated: TIMESTAMP_PLACEHOLDER</div>
 <div class="legend">
-  <div class="legend-item"><div class="legend-box" style="background:#fbbf24;transform:rotate(45deg);width:12px;height:12px;border-radius:2px"></div>Controller</div>
+  CTRL_LEGEND_PLACEHOLDER
+  <div class="legend-item" style="font-size:11px;color:#64748b;margin:-2px 0 4px">(Switch border = controller)</div>
   <div class="legend-item"><div class="legend-box" style="background:#38bdf8"></div>Switch</div>
   <div class="legend-item"><div class="legend-dot" style="background:#f472b6"></div>Host</div>
   <div class="legend-item"><div class="legend-dot" style="background:#a78bfa"></div>IoT Sensor</div>
@@ -128,8 +139,7 @@ const container = document.getElementById('network');
 const options = {
   groups: {
     switch: {
-      shape:'box', color:{background:'#38bdf8',border:'#0ea5e9',
-        highlight:{background:'#7dd3fc',border:'#38bdf8'}},
+      shape:'box',
       font:{color:'#0f172a',face:'sans-serif',size:14}, margin:10,
       shadow:{enabled:true,color:'rgba(0,0,0,.5)',size:10}
     },
@@ -150,26 +160,19 @@ const options = {
         highlight:{background:'#6ee7b7',border:'#34d399'}},
       font:{color:'#f8fafc',face:'sans-serif',size:13,bold:true,multi:true},
       size:22, shadow:{enabled:true,color:'rgba(0,0,0,.5)',size:10}
-    },
-    controller: {
-      shape:'diamond', size:30,
-      color:{background:'#fbbf24',border:'#d97706',
-        highlight:{background:'#fde047',border:'#fbbf24'}},
-      font:{color:'#0f172a',face:'sans-serif',size:14,bold:true}, margin:12,
-      shadow:{enabled:true,color:'rgba(0,0,0,.5)',size:10}
     }
   },
   edges:{
     width:2,
     color:{color:'#475569',highlight:'#38bdf8',hover:'#94a3b8'},
-    smooth:{type:'continuous'},
+    smooth:{type:'dynamic'},
     font:{color:'#fff',size:12,align:'middle',
           background:{enabled:true,color:'rgba(15,23,42,.75)'}}
   },
   physics:{
-    stabilization:{iterations:200},
-    barnesHut:{gravitationalConstant:-4500,centralGravity:0.3,
-               springLength:150,springConstant:0.04}
+    stabilization:{iterations:250},
+    barnesHut:{gravitationalConstant:-6000,centralGravity:0.2,
+               springLength:220,springConstant:0.04}
   },
   interaction:{hover:true,tooltipDelay:150}
 };
@@ -192,13 +195,16 @@ document.getElementById('link-count').textContent = edges.length;
 (function renderGlobal(){
   const panel = document.getElementById('global-stats');
   if (!switchObs || Object.keys(switchObs).length===0) return;
-  let totalRho=0, n=0, maxLambda=0;
-  for (const o of Object.values(switchObs)) { totalRho+=o.rho; n++; if(o.lambda_bps>maxLambda) maxLambda=o.lambda_bps; }
-  const avgRho = n>0 ? totalRho/n : 0;
+  let totalRho=0, nRho=0, maxLambda=0;
+  for (const o of Object.values(switchObs)) {
+    if (o.rho != null) { totalRho += o.rho; nRho++; }
+    if ((o.lambda_bps||0) > maxLambda) maxLambda = o.lambda_bps;
+  }
+  const avgRho = nRho > 0 ? totalRho/nRho : null;
   panel.innerHTML =
     '<hr style="border-color:#334155;margin:10px 0;">'+
     '<h4 style="margin-top:0">Network-Wide State</h4>'+
-    metricRow('Avg ρ (utilisation)', (avgRho*100).toFixed(1)+'%', rhoClass(avgRho))+
+    (avgRho != null ? metricRow('Avg ρ (utilisation)', (avgRho*100).toFixed(1)+'%', rhoClass(avgRho)) : '')+
     metricRow('Peak λ (arrival)',    fmtBps(maxLambda))+
     (muMaxGlobal>0 ? metricRow('μ_max (global cap)', fmtBps(muMaxGlobal)) : '');
 })();
@@ -222,27 +228,30 @@ network.on('click', function(params) {
   let html = '<h3>'+(node.label||nodeId).replace(/\\n/g,' ')+'</h3>';
   html += '<p><b>Type:</b> <span style="text-transform:capitalize">'+node.group+'</span></p>';
 
-  // ── Controller ──────────────────────────────────────────────────────
-  if (node.group==='controller') {
-    html += '<p><b>Role:</b> Control plane (OpenFlow 1.3)</p>';
-    if (node.title) html += '<p style="margin-top:10px;line-height:1.45">'+node.title.replace(/\\n/g,'<br>')+'</p>';
-
   // ── Switch ───────────────────────────────────────────────────────────
-  } else if (node.group==='switch') {
+  if (node.group==='switch') {
     html += '<p><b>DPID:</b> '+nodeId+'</p>';
+    if (node.ctrlLabel) {
+      const cc = node.ctrlBorder||'#d97706';
+      html += '<p><b>Controller:</b> <span style="color:'+cc+';font-weight:600">'+node.ctrlLabel+'</span></p>';
+    }
+
+    // Per-port stats (read early so obs section can use port speeds)
+    const swStats = statsData[String(nodeId)];
 
     // DDPG observation vector
     const obs = switchObs[String(nodeId)];
     if (obs) {
-      html += '<h4>DDPG Switch Observation (M/M/1)</h4>';
-      html += metricRow('λ (arrival rate)',  fmtBps(obs.lambda_bps));
-      html += metricRow('μ_max (capacity)',  fmtBps(obs.mu_max_bps));
-      html += metricRow('ρ (utilisation)',   (obs.rho*100).toFixed(2)+'%', rhoClass(obs.rho));
-      html += metricRow('K (queue cap)',     obs.K.toFixed(0)+' pkts');
-      html += metricRow('N (queue depth)',   obs.N.toFixed(3)+' pkts', obs.N>32?'crit':obs.N>10?'warn':'');
-      html += metricRow('d (delay est.)',    obs.d_ms.toFixed(3)+' ms', obs.d_ms>50?'crit':obs.d_ms>10?'warn':'');
-      html += metricRow('L (loss rate)',     fmtBps(obs.L_bps));
-      html += metricRow('RBW',              fmtBps(obs.rbw_bps));
+      html += '<h4>Switch Observation (M/M/1/K)</h4>';
+      html += metricRow('λ (arrival rate)',  fmtBps(obs.lambda_bps || 0));
+      if (obs.mu_max_bps != null) html += metricRow('μ_max (capacity)', fmtBps(obs.mu_max_bps));
+      if (obs.rho        != null) html += metricRow('ρ (utilisation)',  (obs.rho*100).toFixed(2)+'%', rhoClass(obs.rho));
+      html += metricRow('K (queue cap)', (obs.K||0).toFixed(0)+' pkts');
+      if (obs.N    != null) html += metricRow('N (queue depth)', obs.N.toFixed(3)+' pkts', obs.N>32?'crit':obs.N>10?'warn':'');
+      if (obs.d_ms   != null) html += metricRow('d (delay est.)',   obs.d_ms.toFixed(3)+' ms',          obs.d_ms>50?'crit':obs.d_ms>10?'warn':'');
+      if (obs.p_loss != null) html += metricRow('P_loss (blocking)',(obs.p_loss*100).toFixed(4)+'%',   obs.p_loss>0.05?'crit':obs.p_loss>0.01?'warn':'');
+      html += metricRow('L (loss rate)', fmtBps(obs.L_bps || 0));
+      if (obs.rbw_bps != null) html += metricRow('RBW', fmtBps(obs.rbw_bps));
 
       if (obs.residual_energy_j != null && obs.residual_energy_j >= 0) {
         const ej = obs.residual_energy_j;
@@ -254,9 +263,6 @@ network.on('click', function(params) {
         html += metricRow('', ej.toFixed(1)+' J remaining');
       }
     }
-
-    // Per-port stats table
-    const swStats = statsData[String(nodeId)];
     if (swStats && Object.keys(swStats).length>0) {
       html += '<h4>Port Statistics</h4>';
       html += '<table><tr><th>Port</th><th>RX</th><th>TX</th><th>RX rate</th><th>TX rate</th><th>Drop</th></tr>';
@@ -307,6 +313,13 @@ def _link_width(util_fraction: float) -> float:
     return 1.0 + util_fraction * 7.0
 
 
+def _fmt_bps(bps: float) -> str:
+    if bps >= 1e9:  return f"{bps/1e9:.2f} Gbps"
+    if bps >= 1e6:  return f"{bps/1e6:.2f} Mbps"
+    if bps >= 1e3:  return f"{bps/1e3:.1f} kbps"
+    return f"{bps:.0f} bps"
+
+
 def generate_html(state: dict, output_path: str) -> None:
     switches      = state.get("switches", [])
     hosts         = state.get("hosts",    [])
@@ -315,7 +328,6 @@ def generate_html(state: dict, output_path: str) -> None:
     switch_obs    = state.get("switch_observations", {})
     atvm          = state.get("atvm",     [])
     mu_max_global = state.get("mu_max_global_bps", 0)
-    ctrl_meta     = dict(state.get("controller") or {})
     control_links = state.get("control_links")
     if control_links is None:
         control_links = []
@@ -323,23 +335,58 @@ def generate_html(state: dict, output_path: str) -> None:
             dpid = sw["dpid"] if isinstance(sw, dict) else sw
             control_links.append({"dpid": dpid})
 
+    # ------------------------------------------------------------------
+    # Controller palette — support both new `controllers` array and legacy
+    # singular `controller` key.
+    # ------------------------------------------------------------------
+    raw_ctrls = state.get("controllers") or []
+    if not raw_ctrls and state.get("controller"):
+        raw_ctrls = [state["controller"]]
+
+    controllers_colored = []
+    for i, c in enumerate(raw_ctrls):
+        color = CONTROLLER_COLORS[i % len(CONTROLLER_COLORS)]
+        controllers_colored.append({**c, "_color": color})
+
+    default_color = (controllers_colored[0]["_color"]
+                     if controllers_colored else CONTROLLER_COLORS[0])
+
+    # Map dpid (int) → color dict, using optional controller_id on each link
+    dpid_to_ctrl_color: dict = {}
+    for cl in control_links:
+        dpid = cl.get("dpid")
+        if dpid is None:
+            continue
+        ctrl_id = cl.get("controller_id")
+        color = default_color
+        if ctrl_id:
+            for c in controllers_colored:
+                if c.get("id") == ctrl_id:
+                    color = c["_color"]
+                    break
+        dpid_to_ctrl_color[dpid] = color
+
+    # Legend HTML fragment — one diamond per controller
+    ctrl_legend_html = ""
+    for c in controllers_colored:
+        col   = c["_color"]
+        label = c.get("label", "Controller")
+        ctrl_legend_html += (
+            f'<div class="legend-item">'
+            f'<div class="legend-box" style="background:{col["border"]};'
+            f'transform:rotate(45deg);width:12px;height:12px;border-radius:2px">'
+            f'</div>{label}</div>\n  '
+        )
+
     # Build ATVM lookup: (src_dpid, dst_dpid) -> tx_bps
     atvm_map: dict = {}
     for entry in atvm:
         atvm_map[(entry["src"], entry["dst"])] = entry.get("tx_bps", 0)
 
     # ------------------------------------------------------------------
-    # Nodes
+    # Nodes  (no controller node — affinity shown via switch border color)
     # ------------------------------------------------------------------
     node_list = []
-    ctrl_id   = ctrl_meta.get("id") or "sdn-controller"
-    if switches or control_links:
-        node_list.append({
-            "id":    ctrl_id,
-            "label": ctrl_meta.get("label", "SDN Controller"),
-            "group": "controller",
-            "title": ctrl_meta.get("detail", "OpenFlow 1.3 Controller"),
-        })
 
     for sw in switches:
         if isinstance(sw, dict):
@@ -353,11 +400,28 @@ def generate_html(state: dict, output_path: str) -> None:
         obs = switch_obs.get(str(dpid), {})
         rho = obs.get("rho", 0)
         extra = f"\nρ={rho*100:.0f}%" if rho > 0 else ""
+
+        ctrl_color = dpid_to_ctrl_color.get(dpid, default_color)
+        ctrl_label = next(
+            (c.get("label", "Controller") for c in controllers_colored
+             if c["_color"] is ctrl_color),
+            "Controller",
+        )
         node_list.append({
-            "id":    str(dpid),
-            "label": sw_name + extra,
-            "group": "switch",
-            "title": f"DPID: {dpid}",
+            "id":         str(dpid),
+            "label":      sw_name + extra,
+            "group":      "switch",
+            "title":      f"DPID: {dpid}",
+            "color": {
+                "background": "#38bdf8",
+                "border":     ctrl_color["border"],
+                "highlight":  {"background": "#7dd3fc",
+                               "border":     ctrl_color["border"]},
+            },
+            "borderWidth":         3,
+            "borderWidthSelected": 4,
+            "ctrlLabel":  ctrl_label,
+            "ctrlBorder": ctrl_color["border"],
         })
 
     for h in hosts:
@@ -406,21 +470,6 @@ def generate_html(state: dict, output_path: str) -> None:
     # Edges
     # ------------------------------------------------------------------
     edge_list = []
-    if switches or control_links:
-        for cl in control_links:
-            dpid = cl.get("dpid")
-            if dpid is None:
-                continue
-            edge_list.append({
-                "from":  ctrl_id,
-                "to":    str(dpid),
-                "label": "OF",
-                "title": f"Control: controller ↔ switch {dpid}",
-                "dashes": [8, 4],
-                "color":  {"color": "#f59e0b", "highlight": "#fde047"},
-                "width":  2,
-            })
-
     seen: set = set()
     for lk in links:
         src  = str(lk["src_dpid"])
@@ -431,29 +480,33 @@ def generate_html(state: dict, output_path: str) -> None:
         seen.add(key)
         cost = lk.get("cost_ms", lk.get("cost", 1))
 
-        # Utilisation: take the higher of the two directions so a one-way
-        # flow on a link still shows correctly even after deduplication.
-        tx_ab = atvm_map.get((lk["src_dpid"], lk["dst_dpid"]), 0)
-        tx_ba = atvm_map.get((lk["dst_dpid"], lk["src_dpid"]), 0)
-        tx_bps = max(tx_ab, tx_ba)
-
-        # Link speed: prefer src side, fall back to dst side
+        # Traffic from port tx rates on both sides of the link
         src_port_stats = stats.get(str(lk["src_dpid"]), {}).get(str(lk["src_port"]), {})
         dst_port_stats = stats.get(str(lk["dst_dpid"]), {}).get(str(lk["dst_port"]), {})
+        rate_ab = src_port_stats.get("tx_rate_bps") or 0  # src → dst
+        rate_ba = dst_port_stats.get("tx_rate_bps") or 0  # dst → src
+
+        # Fall back to ATVM when port stats are absent
+        if rate_ab == 0 and rate_ba == 0:
+            rate_ab = atvm_map.get((lk["src_dpid"], lk["dst_dpid"]), 0)
+            rate_ba = atvm_map.get((lk["dst_dpid"], lk["src_dpid"]), 0)
+
+        traffic_bps = max(rate_ab, rate_ba)
+
+        # Capacity from port speed; prefer src side, fall back to dst side
         speed_kbps = src_port_stats.get("speed_kbps") or dst_port_stats.get("speed_kbps", 0)
         speed_bps  = speed_kbps * 1000
-        util       = (tx_bps / speed_bps) if speed_bps > 0 else 0
-        util       = min(util, 1.0)
+        util = min(traffic_bps / speed_bps, 1.0) if speed_bps > 0 else 0
 
         label_cost = f"{cost:.1f}ms" if isinstance(cost, float) else str(cost)
-        label_util = f" {util*100:.0f}%" if util > 0 else ""
+        label_util = f" ({util*100:.0f}%)" if util > 0 else ""
 
-        # Show both direction rates in the tooltip
+        # Tooltip: bidirectional rates with adaptive units
         tooltip = (f"Link: {lk['src_dpid']}:{lk['src_port']} ↔ "
                    f"{lk['dst_dpid']}:{lk['dst_port']}<br>Cost: {cost}ms")
-        if tx_ab > 0 or tx_ba > 0:
-            tooltip += (f"<br>→ {tx_ab/1e6:.2f} Mbps  ← {tx_ba/1e6:.2f} Mbps"
-                        f"  ({util*100:.1f}% peak)")
+        if rate_ab > 0 or rate_ba > 0:
+            tooltip += (f"<br>→ {_fmt_bps(rate_ab)}  ← {_fmt_bps(rate_ba)}"
+                        f"  ({util*100:.1f}% util)")
 
         edge_list.append({
             "from":  src,
@@ -487,6 +540,7 @@ def generate_html(state: dict, output_path: str) -> None:
     ts = datetime.fromtimestamp(state.get("timestamp", time.time())).strftime("%Y-%m-%d %H:%M:%S")
 
     html = HTML_TEMPLATE
+    html = html.replace("CTRL_LEGEND_PLACEHOLDER",    ctrl_legend_html)
     html = html.replace("NODES_JSON_PLACEHOLDER",     json.dumps(node_list))
     html = html.replace("EDGES_JSON_PLACEHOLDER",     json.dumps(edge_list))
     html = html.replace("STATS_JSON_PLACEHOLDER",     json.dumps(stats))
