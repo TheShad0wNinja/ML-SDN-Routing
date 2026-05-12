@@ -212,7 +212,7 @@ document.getElementById('link-count').textContent = edges.length;
 // ---- click handler ----
 network.on('click', function(params) {
   const panel = document.getElementById('panel');
-  if (params.nodes.length===0) {
+  if (params.nodes.length===0 && params.edges.length===0) {
     panel.innerHTML = `
       <h3>Network Overview</h3>
       <p><b>Switches:</b> ${nodes.get({filter:n=>n.group==='switch'}).length}</p>
@@ -220,6 +220,28 @@ network.on('click', function(params) {
       <p><b>Links:</b> ${edges.length}</p>
       <hr style="border-color:#334155;margin:12px 0;">
       <p style="color:#64748b;">Click the controller, a switch, or a host for details.</p>`;
+    return;
+  } else if (params.nodes.length === 0 && params.edges.length > 0) {
+    const edgeId = params.edges[0];
+    const edge = edges.get(edgeId);
+    let html = '<h3>Link Details</h3>';
+    if (edge.is_host_link) {
+      html += '<p><b>Type:</b> Host ↔ Switch</p>';
+      html += '<p><b>Host MAC:</b> ' + edge.mac + '</p>';
+      html += '<p><b>Switch DPID:</b> ' + edge.sw + ' &nbsp;<b>Port:</b> ' + edge.port + '</p>';
+    } else {
+      html += '<p><b>Type:</b> Switch ↔ Switch</p>';
+      html += '<p><b>Connection:</b> Dpid: ' + edge.src_dpid + ' (port ' + edge.src_port + ') ↔ Dpid ' + edge.dst_dpid + ' (port ' + edge.dst_port + ')</p>';
+      html += '<p><b>Cost:</b> ' + edge.cost_ms + ' ms</p>';
+      html += '<h4>Bandwidth & Utilization</h4>';
+      html += metricRow('Capacity', fmtBps(edge.speed_bps));
+      html += metricRow('Traffic dpid ' + edge.src_dpid + ' → dpid ' + edge.dst_dpid, fmtBps(edge.rate_ab));
+      html += metricRow('Traffic dpid ' + edge.dst_dpid + ' → dpid ' + edge.src_dpid, fmtBps(edge.rate_ba));
+      if (edge.speed_bps > 0) {
+          html += metricRow('Peak Utilization', (edge.util * 100).toFixed(2) + '%', rhoClass(edge.util));
+      }
+    }
+    panel.innerHTML = html;
     return;
   }
 
@@ -518,6 +540,16 @@ def generate_html(state: dict, output_path: str) -> None:
                 "color":     _utilisation_color(util),
                 "highlight": "#7dd3fc",
             },
+            "is_host_link": False,
+            "src_dpid": lk["src_dpid"],
+            "src_port": lk["src_port"],
+            "dst_dpid": lk["dst_dpid"],
+            "dst_port": lk["dst_port"],
+            "cost_ms": cost,
+            "rate_ab": rate_ab,
+            "rate_ba": rate_ba,
+            "speed_bps": speed_bps,
+            "util": util,
         })
 
     # Host → switch edges
@@ -535,6 +567,10 @@ def generate_html(state: dict, output_path: str) -> None:
             "title": htitle,
             "dashes": True,
             "color":  {"color": "#64748b", "highlight": "#f472b6"},
+            "is_host_link": True,
+            "mac": mac,
+            "sw": sw,
+            "port": h['port'],
         })
 
     ts = datetime.fromtimestamp(state.get("timestamp", time.time())).strftime("%Y-%m-%d %H:%M:%S")
