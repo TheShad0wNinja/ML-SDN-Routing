@@ -268,22 +268,34 @@ int main(int argc, char* argv[]) {
     Ptr<OFSwitch13Device> ofDev = switches.Get(i)->GetObject<OFSwitch13Device>();
     if (!ofDev) continue;
 
+    double initialEnergyJ = 1e7;     // 10 MJ – measurable depletion per stats interval
+    double energyPerByteJ = 0;
+
     if (i == 4) {                    // MCI – destination hub, must absorb all central traffic
       ofDev->SetAttribute("CpuCapacity", DataRateValue(DataRate("1Gbps")));
       ofDev->SetAttribute("TcamDelay", TimeValue(MicroSeconds(2)));
+      energyPerByteJ = 5e-2;         // High-capacity hub: lower per-byte cost (50 mJ/B)
     } else if (i == 3 || i == 7) {   // DEN, IND – main transit hubs
       ofDev->SetAttribute("CpuCapacity", DataRateValue(DataRate("200Mbps")));
       ofDev->SetAttribute("TcamDelay", TimeValue(MicroSeconds(5)));
+      energyPerByteJ = 8e-2;         // Mid-tier transit: moderate per-byte cost (80 mJ/B)
     } else if (i == 8 || i == 9) {   // ATL, IAD – south/east-coast transit
       ofDev->SetAttribute("CpuCapacity", DataRateValue(DataRate("100Mbps")));
       ofDev->SetAttribute("TcamDelay", TimeValue(MicroSeconds(8)));
+      energyPerByteJ = 0.1;          // Lower capacity: higher per-byte cost (100 mJ/B)
     } else if (i == 5) {             // HOU – intentionally crippled, creates a measurably bad path
       ofDev->SetAttribute("CpuCapacity", DataRateValue(DataRate("1Mbps")));
       ofDev->SetAttribute("TcamDelay", TimeValue(MicroSeconds(100)));
+      energyPerByteJ = 0.15;         // Crippled: highest per-byte cost (150 mJ/B)
     } else {                         // SEA, SNV, LAX, ORD, JFK – edge senders
       ofDev->SetAttribute("CpuCapacity", DataRateValue(DataRate("50Mbps")));
       ofDev->SetAttribute("TcamDelay", TimeValue(MicroSeconds(10)));
+      energyPerByteJ = 0.1;          // Edge switches: moderate per-byte cost (100 mJ/B)
     }
+
+    // Set energy model for this switch (DPID = switch index + 1 by convention)
+    uint64_t dpid = i + 1;
+    controllerApp->SetSwitchEnergyModel(dpid, initialEnergyJ, energyPerByteJ);
   }
 
   /* --- Host annotations -------------------------------------------------- */
