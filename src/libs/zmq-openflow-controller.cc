@@ -17,6 +17,8 @@
 #include "ns3/log.h"
 #include "ns3/simulator.h"
 #include "openflow_builders.h"
+#include <arpa/inet.h>
+#include "ns3/ofswitch13-module.h"
 
 namespace ns3 {
 
@@ -227,8 +229,10 @@ void ZmqOpenFlowController::HandleLldpPacket(uint64_t dpid, uint32_t inPort,
     }
   }
 
-  m_topology.AddLink(chassis_id, port_id, dpid, inPort, delayMs, 1.0);
-  RebuildSpanningTree();
+  bool changed = m_topology.AddLink(chassis_id, port_id, dpid, inPort, delayMs, 1.0);
+  if (changed) {
+    RebuildSpanningTree();
+  }
   NS_LOG_INFO("[TOPO] Link: " << chassis_id << ":" << port_id << " <-> " << dpid
                               << ":" << inPort << " delay=" << delayMs << "ms cost=1.0");
 

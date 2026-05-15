@@ -13,7 +13,7 @@ class Topology {
 public:
   Topology() = default;
 
-  void AddLink(uint64_t dpid1, uint32_t port1, uint64_t dpid2, uint32_t port2, double delayMs = 1.0, double cost = 1.0);
+  bool AddLink(uint64_t dpid1, uint32_t port1, uint64_t dpid2, uint32_t port2, double delayMs = 1.0, double cost = 1.0);
   void RemovePort(uint64_t dpid, uint32_t port);
 
   std::optional<std::vector<uint64_t>> ShortestPath(uint64_t src,
@@ -62,6 +62,10 @@ private:
   // Link costs and delays
   std::unordered_map<uint64_t, std::unordered_map<uint64_t, double>> m_linkDelay;
   std::unordered_map<uint64_t, std::unordered_map<uint64_t, double>> m_linkCost;
+
+  // Path cache: src -> dst -> path (mutable for const ShortestPath method)
+  mutable std::unordered_map<uint64_t,
+      std::unordered_map<uint64_t, std::vector<uint64_t>>> m_pathCache;
 
   void AddAdjacency(uint64_t src, uint64_t dst, uint32_t outPort);
   void RemoveAdjacency(uint64_t src, uint64_t dst);

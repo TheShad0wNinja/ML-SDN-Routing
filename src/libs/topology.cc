@@ -9,8 +9,15 @@
 namespace ns3
 {
 
-void Topology::AddLink(uint64_t dpid1, uint32_t port1, uint64_t dpid2, uint32_t port2, double delayMs, double cost)
+bool Topology::AddLink(uint64_t dpid1, uint32_t port1, uint64_t dpid2, uint32_t port2, double delayMs, double cost)
 {
+    // Return false (no change) if the link already exists with the same endpoints
+    auto it = m_links[dpid1].find(port1);
+    if (it != m_links[dpid1].end() &&
+        it->second.peerDpid == dpid2 && it->second.peerPort == port2) {
+        return false;
+    }
+
     m_links[dpid1][port1] = {dpid2, port2};
     m_links[dpid2][port2] = {dpid1, port1};
 
@@ -25,6 +32,9 @@ void Topology::AddLink(uint64_t dpid1, uint32_t port1, uint64_t dpid2, uint32_t 
 
     AddAdjacency(dpid1, dpid2, port1);
     AddAdjacency(dpid2, dpid1, port2);
+
+    m_pathCache.clear();
+    return true;
 }
 
 void Topology::AddAdjacency(uint64_t src, uint64_t dst, uint32_t outPort)
@@ -88,6 +98,8 @@ void Topology::RemovePort(uint64_t dpid, uint32_t port)
     // Only remove graph edges if no other parallel link exists between the pair
     RemoveAdjacency(dpid, peerDpid);
     RemoveAdjacency(peerDpid, dpid);
+
+    m_pathCache.clear();
 }
 
 void Topology::RemoveAdjacency(uint64_t src, uint64_t dst)
@@ -161,8 +173,19 @@ std::optional<std::vector<uint64_t>> Topology::ShortestPath(uint64_t src, uint64
         return std::vector<uint64_t>{src};
     }
 
+    // Check cache first
+    auto& row = m_pathCache[src];
+    auto it = row.find(dst);
+    if (it != row.end()) {
+        if (it->second.empty()) {
+            return std::nullopt;  // Cached miss
+        }
+        return it->second;  // Cached hit
+    }
+
     if (m_graph.find(src) == m_graph.end())
     {
+        row[dst] = {};  // Cache the miss
         return std::nullopt;
     }
 
@@ -194,14 +217,15 @@ std::optional<std::vector<uint64_t>> Topology::ShortestPath(uint64_t src, uint64
             }
             path.push_back(src);
             std::reverse(path.begin(), path.end());
+            row[dst] = path;
             return path;
         }
 
-        auto it = m_graph.find(u);
-        if (it == m_graph.end())
+        auto graphIt = m_graph.find(u);
+        if (graphIt == m_graph.end())
             continue;
 
-        for (uint64_t v : it->second)
+        for (uint64_t v : graphIt->second)
         {
             double edgeCost = GetLinkCost(u, v);
             double newDist = cost + edgeCost;
@@ -214,6 +238,7 @@ std::optional<std::vector<uint64_t>> Topology::ShortestPath(uint64_t src, uint64
         }
     }
 
+    row[dst] = {};  // Cache the miss
     return std::nullopt;
 }
 
