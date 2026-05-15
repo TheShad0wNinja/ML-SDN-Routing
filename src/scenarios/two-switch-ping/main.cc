@@ -15,7 +15,7 @@ NS_LOG_COMPONENT_DEFINE("ZmqControllerMain");
 int main(int argc, char* argv[])
 {
     bool trace = false;
-    double simTime = 3600;
+    double simTime = 1000;
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("trace", "Enable pcap and datapath stats traces", trace);
@@ -35,7 +35,7 @@ int main(int argc, char* argv[])
     NS_LOG_INFO("Building topology...");
 
     CsmaHelper csma;
-    csma.SetChannelAttribute("DataRate", StringValue("100Mbps"));
+    csma.SetChannelAttribute("DataRate", StringValue("1Mbps"));
     csma.SetChannelAttribute("Delay", StringValue("1ms"));
 
     NetDeviceContainer swPorts[2];

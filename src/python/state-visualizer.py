@@ -233,8 +233,8 @@ network.on('click', function(params) {
       html += '<p><b>Type:</b> Switch ↔ Switch</p>';
       html += '<p><b>Connection:</b> Dpid: ' + edge.src_dpid + ' (port ' + edge.src_port + ') ↔ Dpid ' + edge.dst_dpid + ' (port ' + edge.dst_port + ')</p>';
       html += '<p><b>Cost:</b> ' + edge.cost + ' </p>';
-      html += '<p><b>Delay:</b> ' + String(parseFloat(edge.delay_ms).toFixed(2)) + ' ms</p>';
       html += '<h4>Bandwidth & Utilization</h4>';
+      html += metricRow('Delay', String(parseFloat(edge.delay_ms).toFixed(2)) + ' ms');
       html += metricRow('Capacity', fmtBps(edge.speed_bps));
       html += metricRow('Traffic dpid ' + edge.src_dpid + ' → dpid ' + edge.dst_dpid, fmtBps(edge.rate_ab));
       html += metricRow('Traffic dpid ' + edge.dst_dpid + ' → dpid ' + edge.src_dpid, fmtBps(edge.rate_ba));
@@ -535,7 +535,7 @@ def generate_html(state: dict, output_path: str) -> None:
         edge_list.append({
             "from":  src,
             "to":    dst,
-            "label": f"{lk['src_port']}↔{lk['dst_port']} cost:{label_cost}{label_util}",
+            "label": f"{lk['src_port']}↔{lk['dst_port']} {label_util} \n {label_cost} — {delay_ms:.2f}ms",
             "title": tooltip,
             "width": _link_width(util),
             "color": {

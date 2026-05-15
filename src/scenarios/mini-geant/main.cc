@@ -34,25 +34,21 @@ int main(int argc, char* argv[]) {
 
     NS_LOG_INFO("Configuring Link Helpers (Costs)...");
 
-    // csmaCost10: 100Mbps, 2ms delay
+    // csmaCost10: 100Mbps
     CsmaHelper csmaCost10;
     csmaCost10.SetChannelAttribute("DataRate", StringValue("100Mbps"));
-    csmaCost10.SetChannelAttribute("Delay", StringValue("2ms"));
 
-    // csmaCost20: 50Mbps, 10ms delay
+    // csmaCost20: 50Mbps
     CsmaHelper csmaCost20;
     csmaCost20.SetChannelAttribute("DataRate", StringValue("50Mbps"));
-    csmaCost20.SetChannelAttribute("Delay", StringValue("10ms"));
 
-    // csmaCost50: 10Mbps, 50ms delay
+    // csmaCost50: 10Mbps
     CsmaHelper csmaCost50;
     csmaCost50.SetChannelAttribute("DataRate", StringValue("10Mbps"));
-    csmaCost50.SetChannelAttribute("Delay", StringValue("50ms"));
 
-    // csmaEdge: 1Gbps, 1ms delay
+    // csmaEdge: 1Gbps
     CsmaHelper csmaEdge;
     csmaEdge.SetChannelAttribute("DataRate", StringValue("1Gbps"));
-    csmaEdge.SetChannelAttribute("Delay", StringValue("1ms"));
 
     NetDeviceContainer swPorts[6];
     NetDeviceContainer hostPorts;
@@ -145,18 +141,6 @@ int main(int argc, char* argv[]) {
 
     internal->CreateOpenFlowChannels();
 
-    // Advertising nodes
-    // ApplicationContainer discoveryApps;
-    // for (uint32_t i = 0; i < hosts.GetN(); i++) {
-    //     uint32_t dest = (i + 1) % hosts.GetN();
-    //     PingHelper pingHelper(Ipv4Address(hostIpIfaces.GetAddress(dest)));
-    //     pingHelper.SetAttribute("VerboseMode", EnumValue(Ping::QUIET));
-    //     pingHelper.SetAttribute("Count", UintegerValue(1));
-    //     discoveryApps.Add(pingHelper.Install(hosts.Get(i)));
-    // }
-    // discoveryApps.Start(Seconds(2.0));
-    // discoveryApps.Stop(Seconds(5.0));
-
     NS_LOG_INFO("Configuring Traffic (Ping)...");
     ApplicationContainer pingApps;
 
@@ -166,25 +150,12 @@ int main(int argc, char* argv[]) {
         PingHelper pingHelper(Ipv4Address(hostIpIfaces.GetAddress(dest)));
         pingHelper.SetAttribute("VerboseMode", EnumValue(Ping::QUIET));
         pingHelper.SetAttribute("Count", UintegerValue(0));
+        pingHelper.SetAttribute("Interval", TimeValue(MilliSeconds(10)));
+        pingHelper.SetAttribute("Size", UintegerValue(1024));
         pingApps.Add(pingHelper.Install(hosts.Get(i)));
     }
     pingApps.Start(Seconds(5.0));
     pingApps.Stop(Seconds(simTime - 1.0));
-
-    
-    // After initial discovery pings, have host 0 ping host 2
-    // PingHelper pingH0H2(Ipv4Address(hostIpIfaces.GetAddress(2)));
-    // pingH0H2.SetAttribute("VerboseMode", EnumValue(Ping::QUIET));
-    // ApplicationContainer h0h2 = pingH0H2.Install(hosts.Get(0));
-    // h0h2.Start(Seconds(5.0));
-    // h0h2.Stop(Seconds(simTime - 1.0));
-
-
-    // h0 to h2
-    // PingHelper pingHelper(Ipv4Address(hostIpIfaces.GetAddress(2)));
-    // pingHelper.SetAttribute("VerboseMode", EnumValue(Ping::QUIET));
-    // pingApps.Add(pingHelper.Install(hosts.Get(0)));
-
 
     NS_LOG_INFO("Starting simulation...");
     Simulator::Stop(Seconds(simTime));
