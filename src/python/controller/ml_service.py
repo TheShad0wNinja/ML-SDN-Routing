@@ -107,7 +107,10 @@ class LocalDDPGAgent:
         tau: float = 0.005,
         replay_capacity: int = 50_000,
         batch_size: int = 64,
-        warmup: int = 1_000,
+        # 100 transitions = ~100 s of sim time at the default mlIntervalS=1.0.
+        # Anything higher and short runs (5-min Abilene scenarios) finish before
+        # the agent ever takes a gradient step.
+        warmup: int = 100,
     ):
         if not _HAS_TORCH:
             raise RuntimeError(

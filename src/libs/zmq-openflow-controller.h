@@ -128,6 +128,10 @@ private:
                        struct ofl_msg_packet_in* msg,
                        uint64_t srcMac, uint64_t dstMac);
     void InstallFlow(uint64_t dpid, uint64_t dstMac, uint32_t outPort);
+    // Re-run Dijkstra for every known dst host and reinstall any flow whose
+    // next-hop egress port has changed. Cheap: O(switches * hosts) per call,
+    // and a flow-mod is only emitted when the path actually moves.
+    void RecomputeAllRoutes();
     static std::string FormatIp(uint32_t ip);
 
     void SendSingleLldp(Ptr<const RemoteSwitch> swtch, uint64_t dpid, uint32_t port);
@@ -159,6 +163,10 @@ private:
     Topology m_topology;
     // MAC (48-bit) -> (dpid, port)
     std::unordered_map<uint64_t, std::pair<uint64_t, uint32_t>> m_macToLoc;
+    // Installed flows: dpid -> dstMac -> egress port. Used by RecomputeAllRoutes
+    // to detect when an ML cost change has moved a path, so we can flow-mod
+    // only the entries whose next-hop actually changed.
+    std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint32_t>> m_installedFlows;
     // switch dpid -> set of known ports
     std::unordered_map<uint64_t, std::unordered_set<uint32_t>> m_switchPorts;
     // per-switch per-port full stats (replaces old uint64 placeholder)

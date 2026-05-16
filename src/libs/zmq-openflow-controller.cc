@@ -195,6 +195,41 @@ void ZmqOpenFlowController::InstallFlow(uint64_t dpid, uint64_t dstMac,
   cmd << "flow-mod cmd=add,table=0,prio=100,idle=30 eth_dst=" << macStr
       << " apply:output=" << outPort;
   DpctlExecute(dpid, cmd.str());
+  m_installedFlows[dpid][dstMac] = outPort;
+}
+
+// Recompute next-hop for every (switch, knownDst) pair; reinstall the flow
+// only when Dijkstra has moved the path. Called from ApplyDeltaCosts so live
+// UDP flows actually follow the ML-adjusted costs instead of sitting on the
+// path that was current when the flow was first installed (idle=30 means
+// continuous flows never expire on their own).
+void ZmqOpenFlowController::RecomputeAllRoutes() {
+  size_t rewrites = 0;
+  for (const auto& [mac, loc] : m_macToLoc) {
+    uint64_t dst_dpid = loc.first;
+    uint32_t dst_port = loc.second;
+
+    for (const auto& [dpid, sw] : m_switchMap) {
+      uint32_t newOut;
+      if (dpid == dst_dpid) {
+        newOut = dst_port;
+      } else {
+        auto opt_path = m_topology.ShortestPath(dpid, dst_dpid);
+        if (!opt_path || opt_path->size() < 2) continue;
+        auto outp = m_topology.GetOutPort((*opt_path)[0], (*opt_path)[1]);
+        if (!outp) continue;
+        newOut = *outp;
+      }
+      auto dpIt = m_installedFlows.find(dpid);
+      if (dpIt != m_installedFlows.end()) {
+        auto mIt = dpIt->second.find(mac);
+        if (mIt != dpIt->second.end() && mIt->second == newOut) continue;
+      }
+      InstallFlow(dpid, mac, newOut);
+      ++rewrites;
+    }
+  }
+  if (rewrites) NS_LOG_INFO("[ML] RecomputeAllRoutes rewrote " << rewrites << " flow entries");
 }
 
 // ------------------------------------------------------------------
@@ -1270,6 +1305,7 @@ double ZmqOpenFlowController::ComputeMlReward() {
 
 void ZmqOpenFlowController::ApplyDeltaCosts(const std::vector<double>& deltas) {
   size_t n = std::min(deltas.size(), m_mlLinkOrder.size());
+  bool anyChanged = false;
   for (size_t i = 0; i < n; ++i) {
     double d = deltas[i];
     if (d > m_ml.action_scale)        d = m_ml.action_scale;
@@ -1279,8 +1315,17 @@ void ZmqOpenFlowController::ApplyDeltaCosts(const std::vector<double>& deltas) {
     double base = m_topology.GetBaseLinkCost(a, b);
     if (base <= 0.0) continue;
     double newCost = base * (1.0 + d);
-    m_topology.SetLinkCost(a, b, newCost);
+    double oldCost = m_topology.GetLinkCost(a, b);
+    if (std::abs(newCost - oldCost) > 1e-9) {
+      m_topology.SetLinkCost(a, b, newCost);
+      anyChanged = true;
+    }
   }
+  // Critical: existing flow entries are keyed only on eth_dst with idle=30s,
+  // so continuous UDP flows never re-PacketIn and never see the new costs.
+  // Walk the routing table now and rewrite next-hop ports where Dijkstra has
+  // moved.
+  if (anyChanged) RecomputeAllRoutes();
 }
 
 void ZmqOpenFlowController::MlTick() {
