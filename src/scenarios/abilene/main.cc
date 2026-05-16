@@ -98,6 +98,17 @@ int main(int argc, char* argv[]) {
   uint32_t seed = 12345;
   bool testMode = true;
 
+  // Online FDRL local-agent toggles (default off — bit-identical to current master)
+  bool     mlEnabled              = false;
+  double   mlIntervalS            = 1.0;
+  double   mlActionScale          = 0.15;
+  double   mlAlpha                = 1.0;
+  double   mlBeta                 = 10.0;
+  double   mlGamma                = 0.1;
+  uint32_t mlCheckpointEveryNTicks = 60;
+  bool     mlResume               = true;
+  std::string mlEndpoint          = "tcp://127.0.0.1:5555";
+
   CommandLine cmd(__FILE__);
   cmd.AddValue("trace", "Enable pcap and datapath stats traces", trace);
   cmd.AddValue("simTime", "Simulation duration (s)", simTime);
@@ -106,6 +117,16 @@ int main(int argc, char* argv[]) {
                trafficMode);
   cmd.AddValue("seed", "Random seed", seed);
   cmd.AddValue("test", "Run test in faster test mode", testMode);
+  cmd.AddValue("ml",          "Enable online FDRL local agent",        mlEnabled);
+  cmd.AddValue("mlIntervalS", "Agent observe→act→learn period (s)",     mlIntervalS);
+  cmd.AddValue("mlActionScale","Max |ΔW| as fraction of base cost",     mlActionScale);
+  cmd.AddValue("mlAlpha",     "Reward weight on delay improvement",      mlAlpha);
+  cmd.AddValue("mlBeta",      "Reward penalty weight on loss",           mlBeta);
+  cmd.AddValue("mlGamma",     "Reward weight on energy efficiency",      mlGamma);
+  cmd.AddValue("mlCheckpointEveryNTicks",
+               "Python-side checkpoint cadence in ticks",                mlCheckpointEveryNTicks);
+  cmd.AddValue("mlResume",    "Python resumes from latest checkpoint",   mlResume);
+  cmd.AddValue("mlEndpoint",  "ZMQ endpoint for the agent",              mlEndpoint);
   cmd.Parse(argc, argv);
 
   RngSeedManager::SetSeed(seed);
@@ -252,6 +273,22 @@ int main(int argc, char* argv[]) {
       CreateObject<OFSwitch13InternalHelper>();
   Ptr<ZmqOpenFlowController> controllerApp =
       CreateObject<ZmqOpenFlowController>();
+
+  // Wire ML config (default-constructed = inert, so this is safe when --ml=false)
+  {
+    MlConfig mlCfg;
+    mlCfg.enabled                   = mlEnabled;
+    mlCfg.interval_s                = mlIntervalS;
+    mlCfg.action_scale              = mlActionScale;
+    mlCfg.reward_alpha              = mlAlpha;
+    mlCfg.reward_beta               = mlBeta;
+    mlCfg.reward_gamma              = mlGamma;
+    mlCfg.checkpoint_every_n_ticks  = mlCheckpointEveryNTicks;
+    mlCfg.resume                    = mlResume;
+    mlCfg.seed                      = seed;
+    mlCfg.endpoint                  = mlEndpoint;
+    controllerApp->SetMlConfig(mlCfg);
+  }
 
   controllers.Get(0)->AddApplication(controllerApp);
   controllerApp->SetStartTime(Seconds(0));

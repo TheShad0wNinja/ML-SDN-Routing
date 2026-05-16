@@ -58,6 +58,21 @@ struct SwitchEnergyModel {
     double energy_per_byte_j = 1e-9; // joules consumed per byte forwarded
 };
 
+// Online FDRL local-agent configuration. Default-constructed = disabled and
+// inert; SetMlConfig() opens the ZMQ socket and schedules the first MlTick.
+struct MlConfig {
+    bool   enabled                    = false;
+    double interval_s                 = 1.0;   // observe→act→learn period
+    double action_scale               = 0.15;  // max |ΔW| as fraction of base cost
+    double reward_alpha               = 1.0;   // delay-improvement weight
+    double reward_beta                = 10.0;  // loss-penalty weight
+    double reward_gamma               = 0.1;   // energy-efficiency weight
+    uint32_t checkpoint_every_n_ticks = 60;    // Python-side checkpoint cadence
+    bool   resume                     = true;  // Python loads checkpoint if present
+    uint32_t seed                     = 12345; // shared seed for Python RNG
+    std::string endpoint              = "tcp://127.0.0.1:5555";
+};
+
 class ZmqOpenFlowController : public OFSwitch13Controller {
 public:
     static TypeId GetTypeId();
@@ -71,6 +86,8 @@ public:
     void SetSwitchEnergyModel(uint64_t dpid, double initial_j, double per_byte_j);
     // Override the stats polling interval (seconds); default is 60 s
     void SetStatsInterval(double seconds);
+    // Enable online FDRL local agent. Default-constructed MlConfig keeps it off.
+    void SetMlConfig(const MlConfig& cfg);
 
 protected:
     void StartApplication() override;
@@ -122,6 +139,16 @@ private:
     void FloodViaST(Ptr<const RemoteSwitch> inSwtch, uint32_t inPort,
                     uint32_t bufferId, const uint8_t* data, size_t dataLen);
 
+    // ML loop helpers (no-ops when m_ml.enabled is false).
+    void MlOpenSocket();
+    void MlSendHello();
+    void MlTick();
+    std::string BuildMlStatePayload();
+    double ComputeMlReward();
+    void   ApplyDeltaCosts(const std::vector<double>& deltas);
+    // Stub kept for the safety-rollback feature. See plan §"Additional features".
+    // void MaybeRollback();
+
     static constexpr uint32_t kMaxLldpProbe   = 8;
     static constexpr double   kEchoIntervalSec = 60;
     static constexpr uint32_t kEchoMaxMissed   = 3;
@@ -161,6 +188,19 @@ private:
     std::unordered_map<uint64_t, double>             m_switchResidualEnergy;
 
     double m_statsIntervalS = 60.0;
+
+    // Online FDRL state.
+    MlConfig m_ml;
+    std::unique_ptr<zmq::context_t>                                   m_mlCtx;
+    std::unique_ptr<zmq::socket_t>                                    m_mlSock;
+    uint64_t                                                          m_mlTick = 0;
+    // Canonical link ordering — frozen at first MlTick so the action vector index
+    // → link mapping is stable across ticks.
+    std::vector<std::pair<uint64_t, uint64_t>>                        m_mlLinkOrder;
+    // Snapshot of m_switchObs from the *previous* tick, used by ComputeMlReward.
+    std::unordered_map<uint64_t, SwitchObservation>                   m_mlPrevObs;
+    bool   m_mlHavePrevObs = false;
+    double m_mlPrevReward  = 0.0;
 };
 
 } // namespace ns3

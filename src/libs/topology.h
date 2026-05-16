@@ -23,6 +23,16 @@ public:
   double GetLinkDelay(uint64_t dpid1, uint64_t dpid2) const;
   double GetLinkCost(uint64_t dpid1, uint64_t dpid2) const;
 
+  // Mutable cost API for ML link-weight adjustment.
+  double GetBaseLinkCost(uint64_t dpid1, uint64_t dpid2) const;
+  void   SetLinkCost(uint64_t dpid1, uint64_t dpid2, double newCost);
+  void   ResetLinkCosts();
+
+  // Egress-port capacity (bits/s) stashed when the controller sees
+  // the first PORT_STATS reply; 0 if not yet known.
+  double GetLinkCapacityBps(uint64_t srcDpid, uint64_t dstDpid) const;
+  void   SetLinkCapacityBps(uint64_t srcDpid, uint64_t dstDpid, double capBps);
+
   struct LinkInfo {
     uint64_t src_dpid;
     uint32_t src_port;
@@ -30,6 +40,8 @@ public:
     uint32_t dst_port;
     double   delay_ms = 1.0;
     double   cost = 1.0;
+    double   base_cost = 1.0;
+    double   capacity_bps = 0.0;
   };
   std::vector<LinkInfo> GetAllLinks() const;
 
@@ -62,6 +74,8 @@ private:
   // Link costs and delays
   std::unordered_map<uint64_t, std::unordered_map<uint64_t, double>> m_linkDelay;
   std::unordered_map<uint64_t, std::unordered_map<uint64_t, double>> m_linkCost;
+  std::unordered_map<uint64_t, std::unordered_map<uint64_t, double>> m_baseLinkCost;
+  std::unordered_map<uint64_t, std::unordered_map<uint64_t, double>> m_linkCapacityBps;
 
   // Path cache: src -> dst -> path (mutable for const ShortestPath method)
   mutable std::unordered_map<uint64_t,

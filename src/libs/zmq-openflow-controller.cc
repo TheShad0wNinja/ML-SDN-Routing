@@ -66,6 +66,19 @@ void ZmqOpenFlowController::DoDispose() {
     }
   }
 
+  if (m_mlSock) {
+    try {
+      m_mlSock->close();
+    } catch (...) {
+    }
+  }
+  if (m_mlCtx) {
+    try {
+      m_mlCtx->close();
+    } catch (...) {
+    }
+  }
+
   OFSwitch13Controller::DoDispose();
 }
 
@@ -97,6 +110,25 @@ void ZmqOpenFlowController::SetSwitchEnergyModel(uint64_t dpid,
 
 void ZmqOpenFlowController::SetStatsInterval(double seconds) {
   m_statsIntervalS = seconds;
+}
+
+void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
+  m_ml = cfg;
+  if (!m_ml.enabled) {
+    return;
+  }
+
+  // Make sure stats roll fast enough that the agent gets fresh observations
+  // every tick. Without this, the default 60 s interval would starve MlTick.
+  if (m_statsIntervalS > m_ml.interval_s) {
+    m_statsIntervalS = m_ml.interval_s;
+  }
+
+  MlOpenSocket();
+  // Schedule first tick a bit after LLDP discovery (default trigger at 5 s)
+  // so the link order frozen at first tick reflects the real topology.
+  Simulator::Schedule(Seconds(std::max(6.0, m_ml.interval_s * 2)),
+                      &ZmqOpenFlowController::MlTick, this);
 }
 
 // Handles initial connection with an OF Switch
@@ -574,6 +606,16 @@ void ZmqOpenFlowController::HandlePortStatsReply(
       if (pIt != spIt->second.end()) ps.speed_kbps = pIt->second;
     }
 
+    // Stash the egress capacity into Topology so the ML state payload can
+    // emit per-link absolute headroom even on ticks where stats arrive late.
+    if (ps.speed_kbps > 0) {
+      auto peerDpid = m_topology.GetPeerDpid(dpid, pno);
+      if (peerDpid) {
+        m_topology.SetLinkCapacityBps(dpid, *peerDpid,
+                                       static_cast<double>(ps.speed_kbps) * 1000.0);
+      }
+    }
+
     NS_LOG_INFO("[PORT-STATS]   port " << pno
                 << " rx=" << s->rx_bytes << "B tx=" << s->tx_bytes
                 << "B rx_rate=" << ps.rx_rate_bps / 1e6 << " Mbps"
@@ -911,13 +953,19 @@ void ZmqOpenFlowController::WriteStateToJson() {
   first = true;
   for (const auto& link : m_topology.GetAllLinks()) {
     if (!first) json << ", ";
+    double deltaPct = (link.base_cost > 0)
+                          ? ((link.cost - link.base_cost) / link.base_cost) * 100.0
+                          : 0.0;
     json << "\n    {\n";
     json << "      \"src_dpid\": " << link.src_dpid << ",\n";
     json << "      \"src_port\": " << link.src_port << ",\n";
     json << "      \"dst_dpid\": " << link.dst_dpid << ",\n";
     json << "      \"dst_port\": " << link.dst_port << ",\n";
     json << "      \"delay_ms\": " << link.delay_ms << ",\n";
-    json << "      \"cost\": " << link.cost << "\n";
+    json << "      \"cost\": " << link.cost << ",\n";
+    json << "      \"base_cost\": " << link.base_cost << ",\n";
+    json << "      \"cost_delta_pct\": " << deltaPct << ",\n";
+    json << "      \"capacity_bps\": " << link.capacity_bps << "\n";
     json << "    }";
     first = false;
   }
@@ -1033,6 +1081,297 @@ void ZmqOpenFlowController::WriteStateToJson() {
   } else {
     NS_LOG_WARN("Failed to open " << output_file);
   }
+}
+
+// ------------------------------------------------------------------
+//  Online FDRL local-agent loop
+// ------------------------------------------------------------------
+void ZmqOpenFlowController::MlOpenSocket() {
+  try {
+    m_mlCtx = std::make_unique<zmq::context_t>(1);
+    m_mlSock = std::make_unique<zmq::socket_t>(*m_mlCtx, zmq::socket_type::req);
+    // Short timeouts so a missing Python service can never stall the sim.
+    m_mlSock->set(zmq::sockopt::rcvtimeo, 200);
+    m_mlSock->set(zmq::sockopt::sndtimeo, 200);
+    m_mlSock->set(zmq::sockopt::linger,   0);
+    // REQ sockets normally lock send→recv→send into strict alternation; on a
+    // recv timeout the next send would EFSM. REQ_RELAXED + REQ_CORRELATE let
+    // us resend after a missed reply (necessary when Python is down).
+    m_mlSock->set(zmq::sockopt::req_relaxed, 1);
+    m_mlSock->set(zmq::sockopt::req_correlate, 1);
+    m_mlSock->connect(m_ml.endpoint);
+    NS_LOG_INFO("[ML] Connected ZMQ REQ to " << m_ml.endpoint);
+  } catch (const std::exception& e) {
+    NS_LOG_WARN("[ML] Failed to open ZMQ socket: " << e.what()
+                << " — agent will be inert");
+    m_mlSock.reset();
+    m_mlCtx.reset();
+  }
+}
+
+void ZmqOpenFlowController::MlSendHello() {
+  if (!m_mlSock) return;
+
+  // state_dim = 6 features per switch * |switches|
+  size_t stateDim = 6 * m_switchMap.size();
+  // action_dim = one ΔW per (deduplicated) link
+  size_t actionDim = m_mlLinkOrder.size();
+
+  std::ostringstream hello;
+  hello << "{\"cmd\":\"hello\","
+        << "\"state_dim\":" << stateDim << ","
+        << "\"action_dim\":" << actionDim << ","
+        << "\"seed\":" << m_ml.seed << ","
+        << "\"resume\":" << (m_ml.resume ? "true" : "false") << ","
+        << "\"checkpoint_every_n_ticks\":" << m_ml.checkpoint_every_n_ticks
+        << "}";
+
+  std::string req = hello.str();
+  try {
+    zmq::message_t request(req.size());
+    std::memcpy(request.data(), req.data(), req.size());
+    auto sres = m_mlSock->send(request, zmq::send_flags::none);
+    if (!sres) {
+      NS_LOG_WARN("[ML] hello send timed out");
+      return;
+    }
+    zmq::message_t reply;
+    auto rres = m_mlSock->recv(reply, zmq::recv_flags::none);
+    if (!rres) {
+      NS_LOG_WARN("[ML] hello reply timed out");
+      return;
+    }
+    NS_LOG_INFO("[ML] hello ack: state_dim=" << stateDim
+                << " action_dim=" << actionDim);
+  } catch (const std::exception& e) {
+    NS_LOG_WARN("[ML] hello failed: " << e.what());
+  }
+}
+
+std::string ZmqOpenFlowController::BuildMlStatePayload() {
+  std::ostringstream s;
+  s << std::fixed << std::setprecision(6);
+  s << "{\"cmd\":\"observe\","
+    << "\"tick\":" << m_mlTick << ","
+    << "\"prev_reward\":" << m_mlPrevReward << ","
+    << "\"state\":{";
+
+  // ---- per-switch features ----
+  s << "\"per_switch\":[";
+  bool firstSw = true;
+  for (const auto& [dpid, sw] : m_switchMap) {
+    SwitchObservation obs = m_switchObs.count(dpid) ? m_switchObs.at(dpid)
+                                                    : SwitchObservation{};
+    const auto& em = m_switchEnergyModel.count(dpid)
+                        ? m_switchEnergyModel.at(dpid)
+                        : SwitchEnergyModel{};
+    double energyFrac = (em.initial_energy_j > 0 && obs.residual_energy_j >= 0)
+                            ? (obs.residual_energy_j / em.initial_energy_j)
+                            : 1.0;
+    double rttNs = m_echoRttNs.count(dpid) ? m_echoRttNs.at(dpid) : 0;
+
+    if (!firstSw) s << ",";
+    s << "{\"dpid\":" << dpid
+      << ",\"rho\":" << obs.rho
+      << ",\"d_ms\":" << obs.d_ms
+      << ",\"p_loss\":" << obs.p_loss
+      << ",\"residual_energy_frac\":" << energyFrac
+      << ",\"echo_rtt_ns\":" << rttNs
+      << ",\"mu_max_bps\":" << obs.mu_max_bps
+      << "}";
+    firstSw = false;
+  }
+  s << "],";
+
+  // ---- per-link features ----
+  s << "\"per_link\":[";
+  bool firstLink = true;
+  for (const auto& [a, b] : m_mlLinkOrder) {
+    double cost     = m_topology.GetLinkCost(a, b);
+    double baseCost = m_topology.GetBaseLinkCost(a, b);
+    double cap      = std::max(m_topology.GetLinkCapacityBps(a, b),
+                               m_topology.GetLinkCapacityBps(b, a));
+    double delayMs  = m_topology.GetLinkDelay(a, b);
+
+    // ATVM: tx_bps from src→dst egress port
+    double txBps = 0.0;
+    auto psIt = m_portStats.find(a);
+    if (psIt != m_portStats.end()) {
+      for (const auto& [pno, ps] : psIt->second) {
+        auto peer = m_topology.GetPeerDpid(a, pno);
+        if (peer && *peer == b) {
+          txBps += ps.tx_rate_bps;
+        }
+      }
+    }
+    double util = (cap > 0) ? (txBps / cap) : 0.0;
+
+    if (!firstLink) s << ",";
+    s << "{\"src\":" << a << ",\"dst\":" << b
+      << ",\"tx_bps\":" << txBps
+      << ",\"capacity_bps\":" << cap
+      << ",\"utilization\":" << util
+      << ",\"cost\":" << cost
+      << ",\"base_cost\":" << baseCost
+      << ",\"delay_ms\":" << delayMs
+      << "}";
+    firstLink = false;
+  }
+  s << "]}}";
+  return s.str();
+}
+
+double ZmqOpenFlowController::ComputeMlReward() {
+  if (!m_mlHavePrevObs || m_switchObs.empty()) return 0.0;
+
+  // Mean delay improvement (lower is better → reward positive when curr < prev).
+  double prevDelay = 0.0, currDelay = 0.0;
+  uint32_t prevN = 0, currN = 0;
+  for (const auto& [dpid, o] : m_mlPrevObs) {
+    if (o.d_ms > 0) { prevDelay += o.d_ms; ++prevN; }
+  }
+  for (const auto& [dpid, o] : m_switchObs) {
+    if (o.d_ms > 0) { currDelay += o.d_ms; ++currN; }
+  }
+  double meanPrev = (prevN > 0) ? (prevDelay / prevN) : 0.0;
+  double meanCurr = (currN > 0) ? (currDelay / currN) : 0.0;
+
+  // Loss penalty: total dropped-bytes rate.
+  double prevLoss = 0.0, currLoss = 0.0;
+  for (const auto& [dpid, o] : m_mlPrevObs)   prevLoss += o.L_bps;
+  for (const auto& [dpid, o] : m_switchObs)   currLoss += o.L_bps;
+
+  // Energy-efficiency term: forwarded bytes weighted by residual energy fraction.
+  double energyTerm = 0.0;
+  for (const auto& [a, b] : m_mlLinkOrder) {
+    auto psIt = m_portStats.find(a);
+    if (psIt == m_portStats.end()) continue;
+    double txBps = 0.0;
+    for (const auto& [pno, ps] : psIt->second) {
+      auto peer = m_topology.GetPeerDpid(a, pno);
+      if (peer && *peer == b) txBps += ps.tx_rate_bps;
+    }
+    auto emIt = m_switchEnergyModel.find(a);
+    if (emIt == m_switchEnergyModel.end()) continue;
+    double frac = 1.0;
+    if (emIt->second.initial_energy_j > 0) {
+      auto reIt = m_switchResidualEnergy.find(a);
+      if (reIt != m_switchResidualEnergy.end())
+        frac = reIt->second / emIt->second.initial_energy_j;
+    }
+    energyTerm += txBps * emIt->second.energy_per_byte_j * frac;
+  }
+
+  double R = m_ml.reward_alpha * (meanPrev - meanCurr)
+           - m_ml.reward_beta  * (currLoss - prevLoss) / 1e6  // bring loss into a comparable unit
+           + m_ml.reward_gamma * energyTerm / 1e6;
+  return R;
+}
+
+void ZmqOpenFlowController::ApplyDeltaCosts(const std::vector<double>& deltas) {
+  size_t n = std::min(deltas.size(), m_mlLinkOrder.size());
+  for (size_t i = 0; i < n; ++i) {
+    double d = deltas[i];
+    if (d > m_ml.action_scale)        d = m_ml.action_scale;
+    else if (d < -m_ml.action_scale)  d = -m_ml.action_scale;
+
+    auto [a, b] = m_mlLinkOrder[i];
+    double base = m_topology.GetBaseLinkCost(a, b);
+    if (base <= 0.0) continue;
+    double newCost = base * (1.0 + d);
+    m_topology.SetLinkCost(a, b, newCost);
+  }
+}
+
+void ZmqOpenFlowController::MlTick() {
+  if (!m_ml.enabled) return;
+
+  // Refresh observations: trigger a fresh port-stats sweep so curr obs reflects
+  // the most recent interval. Stats arrive asynchronously, but the ML payload
+  // is built from whatever m_switchObs currently holds — that's the prior
+  // interval's view, which is exactly what the reward needs.
+  for (const auto& kv : m_switchMap) {
+    struct ofl_msg_header* req = BuildPortStatsRequest();
+    if (req) {
+      SendToSwitch(kv.second, req, 0);
+      ofl_msg_free(req, nullptr);
+    }
+  }
+
+  // Freeze link order at first tick (after LLDP discovery). Once frozen, link
+  // additions/removals don't grow the action vector; that's OK for static
+  // topologies and matches the plan's "stable index → link mapping" guarantee.
+  bool firstTick = (m_mlTick == 0);
+  if (firstTick) {
+    for (const auto& link : m_topology.GetAllLinks()) {
+      uint64_t a = link.src_dpid, b = link.dst_dpid;
+      if (a > b) std::swap(a, b);
+      m_mlLinkOrder.push_back({a, b});
+    }
+    NS_LOG_INFO("[ML] Frozen link order: " << m_mlLinkOrder.size() << " links");
+    MlSendHello();
+  }
+
+  // Reward from previous tick's state vs current state.
+  if (m_mlHavePrevObs) {
+    m_mlPrevReward = ComputeMlReward();
+  }
+
+  std::string req = BuildMlStatePayload();
+
+  if (m_mlSock) {
+    try {
+      zmq::message_t request(req.size());
+      std::memcpy(request.data(), req.data(), req.size());
+      auto sres = m_mlSock->send(request, zmq::send_flags::none);
+      if (!sres) {
+        NS_LOG_WARN("[ML] ZMQ send timed out — skipping action this tick");
+      } else {
+        zmq::message_t reply;
+        auto rres = m_mlSock->recv(reply, zmq::recv_flags::none);
+        if (!rres) {
+          NS_LOG_WARN("[ML] ZMQ recv timed out — skipping action this tick");
+        } else {
+        // Minimal JSON parse: scan for "action":[ ... ] and split on commas.
+        std::string body(static_cast<const char*>(reply.data()), reply.size());
+        std::vector<double> action;
+        auto k = body.find("\"action\"");
+        if (k != std::string::npos) {
+          auto lb = body.find('[', k);
+          auto rb = body.find(']', lb);
+          if (lb != std::string::npos && rb != std::string::npos && rb > lb) {
+            std::string arr = body.substr(lb + 1, rb - lb - 1);
+            std::stringstream ss(arr);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+              try { action.push_back(std::stod(tok)); } catch (...) {}
+            }
+          }
+        }
+        if (!action.empty()) {
+          ApplyDeltaCosts(action);
+        }
+        }  // end inner else (recv ok)
+      }    // end outer else (send ok)
+    } catch (const std::exception& e) {
+      NS_LOG_WARN("[ML] ZMQ exchange failed: " << e.what());
+    }
+  }
+
+  // Snapshot for next tick's reward computation.
+  m_mlPrevObs       = m_switchObs;
+  m_mlHavePrevObs   = true;
+  m_mlTick++;
+
+  // ---- Safety clamp & rollback (stubbed; flip on later). ----
+  // Trigger condition: mean L_bps triples within 3 ticks → ResetLinkCosts()
+  // + skip 5 ticks. Easy to wire when we have a stable baseline.
+#if 0
+  MaybeRollback();
+#endif
+
+  Simulator::Schedule(Seconds(m_ml.interval_s),
+                      &ZmqOpenFlowController::MlTick, this);
 }
 
 }  // namespace ns3

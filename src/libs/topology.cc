@@ -30,6 +30,10 @@ bool Topology::AddLink(uint64_t dpid1, uint32_t port1, uint64_t dpid2, uint32_t 
     m_linkCost[dpid1][dpid2] = cost;
     m_linkCost[dpid2][dpid1] = cost;
 
+    // Record the unmodified baseline so SetLinkCost/ResetLinkCosts can recover it.
+    m_baseLinkCost[dpid1][dpid2] = cost;
+    m_baseLinkCost[dpid2][dpid1] = cost;
+
     AddAdjacency(dpid1, dpid2, port1);
     AddAdjacency(dpid2, dpid1, port2);
 
@@ -166,6 +170,59 @@ double Topology::GetLinkCost(uint64_t dpid1, uint64_t dpid2) const
     return jt->second;
 }
 
+double Topology::GetBaseLinkCost(uint64_t dpid1, uint64_t dpid2) const
+{
+    auto it = m_baseLinkCost.find(dpid1);
+    if (it == m_baseLinkCost.end())
+        return 1.0;
+    auto jt = it->second.find(dpid2);
+    if (jt == it->second.end())
+        return 1.0;
+    return jt->second;
+}
+
+void Topology::SetLinkCost(uint64_t dpid1, uint64_t dpid2, double newCost)
+{
+    // Only update edges already present in the graph.
+    auto it = m_linkCost.find(dpid1);
+    if (it == m_linkCost.end() || it->second.find(dpid2) == it->second.end())
+        return;
+
+    // Clamp away pathological values; Dijkstra needs strictly positive costs.
+    if (!(newCost > 0.0))
+        newCost = 1e-3;
+
+    m_linkCost[dpid1][dpid2] = newCost;
+    m_linkCost[dpid2][dpid1] = newCost;
+    m_pathCache.clear();
+}
+
+void Topology::ResetLinkCosts()
+{
+    for (const auto& srcKv : m_baseLinkCost) {
+        for (const auto& dstKv : srcKv.second) {
+            m_linkCost[srcKv.first][dstKv.first] = dstKv.second;
+        }
+    }
+    m_pathCache.clear();
+}
+
+double Topology::GetLinkCapacityBps(uint64_t srcDpid, uint64_t dstDpid) const
+{
+    auto it = m_linkCapacityBps.find(srcDpid);
+    if (it == m_linkCapacityBps.end())
+        return 0.0;
+    auto jt = it->second.find(dstDpid);
+    if (jt == it->second.end())
+        return 0.0;
+    return jt->second;
+}
+
+void Topology::SetLinkCapacityBps(uint64_t srcDpid, uint64_t dstDpid, double capBps)
+{
+    m_linkCapacityBps[srcDpid][dstDpid] = capBps;
+}
+
 std::optional<std::vector<uint64_t>> Topology::ShortestPath(uint64_t src, uint64_t dst) const
 {
     if (src == dst)
@@ -296,7 +353,12 @@ std::vector<Topology::LinkInfo> Topology::GetAllLinks() const
             {
                 double delay = GetLinkDelay(dpid1, dpid2);
                 double cost = GetLinkCost(dpid1, dpid2);
-                result.push_back({dpid1, port1, dpid2, port2, delay, cost});
+                double baseCost = GetBaseLinkCost(dpid1, dpid2);
+                // Pick the larger of the two-direction capacities (either should be set
+                // identically in practice but be defensive).
+                double cap = std::max(GetLinkCapacityBps(dpid1, dpid2),
+                                      GetLinkCapacityBps(dpid2, dpid1));
+                result.push_back({dpid1, port1, dpid2, port2, delay, cost, baseCost, cap});
             }
         }
     }
