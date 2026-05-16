@@ -6,6 +6,7 @@
 #include "ns3/nstime.h"
 #include "topology.h"
 #include <zmq.hpp>
+#include <array>
 #include <memory>
 #include <map>
 #include <cstdint>
@@ -117,6 +118,12 @@ private:
                        const uint8_t* data,
                        size_t dataLen,
                        uint32_t outPort);
+    void SendPacketOutGroup(Ptr<const RemoteSwitch> swtch,
+                            uint32_t inPort,
+                            uint32_t bufferId,
+                            const uint8_t* data,
+                            size_t dataLen,
+                            uint32_t groupId);
     void TriggerLldp();
     void TriggerStats();
     void WriteStateToJson();
@@ -128,6 +135,11 @@ private:
                        struct ofl_msg_packet_in* msg,
                        uint64_t srcMac, uint64_t dstMac);
     void InstallFlow(uint64_t dpid, uint64_t dstMac, uint32_t outPort);
+    // Install or refresh the per-switch flood group (type=ALL) and, on first
+    // install, the broadcast→group flow rule. Idempotent.
+    void InstallOrUpdateFloodGroup(uint64_t dpid);
+    static std::array<uint8_t, 60> BuildArpReply(uint64_t targetMac, uint32_t targetIp,
+                                                  uint64_t requesterMac, uint32_t requesterIp);
     // Re-run Dijkstra for every known dst host and reinstall any flow whose
     // next-hop egress port has changed. Cheap: O(switches * hosts) per call,
     // and a flow-mod is only emitted when the path actually moves.
@@ -156,6 +168,7 @@ private:
     static constexpr uint32_t kMaxLldpProbe   = 8;
     static constexpr double   kEchoIntervalSec = 60;
     static constexpr uint32_t kEchoMaxMissed   = 3;
+    static constexpr uint32_t kFloodGroupId   = 1;
 
     std::unique_ptr<zmq::context_t> m_zmqContext;
     std::unique_ptr<zmq::socket_t>  m_socket;
@@ -189,6 +202,8 @@ private:
     std::unordered_map<uint32_t, uint64_t> m_ipToMac;
     // Spanning tree: dpid -> set of inter-switch ports on the spanning tree
     std::unordered_map<uint64_t, std::unordered_set<uint32_t>> m_spanningTree;
+    // DPIDs that already have the flood group + broadcast flow installed
+    std::unordered_set<uint64_t> m_floodGroupInstalled;
     // Host display annotations set by scenario
     std::unordered_map<uint64_t, HostAnnotation> m_hostAnnotations;
     // Per-switch energy models and residual energy

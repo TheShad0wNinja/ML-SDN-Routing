@@ -143,6 +143,12 @@ void ZmqOpenFlowController::HandshakeSuccessful(Ptr<const RemoteSwitch> swtch) {
   DpctlExecute(swDpId, "flow-mod cmd=add,table=0,prio=0 apply:output=ctrl:128");
   DpctlExecute(swDpId, "set-config miss=128");
 
+  // ARP → controller. Sits above the broadcast→flood-group rule so the
+  // controller can answer known targets directly (proxy ARP) and decide
+  // when to flood unknown ones.
+  DpctlExecute(swDpId,
+      "flow-mod cmd=add,table=0,prio=20 eth_type=0x0806 apply:output=ctrl:128");
+
   // Request port info from connected switch
   struct ofl_msg_header* pdReq = BuildPortDescRequest();
   if (pdReq) {
@@ -186,6 +192,80 @@ void ZmqOpenFlowController::SendPacketOut(Ptr<const RemoteSwitch> swtch,
 }
 
 // ------------------------------------------------------------------
+//  Helper: build and send a PACKET_OUT with a single group action
+// ------------------------------------------------------------------
+void ZmqOpenFlowController::SendPacketOutGroup(Ptr<const RemoteSwitch> swtch,
+                                               uint32_t inPort, uint32_t bufferId,
+                                               const uint8_t* data, size_t dataLen,
+                                               uint32_t groupId) {
+  struct ofl_msg_packet_out* po =
+      (struct ofl_msg_packet_out*)malloc(sizeof(*po));
+  memset(po, 0, sizeof(*po));
+  po->header.type = OFPT_PACKET_OUT;
+  po->buffer_id = bufferId;
+  po->in_port = inPort;
+  if (bufferId == OFP_NO_BUFFER && data && dataLen > 0) {
+    po->data_length = dataLen;
+    po->data = (uint8_t*)malloc(dataLen);
+    memcpy(po->data, data, dataLen);
+  }
+  struct ofl_action_group* a = (struct ofl_action_group*)malloc(sizeof(*a));
+  a->header.type = OFPAT_GROUP;
+  a->header.len = sizeof(*a);
+  a->group_id = groupId;
+  po->actions_num = 1;
+  po->actions =
+      (struct ofl_action_header**)malloc(sizeof(struct ofl_action_header*));
+  po->actions[0] = (struct ofl_action_header*)a;
+  SendToSwitch(swtch, (struct ofl_msg_header*)po, 0);
+  free(po->actions);
+  free(a);
+  if (po->data) free(po->data);
+  free(po);
+}
+
+// ------------------------------------------------------------------
+//  Build a 42-byte Ethernet+ARP reply frame (proxy ARP)
+// ------------------------------------------------------------------
+std::array<uint8_t, 60>
+ZmqOpenFlowController::BuildArpReply(uint64_t targetMac, uint32_t targetIp,
+                                     uint64_t requesterMac, uint32_t requesterIp) {
+  // Sized to Ethernet minimum frame (60 bytes payload + 4 FCS = 64). The
+  // 18 trailing bytes are zero padding; without it some receivers truncate
+  // the tail of the ARP payload.
+  std::array<uint8_t, 60> f{};
+  // Eth dst: requester MAC
+  for (int i = 0; i < 6; ++i) f[i] = (requesterMac >> (8 * (5 - i))) & 0xFF;
+  // Eth src: target MAC (the host we are proxying for)
+  for (int i = 0; i < 6; ++i) f[6 + i] = (targetMac >> (8 * (5 - i))) & 0xFF;
+  // Ethertype: 0x0806
+  f[12] = 0x08; f[13] = 0x06;
+  // HW type: 1 (Ethernet)
+  f[14] = 0x00; f[15] = 0x01;
+  // Proto type: 0x0800 (IPv4)
+  f[16] = 0x08; f[17] = 0x00;
+  // HW len, proto len
+  f[18] = 6; f[19] = 4;
+  // Op: 2 (reply)
+  f[20] = 0x00; f[21] = 0x02;
+  // Sender HW: target MAC
+  for (int i = 0; i < 6; ++i) f[22 + i] = (targetMac >> (8 * (5 - i))) & 0xFF;
+  // Sender proto: target IP (host byte order in memory; serialize big-endian)
+  f[28] = (targetIp >> 24) & 0xFF;
+  f[29] = (targetIp >> 16) & 0xFF;
+  f[30] = (targetIp >>  8) & 0xFF;
+  f[31] = (targetIp      ) & 0xFF;
+  // Target HW: requester MAC
+  for (int i = 0; i < 6; ++i) f[32 + i] = (requesterMac >> (8 * (5 - i))) & 0xFF;
+  // Target proto: requester IP
+  f[38] = (requesterIp >> 24) & 0xFF;
+  f[39] = (requesterIp >> 16) & 0xFF;
+  f[40] = (requesterIp >>  8) & 0xFF;
+  f[41] = (requesterIp      ) & 0xFF;
+  return f;
+}
+
+// ------------------------------------------------------------------
 //  Install a MAC-destination flow with idle timeout
 // ------------------------------------------------------------------
 void ZmqOpenFlowController::InstallFlow(uint64_t dpid, uint64_t dstMac,
@@ -196,6 +276,58 @@ void ZmqOpenFlowController::InstallFlow(uint64_t dpid, uint64_t dstMac,
       << " apply:output=" << outPort;
   DpctlExecute(dpid, cmd.str());
   m_installedFlows[dpid][dstMac] = outPort;
+}
+
+// ------------------------------------------------------------------
+//  Install / refresh the per-switch flood group (type=ALL).
+//  Buckets = host-facing ports ∪ spanning-tree ports for this switch.
+//  On first install also adds the broadcast→group flow rule.
+// ------------------------------------------------------------------
+void ZmqOpenFlowController::InstallOrUpdateFloodGroup(uint64_t dpid) {
+  std::set<uint32_t> ports; // ordered for stable log output
+
+  auto portIt = m_switchPorts.find(dpid);
+  if (portIt != m_switchPorts.end()) {
+    for (uint32_t p : portIt->second) {
+      if (p == 0 || p >= OFPP_MAX) continue;
+      if (!m_topology.IsSwitchLinkPort(dpid, p)) ports.insert(p);
+    }
+  }
+  auto stIt = m_spanningTree.find(dpid);
+  if (stIt != m_spanningTree.end()) {
+    for (uint32_t p : stIt->second) {
+      if (p == 0 || p >= OFPP_MAX) continue;
+      ports.insert(p);
+    }
+  }
+
+  if (ports.empty()) return;
+
+  bool firstInstall = !m_floodGroupInstalled.count(dpid);
+  std::ostringstream gm;
+  gm << "group-mod cmd=" << (firstInstall ? "add" : "mod")
+     << ",type=all,group=" << kFloodGroupId;
+  std::ostringstream logPorts;
+  bool first = true;
+  for (uint32_t p : ports) {
+    gm << " weight=0,port=any,group=any output=" << p;
+    if (!first) logPorts << ",";
+    logPorts << p;
+    first = false;
+  }
+  DpctlExecute(dpid, gm.str());
+
+  if (firstInstall) {
+    std::ostringstream fm;
+    fm << "flow-mod cmd=add,table=0,prio=10 eth_dst=ff:ff:ff:ff:ff:ff"
+       << " apply:group=" << kFloodGroupId;
+    DpctlExecute(dpid, fm.str());
+    m_floodGroupInstalled.insert(dpid);
+  }
+
+  NS_LOG_INFO("[GROUP] " << (firstInstall ? "Installed" : "Updated")
+              << " flood group on dpid=" << dpid
+              << " ports=[" << logPorts.str() << "]");
 }
 
 // Recompute next-hop for every (switch, knownDst) pair; reinstall the flow
@@ -434,6 +566,7 @@ ofl_err ZmqOpenFlowController::HandlePacketIn(struct ofl_msg_packet_in* msg,
     const uint8_t* data = msg->data;
     uint16_t ethertype = (uint16_t)data[12] << 8 | (uint16_t)data[13];
 
+
     if (ethertype == 0x88CC) {
       HandleLldpPacket(dpid, inPort, data, msg->data_length);
       ofl_msg_free((struct ofl_msg_header*)msg, nullptr);
@@ -443,51 +576,40 @@ ofl_err ZmqOpenFlowController::HandlePacketIn(struct ofl_msg_packet_in* msg,
     if (ethertype == 0x0806) {
       HandleArpPacket(data, msg->data_length);
 
-      // Smart ARP forwarding: for ARP requests with a known target, go
-      // direct.
+      // Proxy ARP: synthesize the reply at the controller when we know the
+      // target IP→MAC binding. Falls back to flood on miss.
       if (msg->data_length >= 42) {
         const uint8_t* arp = data + 14;
         uint16_t arpOp = (uint16_t)arp[6] << 8 | arp[7];
         if (arpOp == 1) {
           // Learn sender MAC now — a matching flow-mod on this switch may
           // silently route subsequent ICMP without generating another PacketIn.
-          if (!m_topology.IsSwitchLinkPort(dpid, inPort)) {
-            uint64_t srcMac = 0;
-            for (int i = 6; i < 12; ++i) srcMac = (srcMac << 8) | data[i];
-            if (srcMac) m_macToLoc[srcMac] = {dpid, inPort};
+          uint64_t senderMac = 0;
+          for (int i = 6; i < 12; ++i) senderMac = (senderMac << 8) | data[i];
+          if (senderMac && !m_topology.IsSwitchLinkPort(dpid, inPort)) {
+            m_macToLoc[senderMac] = {dpid, inPort};
           }
+          uint32_t senderIp = ((uint32_t)arp[14] << 24) |
+                              ((uint32_t)arp[15] << 16) |
+                              ((uint32_t)arp[16] << 8) | (uint32_t)arp[17];
           uint32_t targetIp = ((uint32_t)arp[24] << 24) |
                               ((uint32_t)arp[25] << 16) |
                               ((uint32_t)arp[26] << 8) | (uint32_t)arp[27];
+
           auto ipIt = m_ipToMac.find(targetIp);
-          if (ipIt != m_ipToMac.end()) {
-            auto locIt = m_macToLoc.find(ipIt->second);
-            if (locIt != m_macToLoc.end()) {
-              uint64_t tDpid = locIt->second.first;
-              uint32_t tPort = locIt->second.second;
-              if (tDpid == dpid) {
-                SendPacketOut(swtch, inPort, msg->buffer_id, msg->data,
-                              msg->data_length, tPort);
-              } else {
-                auto opt = m_topology.ShortestPath(dpid, tDpid);
-                if (opt && opt->size() >= 2) {
-                  auto fp = m_topology.GetOutPort((*opt)[0], (*opt)[1]);
-                  if (fp)
-                    SendPacketOut(swtch, inPort, msg->buffer_id, msg->data,
-                                  msg->data_length, *fp);
-                  else
-                    FloodViaST(swtch, inPort, msg->buffer_id, msg->data,
-                               msg->data_length);
-                } else {
-                  FloodViaST(swtch, inPort, msg->buffer_id, msg->data,
-                             msg->data_length);
-                }
-              }
-              ofl_msg_free((struct ofl_msg_header*)msg, nullptr);
-              return 0;
-            }
+          if (ipIt != m_ipToMac.end() && senderMac && senderIp) {
+            uint64_t targetMac = ipIt->second;
+            auto reply = BuildArpReply(targetMac, targetIp, senderMac, senderIp);
+            SendPacketOut(swtch, OFPP_CONTROLLER, OFP_NO_BUFFER,
+                          reply.data(), reply.size(), inPort);
+            NS_LOG_INFO("[ARP] Proxy reply " << FormatIp(targetIp)
+                        << " is-at " << FormatMac(targetMac)
+                        << " -> " << FormatIp(senderIp));
+            ofl_msg_free((struct ofl_msg_header*)msg, nullptr);
+            return 0;
           }
-          // Target unknown — flood via spanning tree and return early.
+          // Target unknown — flood via spanning tree.
+          NS_LOG_INFO("[ARP] Flood (target " << FormatIp(targetIp) << " unknown)");
           FloodViaST(swtch, inPort, msg->buffer_id, msg->data,
                      msg->data_length);
           ofl_msg_free((struct ofl_msg_header*)msg, nullptr);
@@ -545,9 +667,11 @@ ofl_err ZmqOpenFlowController::HandlePortStatus(struct ofl_msg_port_status* msg,
         else
           ++mit;
       }
+      InstallOrUpdateFloodGroup(dpid);
       // WriteStateToJson();
     } else if (msg->reason == OFPPR_ADD) {
       m_switchPorts[dpid].insert(port_no);
+      InstallOrUpdateFloodGroup(dpid);
       // Probe the new port immediately for LLDP
       auto swIt = m_switchMap.find(dpid);
       if (swIt != m_switchMap.end()) {
@@ -581,6 +705,7 @@ void ZmqOpenFlowController::HandlePortDescReply(
                   << " speed=" << kbps << " kbps");
     }
   }
+  InstallOrUpdateFloodGroup(dpid);
 }
 
 ofl_err ZmqOpenFlowController::HandleMultipartReply(
@@ -827,12 +952,25 @@ ofl_err ZmqOpenFlowController::HandleEchoReply(struct ofl_msg_echo* msg,
 
 void ZmqOpenFlowController::RebuildSpanningTree() {
   m_spanningTree = m_topology.ComputeSpanningTree();
+  for (const auto& kv : m_switchMap) {
+    InstallOrUpdateFloodGroup(kv.first);
+  }
 }
 
 void ZmqOpenFlowController::FloodViaST(Ptr<const RemoteSwitch> inSwtch,
                                        uint32_t inPort, uint32_t bufferId,
                                        const uint8_t* data, size_t dataLen) {
   uint64_t inDpid = inSwtch->GetDpId();
+
+  // Fast path: dataplane flood via the per-switch group table. The group's
+  // OFPP_IN_PORT suppression keeps the spanning-tree fan-out loop-free, and
+  // each downstream switch matches its own broadcast→group flow rule, so this
+  // single PacketOut produces the full network-wide flood without any further
+  // controller involvement.
+  if (m_floodGroupInstalled.count(inDpid)) {
+    SendPacketOutGroup(inSwtch, inPort, bufferId, data, dataLen, kFloodGroupId);
+    return;
+  }
 
   // If we have no spanning tree yet (topology not discovered), fall back to
   // flooding only on the ingress switch's host-facing ports, or all ports if
