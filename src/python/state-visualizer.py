@@ -89,6 +89,8 @@ th { color:#94a3b8; font-weight:600; }
   <div class="legend-item"><span style="color:#22c55e">─────</span>&nbsp;Link &lt;50% load</div>
   <div class="legend-item"><span style="color:#f59e0b">─────</span>&nbsp;Link 50-80% load</div>
   <div class="legend-item"><span style="color:#ef4444">─────</span>&nbsp;Link &gt;80% load</div>
+  <hr style="border-color:#334155;margin:6px 0;">
+  <div class="legend-item" style="font-size:11px;color:#64748b;">Path finding: click 2 hosts</div>
 </div>
 <div id="panel">
   <h3>Network Overview</h3>
@@ -97,7 +99,7 @@ th { color:#94a3b8; font-weight:600; }
   <p><b>Links:</b> <span id="link-count">0</span></p>
   <div id="global-stats"></div>
   <hr style="border-color:#334155;margin:12px 0;">
-  <p style="color:#64748b;">Click the controller, a switch, or a host for details.</p>
+  <p style="color:#64748b;">Click a node for details, or click 2 hosts to find the shortest path.</p>
 </div>
 
 <script>
@@ -209,17 +211,229 @@ document.getElementById('link-count').textContent = edges.length;
     (muMaxGlobal>0 ? metricRow('μ_max (global cap)', fmtBps(muMaxGlobal)) : '');
 })();
 
+// ---- path finding state ----
+let selectedHosts = [];
+let highlightedPath = null;
+
+// ---- Dijkstra's algorithm for shortest path ----
+function dijkstraPath(srcNodeId, dstNodeId) {
+  // Build adjacency map with costs
+  const graph = {};
+  const allNodeIds = nodes.getIds();
+  allNodeIds.forEach(id => { graph[id] = {}; });
+  
+  edges.get().forEach(edge => {
+    // Treat host links as 0 cost so they don't affect total path cost logic
+    const cost = (edge.is_host_link || edge.dashes) ? 0 : (edge.cost || 1.0);
+    if (!graph[edge.from]) graph[edge.from] = {};
+    if (!graph[edge.to]) graph[edge.to] = {};
+    graph[edge.from][edge.to] = cost;
+    graph[edge.to][edge.from] = cost; // Bidirectional
+  });
+  
+  // Dijkstra's algorithm
+  const dist = {};
+  const prev = {};
+  const visited = new Set();
+  const pq = [];
+  
+  allNodeIds.forEach(id => { dist[id] = Infinity; prev[id] = null; });
+  dist[srcNodeId] = 0;
+  pq.push([0, srcNodeId]);
+  
+  while (pq.length > 0) {
+    pq.sort((a, b) => a[0] - b[0]);
+    const [d, u] = pq.shift();
+    
+    if (visited.has(u)) continue;
+    visited.add(u);
+    
+    if (u === dstNodeId) break;
+    
+    for (const [v, cost] of Object.entries(graph[u] || {})) {
+      const alt = dist[u] + cost;
+      if (alt < dist[v]) {
+        dist[v] = alt;
+        prev[v] = u;
+        pq.push([alt, v]);
+      }
+    }
+  }
+  
+  // Reconstruct path
+  if (dist[dstNodeId] === Infinity) return null;
+  const path = [];
+  let current = dstNodeId;
+  while (current !== null) {
+    path.unshift(current);
+    current = prev[current];
+  }
+  return path;
+}
+
+// ---- Highlight path on network ----
+function highlightPath(path) {
+  // Clear previous highlights
+  if (highlightedPath) {
+    highlightedPath.forEach(edgeId => {
+      const edge = edges.get(edgeId);
+      if (edge) {
+        edge.highlight = false;
+        const util = edge.util || 0;
+        edge.width = 1.0 + util * 7.0;
+        let c = "#22c55e";
+        let hc = "#7dd3fc";
+        if (util >= 0.8) c = "#ef4444";
+        else if (util >= 0.5) c = "#f59e0b";
+        if (edge.is_host_link || edge.dashes) {
+          c = "#64748b";
+          hc = "#f472b6";
+        }
+        edge.color = { color: c, highlight: hc };
+        edges.update(edge);
+      }
+    });
+    // Clear node highlights
+    nodes.get().forEach(n => {
+      if (n.isPathNode) {
+        delete n.isPathNode;
+        n.color = {
+          background: "#38bdf8",
+          border: n.ctrlBorder || "#d97706",
+          highlight: { background: "#7dd3fc", border: n.ctrlBorder || "#d97706" }
+        };
+        nodes.update(n);
+      }
+    });
+  }
+  
+  if (!path || path.length < 2) {
+    highlightedPath = null;
+    return;
+  }
+  
+  highlightedPath = [];
+  
+  // Highlight path edges
+  for (let i = 0; i < path.length - 1; i++) {
+    const from = String(path[i]);
+    const to = String(path[i + 1]);
+    const edgeId = edges.get({
+      filter: e => (e.from === from && e.to === to) || (e.from === to && e.to === from)
+    }).map(e => e.id)[0];
+    
+    if (edgeId) {
+      highlightedPath.push(edgeId);
+      const edge = edges.get(edgeId);
+      edge.highlight = true;
+      edge.width = 5;
+      edge.color = { color: '#22d3ee', highlight: '#22d3ee' };
+      edges.update(edge);
+    }
+  }
+  
+  // Highlight path nodes (switches only, not hosts)
+  path.forEach(nodeId => {
+    const n = nodes.get(nodeId);
+    if (n && n.group === 'switch') {
+      n.isPathNode = true;
+      if (!n.color) n.color = {};
+      n.color.background = '#fbbf24';
+      n.color.border = '#f59e0b';
+      nodes.update(n);
+    }
+  });
+}
+
+// ---- Compute path cost ----
+function computePathCost(path) {
+  let totalCost = 0;
+  for (let i = 0; i < path.length - 1; i++) {
+    const from = String(path[i]);
+    const to = String(path[i + 1]);
+    const edge = edges.get({
+      filter: e => (e.from === from && e.to === to) || (e.from === to && e.to === from)
+    })[0];
+    if (edge) {
+      const cst = (edge.is_host_link || edge.dashes) ? 0 : (edge.cost || 1.0);
+      totalCost += cst;
+    }
+  }
+  return totalCost;
+}
+
+// ---- clear path ----
+function clearPath() {
+  selectedHosts = [];
+  highlightPath(null);
+  updatePanelOverview();
+}
+
+// ---- update overview panel ----
+function updatePanelOverview() {
+  const panel = document.getElementById('panel');
+  panel.innerHTML = `
+    <h3>Network Overview</h3>
+    <p><b>Switches:</b> ${nodes.get({filter:n=>n.group==='switch'}).length}</p>
+    <p><b>Hosts:</b> ${nodes.get({filter:n=>['host','iot_sensor','iot_gateway'].includes(n.group)}).length}</p>
+    <p><b>Links:</b> ${edges.length}</p>
+    <hr style="border-color:#334155;margin:12px 0;">
+    <h4>Path Finding</h4>
+    <p style="color:#94a3b8;font-size:12px">Click two hosts to find the shortest path.</p>
+    <p><b>Selected:</b> ${selectedHosts.length}/2</p>
+    ${selectedHosts.length > 0 ? `<p style="font-size:12px;color:#fbbf24">${selectedHosts.map(h=>nodes.get(h).label.split('\\n')[0]).join(' → ')}</p>` : ''}
+    ${selectedHosts.length === 2 ? `<button onclick="clearPath()" style="width:100%;padding:6px;margin-top:8px;background:#334155;border:1px solid #475569;color:#e2e8f0;border-radius:4px;cursor:pointer">Clear Path</button>` : ''}`;
+}
+
 // ---- click handler ----
 network.on('click', function(params) {
   const panel = document.getElementById('panel');
+  
+  // Handle host clicks for path finding
+  if (params.nodes.length === 1) {
+    const nodeId = params.nodes[0];
+    const node = nodes.get(nodeId);
+    if (['host','iot_sensor','iot_gateway'].includes(node.group)) {
+      const hostIdx = selectedHosts.indexOf(nodeId);
+      if (hostIdx >= 0) {
+        selectedHosts.splice(hostIdx, 1);
+      } else {
+        selectedHosts.push(nodeId);
+        if (selectedHosts.length > 2) {
+          selectedHosts.shift();
+        }
+      }
+      
+      if (selectedHosts.length === 2) {
+        const path = dijkstraPath(selectedHosts[0], selectedHosts[1]);
+        if (path) {
+          highlightPath(path);
+          const cost = computePathCost(path);
+          const pathStr = path.map(id => nodes.get(id).label.split('\\n')[0]).join(' → ');
+          panel.innerHTML = `
+            <h3>Shortest Path</h3>
+            <p><b>From:</b> ${nodes.get(selectedHosts[0]).label.split('\\n')[0]}</p>
+            <p><b>To:</b> ${nodes.get(selectedHosts[1]).label.split('\\n')[0]}</p>
+            <h4>Route</h4>
+            <p style="word-break:break-all;font-size:12px">${pathStr}</p>
+            <h4>Path Metrics</h4>
+            ${metricRow('Total Cost', cost.toFixed(3))}
+            ${metricRow('Hops', path.length - 1)}
+            `;
+          panel.innerHTML += `<button onclick="clearPath()" style="width:100%;padding:6px;margin-top:8px;background:#334155;border:1px solid #475569;color:#e2e8f0;border-radius:4px;cursor:pointer">Clear Path</button>`;
+        } else {
+          panel.innerHTML = '<h3>Path Not Found</h3><p>No path exists between selected hosts.</p>' +
+            `<button onclick="clearPath()" style="width:100%;padding:6px;margin-top:8px;background:#334155;border:1px solid #475569;color:#e2e8f0;border-radius:4px;cursor:pointer">Clear</button>`;
+        }
+      } else {
+        updatePanelOverview();
+      }
+      return;
+    }
+  }
+  
   if (params.nodes.length===0 && params.edges.length===0) {
-    panel.innerHTML = `
-      <h3>Network Overview</h3>
-      <p><b>Switches:</b> ${nodes.get({filter:n=>n.group==='switch'}).length}</p>
-      <p><b>Hosts:</b> ${nodes.get({filter:n=>['host','iot_sensor','iot_gateway'].includes(n.group)}).length}</p>
-      <p><b>Links:</b> ${edges.length}</p>
-      <hr style="border-color:#334155;margin:12px 0;">
-      <p style="color:#64748b;">Click the controller, a switch, or a host for details.</p>`;
+    clearPath();
     return;
   } else if (params.nodes.length === 0 && params.edges.length > 0) {
     const edgeId = params.edges[0];
@@ -241,6 +455,11 @@ network.on('click', function(params) {
       if (edge.speed_bps > 0) {
           html += metricRow('Peak Utilization', (edge.util * 100).toFixed(2) + '%', rhoClass(edge.util));
       }
+    }
+    if (selectedHosts.length > 0) {
+      html += `<hr style="border-color:#334155;margin:12px 0;">
+               <p style="font-size:12px;color:#fbbf24">${selectedHosts.map(h=>nodes.get(h).label.split('\\n')[0]).join(' → ')}</p>
+               <button onclick="clearPath()" style="width:100%;padding:6px;margin-top:8px;background:#334155;border:1px solid #475569;color:#e2e8f0;border-radius:4px;cursor:pointer">Clear Path</button>`;
     }
     panel.innerHTML = html;
     return;
@@ -313,6 +532,12 @@ network.on('click', function(params) {
     html += '<p><b>MAC:</b> '+nodeId+'</p>';
     html += '<p><b>Switch:</b> '+(node.dpid||'?')+' &nbsp;<b>Port:</b> '+(node.port||'?')+'</p>';
 
+  }
+  
+  if (selectedHosts.length > 0) {
+    html += `<hr style="border-color:#334155;margin:12px 0;">
+             <p style="font-size:12px;color:#fbbf24">${selectedHosts.map(h=>nodes.get(h).label.split('\\n')[0]).join(' → ')}</p>
+             <button onclick="clearPath()" style="width:100%;padding:6px;margin-top:8px;background:#334155;border:1px solid #475569;color:#e2e8f0;border-radius:4px;cursor:pointer">Clear Path</button>`;
   }
   panel.innerHTML = html;
 });

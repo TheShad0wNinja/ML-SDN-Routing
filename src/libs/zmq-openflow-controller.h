@@ -64,10 +64,11 @@ struct SwitchEnergyModel {
 struct MlConfig {
     bool   enabled                    = false;
     double interval_s                 = 1.0;   // observe→act→learn period
-    double action_scale               = 0.15;  // max |ΔW| as fraction of base cost
+    double action_scale               = 0.50;  // max |ΔW| as fraction of base cost
     double reward_alpha               = 1.0;   // delay-improvement weight
     double reward_beta                = 10.0;  // loss-penalty weight
     double reward_gamma               = 0.1;   // energy-efficiency weight
+    double reward_delta               = 5.0;   // utilization-penalty weight
     uint32_t checkpoint_every_n_ticks = 60;    // Python-side checkpoint cadence
     bool   resume                     = true;  // Python loads checkpoint if present
     uint32_t seed                     = 12345; // shared seed for Python RNG
@@ -85,6 +86,9 @@ public:
     void SetHostAnnotation(uint64_t mac, const HostAnnotation& ann);
     // Configure forwarding-energy model for a switch (by DPID)
     void SetSwitchEnergyModel(uint64_t dpid, double initial_j, double per_byte_j);
+    // Read back energy state for reporting. Returns -1 if dpid not configured.
+    double GetSwitchInitialEnergyJ(uint64_t dpid) const;
+    double GetSwitchResidualEnergyJ(uint64_t dpid) const;
     // Override the stats polling interval (seconds); default is 60 s
     void SetStatsInterval(double seconds);
     // Enable online FDRL local agent. Default-constructed MlConfig keeps it off.
@@ -211,6 +215,10 @@ private:
     std::unordered_map<uint64_t, double>             m_switchResidualEnergy;
 
     double m_statsIntervalS = 60.0;
+    // Set true whenever a congestion factor moves by more than the threshold;
+    // HandlePortStatsReply checks it after the per-port loop and triggers a
+    // RecomputeAllRoutes if dirty. Avoids re-running Dijkstra on every poll.
+    bool m_congestionDirty = false;
 
     // Online FDRL state.
     MlConfig m_ml;

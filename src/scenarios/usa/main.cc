@@ -2,6 +2,7 @@
 #include <ns3/core-module.h>
 #include <ns3/csma-module.h>
 #include <ns3/error-model.h>
+#include <ns3/flow-monitor-module.h>
 #include <ns3/internet-apps-module.h>
 #include <ns3/internet-module.h>
 #include <ns3/network-module.h>
@@ -19,22 +20,15 @@ using namespace ns3;
 NS_LOG_COMPONENT_DEFINE("USA");
 
 /* ========================================================================= */
-/*  1. STATS COLLECTOR  – centralized metrics                                 */
+/*  1. STATS COLLECTOR  – ping-only counters; flow stats come from FlowMonitor
+ */
 /* ========================================================================= */
 class StatsCollector {
  public:
-  static uint64_t g_totalRxBytes;
-  static uint64_t g_totalTxBytes;
   static uint64_t g_pingTx;
   static uint64_t g_pingRx;
   static double g_rttSumMs;
 
-  static void SinkRxCallback(Ptr<const Packet> p, const Address& addr) {
-    g_totalRxBytes += p->GetSize();
-  }
-  static void AppTxCallback(Ptr<const Packet> p) {
-    g_totalTxBytes += p->GetSize();
-  }
   static void PingTxCallback(uint16_t /*seq*/, Ptr<Packet> /*p*/) {
     ++g_pingTx;
   }
@@ -43,18 +37,8 @@ class StatsCollector {
     g_rttSumMs += rtt.GetMilliSeconds();
   }
 
-  static void PrintReport() {
-    std::cout << "\n=== UDP Load Generator ===" << std::endl;
-    std::cout << "  Transmitted : " << g_totalTxBytes << " B ("
-              << g_totalTxBytes / 1e6 << " MB)" << std::endl;
-    std::cout << "  Received    : " << g_totalRxBytes << " B ("
-              << g_totalRxBytes / 1e6 << " MB)" << std::endl;
-    if (g_totalTxBytes > 0) {
-      std::cout << "  Delivery    : "
-                << (g_totalRxBytes * 100.0 / g_totalTxBytes) << "%"
-                << std::endl;
-    }
-    std::cout << "\n=== Performance Monitor (ping) ===" << std::endl;
+  static void PrintPingReport() {
+    std::cout << "\n=== Liveness Probe (ping) ===" << std::endl;
     std::cout << "  Sent        : " << g_pingTx << std::endl;
     std::cout << "  Received    : " << g_pingRx << std::endl;
     if (g_pingTx > 0) {
@@ -71,8 +55,6 @@ class StatsCollector {
   }
 };
 
-uint64_t StatsCollector::g_totalRxBytes = 0;
-uint64_t StatsCollector::g_totalTxBytes = 0;
 uint64_t StatsCollector::g_pingTx = 0;
 uint64_t StatsCollector::g_pingRx = 0;
 double StatsCollector::g_rttSumMs = 0.0;
@@ -114,33 +96,32 @@ class LinkController {
 /*  3. CONFIGURATION STRUCTURES                                            */
 /* ========================================================================= */
 struct NodeProfile {
-  std::string name;         // City / node name
-  std::string nodeType;     // "tier1", "tier2", "edge", "crippled"
-  std::string cpuCapacity;  // e.g. "1Gbps"
-  uint32_t tcamDelayUs;     // Microseconds
-  double energyPerByteJ;    // Joules / byte
-  double initialEnergyJ;    // Starting energy reservoir
+  std::string name;
+  std::string nodeType;
+  std::string cpuCapacity;
+  uint32_t tcamDelayUs;
+  double energyPerByteJ;
+  double initialEnergyJ;
 };
 
 struct LinkSpec {
-  uint32_t src;            // Source switch index
-  uint32_t dst;            // Destination switch index
-  double distanceKm;       // Geographic distance
-  double lossRate;         // Packet error rate (0.0 = perfect)
-  std::string bufferSize;  // Queue limit, e.g. "500p"
-  bool failureTarget;      // true = eligible for scheduled churn
+  uint32_t src;
+  uint32_t dst;
+  double distanceKm;
+  double lossRate;
+  std::string bufferSize;
+  bool failureTarget;
 };
 
 /* ========================================================================= */
-/*  4. TOPOLOGY BUILDER  – nodes, links, OpenFlow, energy models             */
+/*  4. TOPOLOGY BUILDER                                                      */
 /* ========================================================================= */
 class UsaTopologyBuilder {
  public:
   UsaTopologyBuilder() {
-    m_edgeHelper.SetChannelAttribute("DataRate", StringValue("1Gbps"));
+    m_edgeHelper.SetChannelAttribute("DataRate", StringValue("100Mbps"));
     m_edgeHelper.SetChannelAttribute("Delay", StringValue("1ms"));
-
-    m_backboneHelper.SetChannelAttribute("DataRate", StringValue("10Gbps"));
+    m_backboneHelper.SetChannelAttribute("DataRate", StringValue("1Gbps"));
   }
 
   void CreateNodes(uint32_t numNodes) {
@@ -153,12 +134,13 @@ class UsaTopologyBuilder {
   }
 
   void InstallHost(uint32_t idx, const std::string& name,
-                   Ptr<ZmqOpenFlowController> ctrl) {
+                   Ptr<ZmqOpenFlowController> ctrl,
+                   const std::string& edgeQueueSize) {
     NetDeviceContainer dev = m_edgeHelper.Install(
         NodeContainer(m_hosts.Get(idx), m_switches.Get(idx)));
     m_hostPorts.Add(dev.Get(0));
     m_swPorts[idx].Add(dev.Get(1));
-    ConfigureQueue(dev.Get(1), "100p");
+    ConfigureQueue(dev.Get(1), edgeQueueSize);
 
     Ptr<NetDevice> nd = m_hosts.Get(idx)->GetDevice(0);
     Mac48Address addr = Mac48Address::ConvertFrom(nd->GetAddress());
@@ -168,10 +150,11 @@ class UsaTopologyBuilder {
     ctrl->SetHostAnnotation(MacToU64(addr), ann);
   }
 
-  LinkController::State* AddBackboneLink(const LinkSpec& spec) {
+  LinkController::State* AddBackboneLink(const LinkSpec& spec,
+                                         const std::string& backboneQueueSize) {
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(6) << (spec.distanceKm * 5e-6)
-        << "s";  // 5 µs / km (2/3 c)
+        << "s";
     m_backboneHelper.SetChannelAttribute("Delay", StringValue(oss.str()));
 
     NetDeviceContainer dev = m_backboneHelper.Install(
@@ -179,8 +162,8 @@ class UsaTopologyBuilder {
     m_swPorts[spec.src].Add(dev.Get(0));
     m_swPorts[spec.dst].Add(dev.Get(1));
 
-    ConfigureQueue(dev.Get(0), spec.bufferSize);
-    ConfigureQueue(dev.Get(1), spec.bufferSize);
+    ConfigureQueue(dev.Get(0), backboneQueueSize);
+    ConfigureQueue(dev.Get(1), backboneQueueSize);
 
     if (spec.lossRate > 0.0) {
       SetLinkErrorRate(dev.Get(0), spec.lossRate);
@@ -239,7 +222,6 @@ class UsaTopologyBuilder {
     m_ofHelper->EnableDatapathStats(prefix + "-stats");
   }
 
-  // Accessors
   NodeContainer& GetHosts() { return m_hosts; }
   NodeContainer& GetSwitches() { return m_switches; }
   Ipv4InterfaceContainer& GetHostIfaces() { return m_hostIfaces; }
@@ -285,7 +267,7 @@ class UsaTopologyBuilder {
 };
 
 /* ========================================================================= */
-/*  5. TRAFFIC MANAGER  – sinks, pings, rotating UDP                        */
+/*  5. TRAFFIC MANAGER                                                       */
 /* ========================================================================= */
 class TrafficManager {
  public:
@@ -294,25 +276,36 @@ class TrafficManager {
     m_uv = CreateObject<UniformRandomVariable>();
   }
 
-  void InstallSinks(uint16_t port, double simTime) {
-    for (uint32_t i = 0; i < m_hosts.GetN(); ++i) {
-      PacketSinkHelper sink("ns3::UdpSocketFactory",
-                            InetSocketAddress(Ipv4Address::GetAny(), port));
-      ApplicationContainer app = sink.Install(m_hosts.Get(i));
-      app.Start(Seconds(1.0));
-      app.Stop(Seconds(simTime));
-      m_sinkApps.Add(app);
-    }
-    for (uint32_t i = 0; i < m_sinkApps.GetN(); ++i) {
-      m_sinkApps.Get(i)->TraceConnectWithoutContext(
-          "Rx", MakeCallback(&StatsCollector::SinkRxCallback));
+  // Pre-warm controller flow tables by sending one ping between every host
+  // pair, spread across [startTime, startTime + durationS]. This forces
+  // Dijkstra + flow_mod for every path before measurement begins, so the
+  // first measured second isn't dominated by reactive-install latency.
+  void WarmupFlows(double startTime, double durationS) {
+    uint32_t n = m_hosts.GetN();
+    uint32_t totalPairs = n * (n - 1);
+    if (totalPairs == 0 || durationS <= 0.0) return;
+    double slotS = durationS / static_cast<double>(totalPairs);
+    uint32_t idx = 0;
+    for (uint32_t src = 0; src < n; ++src) {
+      for (uint32_t dst = 0; dst < n; ++dst) {
+        if (dst == src) continue;
+        PingHelper ping(Ipv4Address(m_ifaces.GetAddress(dst)));
+        ping.SetAttribute("VerboseMode", EnumValue(Ping::SILENT));
+        ping.SetAttribute("Count", UintegerValue(1));
+        ApplicationContainer app = ping.Install(m_hosts.Get(src));
+        double t = startTime + idx * slotS;
+        app.Start(Seconds(t));
+        app.Stop(Seconds(t + 1.0));
+        m_warmupApps.Add(app);
+        ++idx;
+      }
     }
   }
 
   void InstallPings(double startTime, double simTime) {
     uint32_t n = m_hosts.GetN();
     for (uint32_t src = 0; src < n; ++src) {
-      uint32_t dst = (src + n / 2) % n;  // opposite side of ring
+      uint32_t dst = (src + n / 2) % n;
       PingHelper ping(Ipv4Address(m_ifaces.GetAddress(dst)));
       ping.SetAttribute("VerboseMode", EnumValue(Ping::SILENT));
       ping.SetAttribute("Count", UintegerValue(0));
@@ -330,41 +323,50 @@ class TrafficManager {
   }
 
   void InstallUdpLoad(double startTime, double simTime, double flowDuration,
-                      const std::string& trafficMode, bool testMode) {
+                      const std::string& trafficMode, uint32_t maxRateMbps) {
     uint32_t n = m_hosts.GetN();
     uint16_t port = 9000;
 
-    for (double t = startTime; t < simTime - 2.0; t += flowDuration) {
+    // Install one sink per host so UDP traffic has a receiver
+    for (uint32_t i = 0; i < n; ++i) {
+      PacketSinkHelper sink("ns3::TcpSocketFactory",
+                            InetSocketAddress(Ipv4Address::GetAny(), port));
+      ApplicationContainer app = sink.Install(m_hosts.Get(i));
+      app.Start(Seconds(startTime - 0.5));
+      app.Stop(Seconds(simTime));
+      m_sinkApps.Add(app);
+    }
+
+    // Overlap flows: new wave every flowDuration/2, not flowDuration
+    double waveStride = flowDuration * 0.5;
+    for (double t = startTime; t < simTime - 2.0; t += waveStride) {
       for (uint32_t src = 0; src < n; ++src) {
         uint32_t dst = PickDestination(src, n, trafficMode);
         if (dst == src) continue;
 
-        uint32_t minRate = testMode ? 1 : 10;
-        uint32_t maxRate = testMode ? 1 : 30;
-        uint32_t rateInt = m_uv->GetInteger(minRate, maxRate);
+        uint32_t rateInt =
+            m_uv->GetInteger(1, std::max<uint32_t>(1, maxRateMbps));
         std::string rateStr = std::to_string(rateInt) + "Mbps";
 
-        OnOffHelper onoff("ns3::UdpSocketFactory",
+        OnOffHelper onoff("ns3::TcpSocketFactory",
                           InetSocketAddress(m_ifaces.GetAddress(dst), port));
         onoff.SetConstantRate(DataRate(rateStr));
         onoff.SetAttribute("PacketSize", UintegerValue(1024));
 
         ApplicationContainer app = onoff.Install(m_hosts.Get(src));
-        double offset = m_uv->GetValue(0.0, 0.5);
+        // Spread starts across 5 s, not 0.5 s, to avoid synchronized bursts
+        double offset = m_uv->GetValue(0.0, 5.0);
         app.Start(Seconds(t + offset));
         app.Stop(Seconds(t + flowDuration));
         m_srcApps.Add(app);
       }
-    }
-    for (uint32_t i = 0; i < m_srcApps.GetN(); ++i) {
-      m_srcApps.Get(i)->TraceConnectWithoutContext(
-          "Tx", MakeCallback(&StatsCollector::AppTxCallback));
     }
   }
 
  private:
   NodeContainer& m_hosts;
   Ipv4InterfaceContainer& m_ifaces;
+  ApplicationContainer m_warmupApps;
   ApplicationContainer m_srcApps;
   ApplicationContainer m_sinkApps;
   ApplicationContainer m_pingApps;
@@ -373,14 +375,14 @@ class TrafficManager {
   uint32_t PickDestination(uint32_t src, uint32_t n, const std::string& mode) {
     uint32_t dst = src;
     if (mode == "central") {
-      dst = 15;  // Chicago
+      dst = 15;
     } else if (mode == "random") {
       do {
         dst = m_uv->GetInteger(0, n - 1);
       } while (dst == src);
     } else if (mode == "grouped") {
-      bool isWest = (src <= 10);  // Vancouver .. ElPaso
-      bool isEast = (src >= 22);  // Cleveland .. Boston
+      bool isWest = (src <= 10);
+      bool isEast = (src >= 22);
       double roll = m_uv->GetValue();
       if (roll < 0.8) {
         if (isWest)
@@ -402,14 +404,23 @@ class TrafficManager {
 };
 
 /* ========================================================================= */
-/*  6. MAIN  – centralized config tables; edit here to change behavior       */
+/*  6. MAIN                                                                   */
 /* ========================================================================= */
 int main(int argc, char* argv[]) {
   bool trace = false;
-  double simTime = 300;
+  double simTime = 60.0;
+  double warmupS = 10.0;
   std::string trafficMode = "random";
   uint32_t seed = 12345;
-  bool testMode = true;
+
+  bool pingEnabled = true;
+  bool udpEnabled = false;
+  bool failuresEnabled = false;
+  bool crippleEnabled = false;
+  uint32_t udpRateCap = 5;  // Mbps per flow cap
+  double udpFlowDuration = 30.0;
+  std::string backboneQueue = "2000p";
+  std::string edgeQueue = "200p";
 
   bool mlEnabled = false;
   double mlIntervalS = 1.0;
@@ -424,12 +435,21 @@ int main(int argc, char* argv[]) {
   CommandLine cmd(__FILE__);
   cmd.AddValue("trace", "Enable pcap and datapath stats traces", trace);
   cmd.AddValue("simTime", "Simulation duration (s)", simTime);
+  cmd.AddValue("warmupS", "Pre-warmup window for flow installs (s)", warmupS);
   cmd.AddValue("trafficMode", "Traffic: random, central, grouped", trafficMode);
   cmd.AddValue("seed", "Random seed", seed);
-  cmd.AddValue("test", "Fast test mode", testMode);
+  cmd.AddValue("ping", "Enable measurement pings", pingEnabled);
+  cmd.AddValue("udp", "Enable OnOff UDP background load", udpEnabled);
+  cmd.AddValue("failures", "Enable scheduled link churn", failuresEnabled);
+  cmd.AddValue("cripple", "Cripple Missoula node (1Mbps CPU, 100us TCAM)",
+               crippleEnabled);
+  cmd.AddValue("udpRateCap", "Max per-flow UDP rate in Mbps", udpRateCap);
+  cmd.AddValue("udpFlowDuration", "UDP flow length (s)", udpFlowDuration);
+  cmd.AddValue("backboneQueue", "Backbone CSMA queue size", backboneQueue);
+  cmd.AddValue("edgeQueue", "Edge CSMA queue size", edgeQueue);
   cmd.AddValue("ml", "Enable FDRL agent", mlEnabled);
   cmd.AddValue("mlIntervalS", "Agent period (s)", mlIntervalS);
-  cmd.AddValue("mlActionScale", "Max |ΔW| fraction", mlActionScale);
+  cmd.AddValue("mlActionScale", "Max |dW| fraction", mlActionScale);
   cmd.AddValue("mlAlpha", "Reward weight on delay", mlAlpha);
   cmd.AddValue("mlBeta", "Reward penalty on loss", mlBeta);
   cmd.AddValue("mlGamma", "Reward weight on energy", mlGamma);
@@ -441,93 +461,99 @@ int main(int argc, char* argv[]) {
 
   RngSeedManager::SetSeed(seed);
 
+  if (warmupS < 0.0) warmupS = 0.0;
+  if (warmupS > simTime - 5.0) warmupS = std::max(0.0, simTime - 5.0);
+
   /* --- 6a. NODE CONFIGURATION TABLE ------------------------------------ */
-  // EDIT HERE: change cpuCapacity, tcamDelayUs, energyPerByteJ, etc.
   const uint32_t NUM_NODES = 34;
   std::vector<NodeProfile> nodeProfiles = {
-      // { name,           type,       cpu,       tcam, e/B,   initE }
       {"Vancouver", "edge", "100Mbps", 10, 0.10, 1e7},
-      {"Seattle", "tier1", "1Gbps", 2, 0.05, 1e7},
+      {"Seattle", "tier1", "1Gbps", 2, 0.05, 5e7},
       {"Portland", "edge", "100Mbps", 10, 0.10, 1e7},
-      {"Sunnyvale", "tier2", "500Mbps", 5, 0.08, 1e7},
-      {"LosAngeles", "tier2", "500Mbps", 5, 0.08, 1e7},
-      {"Missoula", "crippled", "1Mbps", 100, 0.15, 1e7},
-      {"SaltLakeCity", "tier1", "1Gbps", 2, 0.05, 1e7},
+      {"Sunnyvale", "tier2", "500Mbps", 5, 0.08, 2e7},
+      {"LosAngeles", "tier2", "500Mbps", 5, 0.08, 2e7},
+      {"Missoula", "crippled", "1Mbps", 100, 0.15, 5e6},
+      {"SaltLakeCity", "tier1", "1Gbps", 2, 0.05, 5e7},
       {"Phoenix", "edge", "100Mbps", 10, 0.10, 1e7},
-      {"Denver", "tier2", "500Mbps", 5, 0.08, 1e7},
+      {"Denver", "tier2", "500Mbps", 5, 0.08, 2e7},
       {"Albuqerque", "edge", "100Mbps", 10, 0.10, 1e7},
-      {"ElPaso", "tier2", "500Mbps", 5, 0.08, 1e7},
+      {"ElPaso", "tier2", "500Mbps", 5, 0.08, 2e7},
       {"Minneapolis", "edge", "100Mbps", 10, 0.10, 1e7},
-      {"KansasCity", "tier2", "500Mbps", 5, 0.08, 1e7},
+      {"KansasCity", "tier2", "500Mbps", 5, 0.08, 2e7},
       {"Dallas", "edge", "100Mbps", 10, 0.10, 1e7},
-      {"Houston", "tier1", "1Gbps", 2, 0.05, 1e7},
-      {"Chicago", "tier1", "1Gbps", 2, 0.05, 1e7},
+      {"Houston", "tier1", "1Gbps", 2, 0.05, 5e7},
+      {"Chicago", "tier1", "1Gbps", 2, 0.05, 5e7},
       {"Indianapolis", "edge", "100Mbps", 10, 0.10, 1e7},
       {"Louisville", "edge", "100Mbps", 10, 0.10, 1e7},
-      {"Nashville", "tier2", "500Mbps", 5, 0.08, 1e7},
+      {"Nashville", "tier2", "500Mbps", 5, 0.08, 2e7},
       {"Memphis", "edge", "100Mbps", 10, 0.10, 1e7},
       {"Jackson", "edge", "100Mbps", 10, 0.10, 1e7},
       {"BatonRouge", "edge", "100Mbps", 10, 0.10, 1e7},
-      {"Cleveland", "tier2", "500Mbps", 5, 0.08, 1e7},
+      {"Cleveland", "tier2", "500Mbps", 5, 0.08, 2e7},
       {"Pittsburgh", "edge", "100Mbps", 10, 0.10, 1e7},
-      {"Atlanta", "tier2", "500Mbps", 5, 0.08, 1e7},
-      {"Jacksonville", "tier2", "500Mbps", 5, 0.08, 1e7},
+      {"Atlanta", "tier2", "500Mbps", 5, 0.08, 2e7},
+      {"Jacksonville", "tier2", "500Mbps", 5, 0.08, 2e7},
       {"Buffalo", "edge", "100Mbps", 10, 0.10, 1e7},
       {"Ashburn", "edge", "100Mbps", 10, 0.10, 1e7},
       {"Raleigh", "edge", "100Mbps", 10, 0.10, 1e7},
-      {"WashingtonDC", "tier2", "500Mbps", 5, 0.08, 1e7},
+      {"WashingtonDC", "tier2", "500Mbps", 5, 0.08, 2e7},
       {"Miami", "edge", "100Mbps", 10, 0.10, 1e7},
       {"Philadelphia", "edge", "100Mbps", 10, 0.10, 1e7},
       {"NewYork", "edge", "100Mbps", 10, 0.10, 1e7},
       {"Boston", "edge", "100Mbps", 10, 0.10, 1e7},
   };
 
+  // Decripple Missoula unless explicitly requested. Crippled node adds
+  // 100us TCAM + 1Mbps CPU; useful for failure-mode tests, noise for routing
+  // comparisons.
+  if (!crippleEnabled) {
+    nodeProfiles[5] = {"Missoula", "tier2", "500Mbps", 5, 0.08, 2e7};
+  }
+
   /* --- 6b. LINK CONFIGURATION TABLE ------------------------------------ */
-  // EDIT HERE: change distanceKm, lossRate, bufferSize, or failureTarget
   std::vector<LinkSpec> linkSpecs = {
-      // {src, dst, distance, loss,   buffer,  fail?}
-      {4, 7, 575.0, 0.0, "500p", false},       // LA-Phoenix
-      {7, 10, 557.0, 0.0, "500p", false},      // Phoenix-ElPaso
-      {10, 9, 369.0, 0.0, "500p", false},      // ElPaso-Albuqerque
-      {10, 14, 1087.0, 0.004, "500p", false},  // ElPaso-Houston
-      {9, 8, 537.0, 0.0, "500p", false},       // Albuqerque-Denver
-      {8, 12, 898.0, 0.002, "500p", true},     // Denver-KansasCity   **FAIL**
-      {5, 11, 1617.0, 0.003, "500p", false},   // Missoula-Minneapolis
-      {11, 15, 572.0, 0.0, "500p", false},     // Minneapolis-Chicago
-      {14, 13, 362.0, 0.0, "500p", false},     // Houston-Dallas
-      {13, 12, 729.0, 0.0, "500p", false},     // Dallas-KansasCity
-      {12, 15, 662.0, 0.0, "500p", false},     // KansasCity-Chicago
-      {15, 16, 263.0, 0.0, "500p", true},      // Chicago-Indianapolis **FAIL**
-      {14, 21, 413.0, 0.0, "500p", false},     // Houston-BatonRouge
-      {21, 25, 913.0, 0.002, "500p", false},   // BatonRouge-Jacksonville
-      {25, 30, 525.0, 0.0, "500p", false},     // Jacksonville-Miami
-      {25, 24, 458.0, 0.0, "500p", false},     // Jacksonville-Atlanta
-      {24, 18, 346.0, 0.0, "500p", false},     // Atlanta-Nashville
-      {24, 28, 572.0, 0.0, "500p", false},     // Atlanta-Raleigh
-      {14, 20, 569.0, 0.0, "500p", false},     // Houston-Jackson
-      {20, 19, 316.0, 0.0, "500p", false},     // Jackson-Memphis
-      {19, 18, 306.0, 0.0, "500p", false},     // Memphis-Nashville
-      {18, 17, 249.0, 0.0, "500p", false},     // Nashville-Louisville
-      {17, 16, 172.0, 0.0, "500p", false},     // Louisville-Indianapolis
-      {28, 29, 375.0, 0.0, "500p", false},     // Raleigh-WashingtonDC
-      {29, 27, 55.0, 0.0, "500p", false},      // WashingtonDC-Ashburn
-      {29, 31, 199.0, 0.0, "500p", false},     // WashingtonDC-Philadelphia
-      {31, 32, 130.0, 0.0, "500p", false},     // Philadelphia-NewYork
-      {15, 22, 497.0, 0.0, "500p", false},     // Chicago-Cleveland
-      {22, 26, 279.0, 0.0, "500p", false},     // Cleveland-Buffalo
-      {26, 33, 644.0, 0.0, "500p", false},     // Buffalo-Boston
-      {22, 23, 185.0, 0.0, "500p", false},     // Cleveland-Pittsburgh
-      {23, 27, 360.0, 0.0, "500p", false},     // Pittsburgh-Ashburn
-      {32, 33, 306.0, 0.0, "500p", false},     // NewYork-Boston
-      {2, 3, 907.0, 0.002, "500p", false},     // Portland-Sunnyvale
-      {3, 4, 503.0, 0.0, "500p", false},       // Sunnyvale-LA
-      {3, 6, 955.0, 0.003, "500p", false},     // Sunnyvale-SaltLakeCity
-      {8, 6, 598.0, 0.0, "500p", false},       // Denver-SaltLakeCity
-      {4, 6, 934.0, 0.003, "500p", false},     // LA-SaltLakeCity
-      {0, 1, 194.0, 0.0, "500p", false},       // Vancouver-Seattle
-      {1, 5, 635.0, 0.0, "500p", false},       // Seattle-Missoula
-      {1, 2, 233.0, 0.0, "500p", false},       // Seattle-Portland
-      {1, 6, 1128.0, 0.003, "500p", false},    // Seattle-SaltLakeCity
+      {4, 7, 575.0, 0.0, backboneQueue, false},
+      {7, 10, 557.0, 0.0, backboneQueue, false},
+      {10, 9, 369.0, 0.0, backboneQueue, false},
+      {10, 14, 1087.0, 0.004, backboneQueue, false},
+      {9, 8, 537.0, 0.0, backboneQueue, false},
+      {8, 12, 898.0, 0.002, backboneQueue, true},
+      {5, 11, 1617.0, 0.003, backboneQueue, false},
+      {11, 15, 572.0, 0.0, backboneQueue, false},
+      {14, 13, 362.0, 0.0, backboneQueue, false},
+      {13, 12, 729.0, 0.0, backboneQueue, false},
+      {12, 15, 662.0, 0.0, backboneQueue, false},
+      {15, 16, 263.0, 0.0, backboneQueue, true},
+      {14, 21, 413.0, 0.0, backboneQueue, false},
+      {21, 25, 913.0, 0.002, backboneQueue, false},
+      {25, 30, 525.0, 0.0, backboneQueue, false},
+      {25, 24, 458.0, 0.0, backboneQueue, false},
+      {24, 18, 346.0, 0.0, backboneQueue, false},
+      {24, 28, 572.0, 0.0, backboneQueue, false},
+      {14, 20, 569.0, 0.0, backboneQueue, false},
+      {20, 19, 316.0, 0.0, backboneQueue, false},
+      {19, 18, 306.0, 0.0, backboneQueue, false},
+      {18, 17, 249.0, 0.0, backboneQueue, false},
+      {17, 16, 172.0, 0.0, backboneQueue, false},
+      {28, 29, 375.0, 0.0, backboneQueue, false},
+      {29, 27, 55.0, 0.0, backboneQueue, false},
+      {29, 31, 199.0, 0.0, backboneQueue, false},
+      {31, 32, 130.0, 0.0, backboneQueue, false},
+      {15, 22, 497.0, 0.0, backboneQueue, false},
+      {22, 26, 279.0, 0.0, backboneQueue, false},
+      {26, 33, 644.0, 0.0, backboneQueue, false},
+      {22, 23, 185.0, 0.0, backboneQueue, false},
+      {23, 27, 360.0, 0.0, backboneQueue, false},
+      {32, 33, 306.0, 0.0, backboneQueue, false},
+      {2, 3, 907.0, 0.002, backboneQueue, false},
+      {3, 4, 503.0, 0.0, backboneQueue, false},
+      {3, 6, 955.0, 0.003, backboneQueue, false},
+      {8, 6, 598.0, 0.0, backboneQueue, false},
+      {4, 6, 934.0, 0.003, backboneQueue, false},
+      {0, 1, 194.0, 0.0, backboneQueue, false},
+      {1, 5, 635.0, 0.0, backboneQueue, false},
+      {1, 2, 233.0, 0.0, backboneQueue, false},
+      {1, 6, 1128.0, 0.003, backboneQueue, false},
   };
 
   /* --- 6c. BUILD ------------------------------------------------------- */
@@ -551,51 +577,152 @@ int main(int argc, char* argv[]) {
   }
 
   for (uint32_t i = 0; i < NUM_NODES; ++i) {
-    builder.InstallHost(i, nodeProfiles[i].name, ctrl);
-    builder.ConfigureSwitch(i, nodeProfiles[i], ctrl);
+    builder.InstallHost(i, nodeProfiles[i].name, ctrl, edgeQueue);
   }
 
   std::vector<LinkController::State*> failureLinks;
   for (const auto& spec : linkSpecs) {
-    LinkController::State* ls = builder.AddBackboneLink(spec);
+    LinkController::State* ls = builder.AddBackboneLink(spec, spec.bufferSize);
     if (ls) failureLinks.push_back(ls);
   }
 
   builder.SetupIpStack();
   builder.InstallOpenFlow(ctrl);
 
-  /* --- 6d. TRAFFIC ----------------------------------------------------- */
-  TrafficManager traffic(builder.GetHosts(), builder.GetHostIfaces());
-  // traffic.InstallSinks(9000, simTime);
-  traffic.InstallPings(5.0, simTime);
-  // traffic.InstallUdpLoad(5.0, simTime, 30.0, trafficMode, testMode);
-
-  /* --- 6e. SCHEDULED CHURN --------------------------------------------- */
-  // EDIT HERE: change failure timing or add more events
-  if (failureLinks.size() >= 3) {
-    Simulator::Schedule(Seconds(60.0), &LinkController::BringDown,
-                        failureLinks[0]);
-    Simulator::Schedule(Seconds(120.0), &LinkController::BringUp,
-                        failureLinks[0]);
-    Simulator::Schedule(Seconds(150.0), &LinkController::BringDown,
-                        failureLinks[1]);
-    Simulator::Schedule(Seconds(210.0), &LinkController::BringUp,
-                        failureLinks[1]);
-    Simulator::Schedule(Seconds(240.0), &LinkController::BringDown,
-                        failureLinks[2]);
-    Simulator::Schedule(Seconds(285.0), &LinkController::BringUp,
-                        failureLinks[2]);
+  // ConfigureSwitch sets attributes on OFSwitch13Device, which only exists
+  // after InstallOpenFlow has run. Running it earlier silently no-ops the
+  // CPU/TCAM/energy assignments.
+  for (uint32_t i = 0; i < NUM_NODES; ++i) {
+    builder.ConfigureSwitch(i, nodeProfiles[i], ctrl);
   }
 
-  /* --- 6f. RUN --------------------------------------------------------- */
+  /* --- 6d. TRAFFIC ----------------------------------------------------- */
+  TrafficManager traffic(builder.GetHosts(), builder.GetHostIfaces());
+
+  // Warmup runs from t=1.0 to t=1.0+warmupS so the controller can install
+  // every host-pair flow before measurement begins.
+  double measureStart = 1.0 + warmupS;
+  if (warmupS > 0.0) {
+    traffic.WarmupFlows(1.0, warmupS);
+  }
+
+  if (pingEnabled) {
+    traffic.InstallPings(measureStart, simTime);
+  }
+  if (udpEnabled) {
+    traffic.InstallUdpLoad(measureStart, simTime, udpFlowDuration, trafficMode,
+                           udpRateCap);
+  }
+
+  /* --- 6e. SCHEDULED CHURN --------------------------------------------- */
+  // Scale failure events to fractions of the measurement window so the
+  // schedule still makes sense at simTime=60 or simTime=300.
+  if (failuresEnabled && failureLinks.size() >= 3) {
+    double window = simTime - measureStart;
+    auto at = [&](double frac) {
+      return Seconds(measureStart + frac * window);
+    };
+    Simulator::Schedule(at(0.20), &LinkController::BringDown, failureLinks[0]);
+    Simulator::Schedule(at(0.40), &LinkController::BringUp, failureLinks[0]);
+    Simulator::Schedule(at(0.50), &LinkController::BringDown, failureLinks[1]);
+    Simulator::Schedule(at(0.70), &LinkController::BringUp, failureLinks[1]);
+    Simulator::Schedule(at(0.80), &LinkController::BringDown, failureLinks[2]);
+    Simulator::Schedule(at(0.95), &LinkController::BringUp, failureLinks[2]);
+  }
+
+  /* --- 6f. FLOW MONITOR ------------------------------------------------ */
+  FlowMonitorHelper flowmonHelper;
+  Ptr<FlowMonitor> monitor = flowmonHelper.InstallAll();
+  // Discard anything that flew during warmup so the report reflects only
+  // the measurement window.
+  Simulator::Schedule(Seconds(measureStart),
+                      [&]() { monitor->ResetAllStats(); });
+
+  /* --- 6g. RUN --------------------------------------------------------- */
   if (trace) {
     builder.EnableTraces("usa-stress");
   }
 
-  NS_LOG_INFO("Starting Simulation...");
+  NS_LOG_INFO("Starting Simulation (simTime=" << simTime << "s, warmup="
+                                              << warmupS << "s)...");
   Simulator::Stop(Seconds(simTime));
   Simulator::Run();
-  StatsCollector::PrintReport();
+
+  /* --- 6h. REPORT ------------------------------------------------------ */
+  StatsCollector::PrintPingReport();
+
+  monitor->CheckForLostPackets();
+  auto classifier =
+      DynamicCast<Ipv4FlowClassifier>(flowmonHelper.GetClassifier());
+  auto stats = monitor->GetFlowStats();
+
+  uint64_t totalTx = 0, totalRx = 0, totalLost = 0;
+  double delaySumS = 0.0;
+  uint64_t rxForDelay = 0;
+  for (auto& kv : stats) {
+    totalTx += kv.second.txPackets;
+    totalRx += kv.second.rxPackets;
+    totalLost += kv.second.lostPackets;
+    delaySumS += kv.second.delaySum.GetSeconds();
+    rxForDelay += kv.second.rxPackets;
+  }
+
+  std::cout << "\n=== FlowMonitor Summary (post-warmup window) ==="
+            << std::endl;
+  std::cout << "  Flows       : " << stats.size() << std::endl;
+  std::cout << "  Tx packets  : " << totalTx << std::endl;
+  std::cout << "  Rx packets  : " << totalRx << std::endl;
+  std::cout << "  Lost packets: " << totalLost << std::endl;
+  if (totalTx > 0) {
+    std::cout << "  Delivery    : " << (totalRx * 100.0 / totalTx) << "%"
+              << std::endl;
+  }
+  if (rxForDelay > 0) {
+    std::cout << "  Avg delay   : " << (delaySumS * 1000.0 / rxForDelay)
+              << " ms" << std::endl;
+  }
+
+  /* --- 6i. ENERGY REPORT ---------------------------------------------- */
+  // Power averaged over the full sim run. Useful for comparing routing
+  // policies (e.g. plain Dijkstra vs FDRL agent) under identical traffic.
+  {
+    double totalInitialJ = 0.0;
+    double totalResidualJ = 0.0;
+    uint32_t tracked = 0;
+    std::cout << "\n=== Switch Energy (consumed over " << simTime
+              << "s) ===" << std::endl;
+    std::cout << std::left << std::setw(14) << "Switch" << std::right
+              << std::setw(14) << "Consumed (J)" << std::setw(14)
+              << "Avg Power (W)" << std::endl;
+    for (uint32_t i = 0; i < NUM_NODES; ++i) {
+      uint64_t dpid = i + 1;
+      double init = ctrl->GetSwitchInitialEnergyJ(dpid);
+      double resid = ctrl->GetSwitchResidualEnergyJ(dpid);
+      if (init < 0 || resid < 0) continue;
+      double consumed = init - resid;
+      double avgW = (simTime > 0) ? consumed / simTime : 0.0;
+      totalInitialJ += init;
+      totalResidualJ += resid;
+      ++tracked;
+      std::cout << std::left << std::setw(14) << nodeProfiles[i].name
+                << std::right << std::setw(14) << std::fixed
+                << std::setprecision(2) << consumed << std::setw(14) << avgW
+                << std::endl;
+    }
+    if (tracked > 0 && simTime > 0) {
+      double totalConsumed = totalInitialJ - totalResidualJ;
+      std::cout << "  Switches tracked  : " << tracked << std::endl;
+      std::cout << "  Total consumed    : " << totalConsumed << " J"
+                << std::endl;
+      std::cout << "  Total avg power   : " << (totalConsumed / simTime) << " W"
+                << std::endl;
+      std::cout << "  Per-switch avg    : "
+                << (totalConsumed / simTime / tracked) << " W" << std::endl;
+    } else {
+      std::cout << "  (no energy model configured)" << std::endl;
+    }
+  }
+
   Simulator::Destroy();
   NS_LOG_INFO("Simulation Complete.");
   return 0;

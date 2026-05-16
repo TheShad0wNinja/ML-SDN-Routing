@@ -199,11 +199,82 @@ void Topology::SetLinkCost(uint64_t dpid1, uint64_t dpid2, double newCost)
 
 void Topology::ResetLinkCosts()
 {
+    m_linkCongestion.clear();
+    m_linkMlDelta.clear();
     for (const auto& srcKv : m_baseLinkCost) {
         for (const auto& dstKv : srcKv.second) {
             m_linkCost[srcKv.first][dstKv.first] = dstKv.second;
         }
     }
+    m_pathCache.clear();
+}
+
+void Topology::SetLinkBaseCost(uint64_t dpid1, uint64_t dpid2, double baseCost)
+{
+    auto it = m_baseLinkCost.find(dpid1);
+    if (it == m_baseLinkCost.end() || it->second.find(dpid2) == it->second.end())
+        return;
+    if (!(baseCost > 0.0)) baseCost = 1e-3;
+    m_baseLinkCost[dpid1][dpid2] = baseCost;
+    m_baseLinkCost[dpid2][dpid1] = baseCost;
+    RecomputeCost(dpid1, dpid2);
+}
+
+static double LookupOrZero(
+    const std::unordered_map<uint64_t, std::unordered_map<uint64_t, double>>& m,
+    uint64_t a, uint64_t b)
+{
+    auto it = m.find(a);
+    if (it == m.end()) return 0.0;
+    auto jt = it->second.find(b);
+    if (jt == it->second.end()) return 0.0;
+    return jt->second;
+}
+
+double Topology::GetLinkCongestion(uint64_t dpid1, uint64_t dpid2) const
+{
+    return LookupOrZero(m_linkCongestion, dpid1, dpid2);
+}
+
+void Topology::SetLinkCongestion(uint64_t dpid1, uint64_t dpid2, double congestion)
+{
+    auto it = m_linkCost.find(dpid1);
+    if (it == m_linkCost.end() || it->second.find(dpid2) == it->second.end())
+        return;
+    if (!(congestion >= 0.0)) congestion = 0.0;
+    m_linkCongestion[dpid1][dpid2] = congestion;
+    m_linkCongestion[dpid2][dpid1] = congestion;
+    RecomputeCost(dpid1, dpid2);
+}
+
+double Topology::GetLinkMlDelta(uint64_t dpid1, uint64_t dpid2) const
+{
+    return LookupOrZero(m_linkMlDelta, dpid1, dpid2);
+}
+
+void Topology::SetLinkMlDelta(uint64_t dpid1, uint64_t dpid2, double delta)
+{
+    auto it = m_linkCost.find(dpid1);
+    if (it == m_linkCost.end() || it->second.find(dpid2) == it->second.end())
+        return;
+    m_linkMlDelta[dpid1][dpid2] = delta;
+    m_linkMlDelta[dpid2][dpid1] = delta;
+    RecomputeCost(dpid1, dpid2);
+}
+
+void Topology::RecomputeCost(uint64_t dpid1, uint64_t dpid2)
+{
+    auto it = m_linkCost.find(dpid1);
+    if (it == m_linkCost.end() || it->second.find(dpid2) == it->second.end())
+        return;
+    double base = LookupOrZero(m_baseLinkCost, dpid1, dpid2);
+    if (!(base > 0.0)) base = 1.0;
+    double cong  = LookupOrZero(m_linkCongestion, dpid1, dpid2);
+    double mlDel = LookupOrZero(m_linkMlDelta, dpid1, dpid2);
+    double eff = base * (1.0 + cong) * (1.0 + mlDel);
+    if (!(eff > 0.0)) eff = 1e-3;
+    m_linkCost[dpid1][dpid2] = eff;
+    m_linkCost[dpid2][dpid1] = eff;
     m_pathCache.clear();
 }
 

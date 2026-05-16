@@ -24,6 +24,15 @@ namespace ns3 {
 
 NS_LOG_COMPONENT_DEFINE("ZmqOpenFlowController");
 
+// Map (delay, capacity) → static link cost. Low-delay, high-capacity links
+// are cheap; the floors keep early-LLDP links (capacity unknown until
+// PORT_STATS arrives) on the same order of magnitude as discovered links.
+static double ComputeBaseCost(double delayMs, double capBps) {
+  double d = std::clamp(delayMs, 1.0, 1000.0);
+  double cap_gbps = std::max(capBps, 10e6) / 1e9;  // 10 Mbps floor
+  return d / cap_gbps;
+}
+
 TypeId ZmqOpenFlowController::GetTypeId() {
   static TypeId tid = TypeId("ns3::ZmqOpenFlowController")
                           .SetParent<OFSwitch13Controller>()
@@ -106,6 +115,18 @@ void ZmqOpenFlowController::SetSwitchEnergyModel(uint64_t dpid,
   m_switchEnergyModel[dpid] = {initial_j, per_byte_j};
   if (initial_j >= 0)
     m_switchResidualEnergy[dpid] = initial_j;
+}
+
+double ZmqOpenFlowController::GetSwitchInitialEnergyJ(uint64_t dpid) const {
+  auto it = m_switchEnergyModel.find(dpid);
+  if (it == m_switchEnergyModel.end()) return -1.0;
+  return it->second.initial_energy_j;
+}
+
+double ZmqOpenFlowController::GetSwitchResidualEnergyJ(uint64_t dpid) const {
+  auto it = m_switchResidualEnergy.find(dpid);
+  if (it == m_switchResidualEnergy.end()) return -1.0;
+  return it->second;
 }
 
 void ZmqOpenFlowController::SetStatsInterval(double seconds) {
@@ -428,12 +449,16 @@ void ZmqOpenFlowController::HandleLldpPacket(uint64_t dpid, uint32_t inPort,
     }
   }
 
-  bool changed = m_topology.AddLink(chassis_id, port_id, dpid, inPort, delayMs, 1.0);
+  // Capacity isn't known until PORT_STATS arrives; seed base_cost from delay
+  // with the 10 Mbps capacity floor in ComputeBaseCost, then refine later.
+  double baseCost = ComputeBaseCost(delayMs, 0.0);
+  bool changed = m_topology.AddLink(chassis_id, port_id, dpid, inPort, delayMs, baseCost);
   if (changed) {
     RebuildSpanningTree();
   }
   NS_LOG_INFO("[TOPO] Link: " << chassis_id << ":" << port_id << " <-> " << dpid
-                              << ":" << inPort << " delay=" << delayMs << "ms cost=1.0");
+                              << ":" << inPort << " delay=" << delayMs
+                              << "ms base_cost=" << baseCost);
 
   // Flush MAC entries learned on now-confirmed switch-link ports
   for (auto mit = m_macToLoc.begin(); mit != m_macToLoc.end();) {
@@ -771,8 +796,21 @@ void ZmqOpenFlowController::HandlePortStatsReply(
     if (ps.speed_kbps > 0) {
       auto peerDpid = m_topology.GetPeerDpid(dpid, pno);
       if (peerDpid) {
-        m_topology.SetLinkCapacityBps(dpid, *peerDpid,
-                                       static_cast<double>(ps.speed_kbps) * 1000.0);
+        double capBps = static_cast<double>(ps.speed_kbps) * 1000.0;
+        m_topology.SetLinkCapacityBps(dpid, *peerDpid, capBps);
+        // Refine base_cost now that we know real capacity.
+        m_topology.SetLinkBaseCost(dpid, *peerDpid,
+            ComputeBaseCost(m_topology.GetLinkDelay(dpid, *peerDpid), capBps));
+
+        // Derive congestion factor from utilization with EWMA smoothing.
+        double util = std::clamp(ps.tx_rate_bps / std::max(1.0, capBps), 0.0, 0.99);
+        double cong = std::min(5.0, util * util / std::max(1e-3, 1.0 - util));
+        double prev = m_topology.GetLinkCongestion(dpid, *peerDpid);
+        double smooth = 0.7 * prev + 0.3 * cong;
+        if (std::abs(smooth - prev) > 0.05) {
+          m_topology.SetLinkCongestion(dpid, *peerDpid, smooth);
+          m_congestionDirty = true;
+        }
       }
     }
 
@@ -783,6 +821,11 @@ void ZmqOpenFlowController::HandlePortStatsReply(
   }
 
   ComputeSwitchObservations(dpid);
+
+  if (m_congestionDirty) {
+    m_congestionDirty = false;
+    RecomputeAllRoutes();
+  }
 }
 
 void ZmqOpenFlowController::ComputeSwitchObservations(uint64_t dpid) {
@@ -1435,9 +1478,35 @@ double ZmqOpenFlowController::ComputeMlReward() {
     energyTerm += txBps * emIt->second.energy_per_byte_j * frac;
   }
 
+  // Utilization penalty: discourage saturating links. Mean keeps the signal
+  // bounded; peak punishes the worst bottleneck so the agent has a reason to
+  // avoid corner-case hotspots even when the average looks fine.
+  double utilSum = 0.0;
+  double utilPeak = 0.0;
+  uint32_t utilN = 0;
+  for (const auto& [a, b] : m_mlLinkOrder) {
+    double cap = std::max(m_topology.GetLinkCapacityBps(a, b),
+                          m_topology.GetLinkCapacityBps(b, a));
+    if (cap <= 0.0) continue;
+    double txBps = 0.0;
+    auto psIt = m_portStats.find(a);
+    if (psIt != m_portStats.end()) {
+      for (const auto& [pno, ps] : psIt->second) {
+        auto peer = m_topology.GetPeerDpid(a, pno);
+        if (peer && *peer == b) txBps += ps.tx_rate_bps;
+      }
+    }
+    double u = std::clamp(txBps / cap, 0.0, 1.0);
+    utilSum += u;
+    if (u > utilPeak) utilPeak = u;
+    ++utilN;
+  }
+  double meanUtil = (utilN > 0) ? (utilSum / utilN) : 0.0;
+
   double R = m_ml.reward_alpha * (meanPrev - meanCurr)
            - m_ml.reward_beta  * (currLoss - prevLoss) / 1e6  // bring loss into a comparable unit
-           + m_ml.reward_gamma * energyTerm / 1e6;
+           + m_ml.reward_gamma * energyTerm / 1e6
+           - m_ml.reward_delta * (0.5 * meanUtil + 0.5 * utilPeak);
   return R;
 }
 
@@ -1450,12 +1519,9 @@ void ZmqOpenFlowController::ApplyDeltaCosts(const std::vector<double>& deltas) {
     else if (d < -m_ml.action_scale)  d = -m_ml.action_scale;
 
     auto [a, b] = m_mlLinkOrder[i];
-    double base = m_topology.GetBaseLinkCost(a, b);
-    if (base <= 0.0) continue;
-    double newCost = base * (1.0 + d);
-    double oldCost = m_topology.GetLinkCost(a, b);
-    if (std::abs(newCost - oldCost) > 1e-9) {
-      m_topology.SetLinkCost(a, b, newCost);
+    double prev = m_topology.GetLinkMlDelta(a, b);
+    if (std::abs(d - prev) > 1e-9) {
+      m_topology.SetLinkMlDelta(a, b, d);
       anyChanged = true;
     }
   }

@@ -28,6 +28,14 @@ public:
   void   SetLinkCost(uint64_t dpid1, uint64_t dpid2, double newCost);
   void   ResetLinkCosts();
 
+  // Layered cost composition: effective cost = base * (1 + congestion) * (1 + ml_delta).
+  // Setters recompute and broadcast the effective cost; pathCache is invalidated.
+  void   SetLinkBaseCost(uint64_t dpid1, uint64_t dpid2, double baseCost);
+  double GetLinkCongestion(uint64_t dpid1, uint64_t dpid2) const;
+  void   SetLinkCongestion(uint64_t dpid1, uint64_t dpid2, double congestion);
+  double GetLinkMlDelta(uint64_t dpid1, uint64_t dpid2) const;
+  void   SetLinkMlDelta(uint64_t dpid1, uint64_t dpid2, double delta);
+
   // Egress-port capacity (bits/s) stashed when the controller sees
   // the first PORT_STATS reply; 0 if not yet known.
   double GetLinkCapacityBps(uint64_t srcDpid, uint64_t dstDpid) const;
@@ -75,6 +83,8 @@ private:
   std::unordered_map<uint64_t, std::unordered_map<uint64_t, double>> m_linkDelay;
   std::unordered_map<uint64_t, std::unordered_map<uint64_t, double>> m_linkCost;
   std::unordered_map<uint64_t, std::unordered_map<uint64_t, double>> m_baseLinkCost;
+  std::unordered_map<uint64_t, std::unordered_map<uint64_t, double>> m_linkCongestion;
+  std::unordered_map<uint64_t, std::unordered_map<uint64_t, double>> m_linkMlDelta;
   std::unordered_map<uint64_t, std::unordered_map<uint64_t, double>> m_linkCapacityBps;
 
   // Path cache: src -> dst -> path (mutable for const ShortestPath method)
@@ -83,6 +93,10 @@ private:
 
   void AddAdjacency(uint64_t src, uint64_t dst, uint32_t outPort);
   void RemoveAdjacency(uint64_t src, uint64_t dst);
+
+  // Compose effective cost from base × (1 + congestion) × (1 + ml_delta).
+  // No-op if the link doesn't exist. Clears path cache.
+  void RecomputeCost(uint64_t dpid1, uint64_t dpid2);
 };
 
 } // namespace ns3
