@@ -27,7 +27,9 @@ RUN pip3 install --no-cache-dir \
     eventlet==0.41.0 \
     dnspython==2.8.0 \
     ryu==4.34 \
-    pyzmq==27.1.0
+    pyzmq==27.1.0 \ 
+    torch \
+    numpy
 
 # Patch eventless
 # RUN sed -i -e 's/from eventlet.wsgi import ALREADY_HANDLED/import eventlet.wsgi/g' -e 's/_ALREADY_HANDLED = ALREADY_HANDLED/_ALREADY_HANDLED = getattr(getattr(eventlet.wsgi, "WSGI_LOCAL", None), "already_handled", None)/g' $(python3 -c "import ryu.app.wsgi as w; print(w.__file__)")
