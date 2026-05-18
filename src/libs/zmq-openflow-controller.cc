@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -138,6 +139,33 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
   if (!m_ml.enabled) {
     return;
   }
+
+  // Apply priority preset — overwrites individual weights unless preset is
+  // "custom". The user can still override individual weights after calling
+  // SetMlConfig if needed; the typical flow is preset-or-custom, not both.
+  if (m_ml.priority_preset == "balanced") {
+    m_ml.reward_alpha = 1.0;  m_ml.reward_beta  = 2.0;
+    m_ml.reward_gamma = 1.5;  m_ml.reward_delta = 1.0;
+    m_ml.reward_zeta  = 0.5;  m_ml.reward_eta   = 1.5;
+    m_ml.reward_theta = 1.0;
+  } else if (m_ml.priority_preset == "delay_first") {
+    m_ml.reward_alpha = 2.5;  m_ml.reward_beta  = 3.0;
+    m_ml.reward_gamma = 0.5;  m_ml.reward_delta = 1.0;
+    m_ml.reward_zeta  = 0.2;  m_ml.reward_eta   = 0.8;
+    m_ml.reward_theta = 0.5;
+  } else if (m_ml.priority_preset == "energy_first") {
+    m_ml.reward_alpha = 0.5;  m_ml.reward_beta  = 1.5;
+    m_ml.reward_gamma = 3.0;  m_ml.reward_delta = 1.0;
+    m_ml.reward_zeta  = 1.5;  m_ml.reward_eta   = 3.0;
+    m_ml.reward_theta = 2.0;
+  }
+  // Any other value (including "custom") leaves the weights as-passed.
+
+  NS_LOG_INFO("[ML] preset=" << m_ml.priority_preset
+              << " α=" << m_ml.reward_alpha << " β=" << m_ml.reward_beta
+              << " γ=" << m_ml.reward_gamma << " δ=" << m_ml.reward_delta
+              << " ζ=" << m_ml.reward_zeta  << " η=" << m_ml.reward_eta
+              << " θ=" << m_ml.reward_theta);
 
   // Make sure stats roll fast enough that the agent gets fresh observations
   // every tick. Without this, the default 60 s interval would starve MlTick.
@@ -1328,8 +1356,12 @@ void ZmqOpenFlowController::MlOpenSocket() {
 void ZmqOpenFlowController::MlSendHello() {
   if (!m_mlSock) return;
 
-  // state_dim = 6 features per switch * |switches|
-  size_t stateDim = 6 * m_switchMap.size();
+  // state_dim layout — keep in sync with python's _flatten_state():
+  //   7 per-switch features (rho, d_ms, p_loss, residual_frac, depletion,
+  //                          echo_rtt_s, mu_max_gbps)
+  //   3 per-link features  (utilization, cost_norm, tx_share)
+  //   1 global scalar      (residual_energy_stddev)
+  size_t stateDim = 7 * m_switchMap.size() + 3 * m_mlLinkOrder.size() + 1;
   // action_dim = one ΔW per (deduplicated) link
   size_t actionDim = m_mlLinkOrder.size();
 
@@ -1370,6 +1402,7 @@ std::string ZmqOpenFlowController::BuildMlStatePayload() {
   s << "{\"cmd\":\"observe\","
     << "\"tick\":" << m_mlTick << ","
     << "\"prev_reward\":" << m_mlPrevReward << ","
+    << "\"explore\":" << (m_ml.explore ? "true" : "false") << ","
     << "\"state\":{";
 
   // ---- per-switch features ----
@@ -1382,7 +1415,8 @@ std::string ZmqOpenFlowController::BuildMlStatePayload() {
                         ? m_switchEnergyModel.at(dpid)
                         : SwitchEnergyModel{};
     double energyFrac = (em.initial_energy_j > 0 && obs.residual_energy_j >= 0)
-                            ? (obs.residual_energy_j / em.initial_energy_j)
+                            ? std::clamp(obs.residual_energy_j / em.initial_energy_j,
+                                         0.0, 1.0)
                             : 1.0;
     double rttNs = m_echoRttNs.count(dpid) ? m_echoRttNs.at(dpid) : 0;
 
@@ -1392,6 +1426,7 @@ std::string ZmqOpenFlowController::BuildMlStatePayload() {
       << ",\"d_ms\":" << obs.d_ms
       << ",\"p_loss\":" << obs.p_loss
       << ",\"residual_energy_frac\":" << energyFrac
+      << ",\"depletion\":" << (1.0 - energyFrac)
       << ",\"echo_rtt_ns\":" << rttNs
       << ",\"mu_max_bps\":" << obs.mu_max_bps
       << "}";
@@ -1433,61 +1468,58 @@ std::string ZmqOpenFlowController::BuildMlStatePayload() {
       << "}";
     firstLink = false;
   }
-  s << "]}}";
+  s << "],";
+  // Global energy-fairness signal — single scalar appended after per_link.
+  s << "\"residual_energy_stddev\":" << ComputeResidualEnergyStddev();
+  s << "}}";
   return s.str();
 }
 
 double ZmqOpenFlowController::ComputeMlReward() {
-  if (!m_mlHavePrevObs || m_switchObs.empty()) return 0.0;
+  if (m_switchObs.empty()) return 0.0;
 
-  // Mean delay improvement (lower is better → reward positive when curr < prev).
-  double prevDelay = 0.0, currDelay = 0.0;
-  uint32_t prevN = 0, currN = 0;
-  for (const auto& [dpid, o] : m_mlPrevObs) {
-    if (o.d_ms > 0) { prevDelay += o.d_ms; ++prevN; }
-  }
+  // ---- 1. Delay quality term (absolute, normalized) ----
+  double currDelay = 0.0;
+  uint32_t currN = 0;
   for (const auto& [dpid, o] : m_switchObs) {
     if (o.d_ms > 0) { currDelay += o.d_ms; ++currN; }
   }
-  double meanPrev = (prevN > 0) ? (prevDelay / prevN) : 0.0;
   double meanCurr = (currN > 0) ? (currDelay / currN) : 0.0;
+  double delayRef = std::max(1.0, m_ml.delay_ref_ms);
+  double delayQuality = 1.0 - std::clamp(meanCurr / delayRef, 0.0, 1.0);
 
-  // Loss penalty: total dropped-bytes rate.
-  double prevLoss = 0.0, currLoss = 0.0;
-  for (const auto& [dpid, o] : m_mlPrevObs)   prevLoss += o.L_bps;
-  for (const auto& [dpid, o] : m_switchObs)   currLoss += o.L_bps;
+  // ---- 2. Loss quality term (absolute, normalized) ----
+  double currLoss = 0.0;
+  for (const auto& [dpid, o] : m_switchObs) currLoss += o.L_bps;
+  double lossRef = std::max(1.0, m_ml.loss_ref_bps);
+  double lossQuality = 1.0 - std::clamp(currLoss / lossRef, 0.0, 1.0);
 
-  // Energy-efficiency term: forwarded bytes weighted by residual energy fraction.
-  double energyTerm = 0.0;
-  for (const auto& [a, b] : m_mlLinkOrder) {
-    auto psIt = m_portStats.find(a);
+  // ---- 3. Power-consumption penalty ----
+  // currPower_W approximates instantaneous aggregate draw from per-switch
+  // tx rates × per-byte energy cost. Sum across all switches with energy
+  // models; switches without a configured model contribute 0.
+  double currPowerW = 0.0;
+  for (const auto& [dpid, em] : m_switchEnergyModel) {
+    if (em.initial_energy_j <= 0) continue;
+    auto psIt = m_portStats.find(dpid);
     if (psIt == m_portStats.end()) continue;
     double txBps = 0.0;
-    for (const auto& [pno, ps] : psIt->second) {
-      auto peer = m_topology.GetPeerDpid(a, pno);
-      if (peer && *peer == b) txBps += ps.tx_rate_bps;
-    }
-    auto emIt = m_switchEnergyModel.find(a);
-    if (emIt == m_switchEnergyModel.end()) continue;
-    double frac = 1.0;
-    if (emIt->second.initial_energy_j > 0) {
-      auto reIt = m_switchResidualEnergy.find(a);
-      if (reIt != m_switchResidualEnergy.end())
-        frac = reIt->second / emIt->second.initial_energy_j;
-    }
-    energyTerm += txBps * emIt->second.energy_per_byte_j * frac;
+    for (const auto& [pno, ps] : psIt->second) txBps += ps.tx_rate_bps;
+    // power_W = bytes/s × J/byte = J/s = W.
+    currPowerW += (txBps / 8.0) * em.energy_per_byte_j;
   }
+  double powerRef = std::max(1.0, m_ml.power_ref_w);
+  double powerCost = std::clamp(currPowerW / powerRef, 0.0, 1.0);
 
-  // Utilization penalty: discourage saturating links. Mean keeps the signal
-  // bounded; peak punishes the worst bottleneck so the agent has a reason to
-  // avoid corner-case hotspots even when the average looks fine.
-  double utilSum = 0.0;
-  double utilPeak = 0.0;
+  // ---- 4. Utilization penalty (mean + peak) ----
+  double utilSum = 0.0, utilPeak = 0.0;
   uint32_t utilN = 0;
+  // Also accumulate per-switch tx_bps for the reserve-aware term below.
+  std::unordered_map<uint64_t, double> switchTxBps;
+  double totalTxBps = 0.0;
   for (const auto& [a, b] : m_mlLinkOrder) {
     double cap = std::max(m_topology.GetLinkCapacityBps(a, b),
                           m_topology.GetLinkCapacityBps(b, a));
-    if (cap <= 0.0) continue;
     double txBps = 0.0;
     auto psIt = m_portStats.find(a);
     if (psIt != m_portStats.end()) {
@@ -1496,27 +1528,117 @@ double ZmqOpenFlowController::ComputeMlReward() {
         if (peer && *peer == b) txBps += ps.tx_rate_bps;
       }
     }
-    double u = std::clamp(txBps / cap, 0.0, 1.0);
-    utilSum += u;
-    if (u > utilPeak) utilPeak = u;
-    ++utilN;
+    switchTxBps[a] += txBps;
+    totalTxBps += txBps;
+    if (cap > 0.0) {
+      double u = std::clamp(txBps / cap, 0.0, 1.0);
+      utilSum += u;
+      if (u > utilPeak) utilPeak = u;
+      ++utilN;
+    }
   }
   double meanUtil = (utilN > 0) ? (utilSum / utilN) : 0.0;
+  double utilPenalty = 0.5 * meanUtil + 0.5 * utilPeak;
 
-  double R = m_ml.reward_alpha * (meanPrev - meanCurr)
-           - m_ml.reward_beta  * (currLoss - prevLoss) / 1e6  // bring loss into a comparable unit
-           + m_ml.reward_gamma * energyTerm / 1e6
-           - m_ml.reward_delta * (0.5 * meanUtil + 0.5 * utilPeak);
+  // ---- 5. Active-switch footprint penalty ----
+  // A switch counts as "active" if it forwarded ≥ ~1 kbps this interval.
+  // Tiny bookkeeping traffic (echo, LLDP) is below this threshold.
+  constexpr double kActiveThresholdBps = 1024.0;
+  uint32_t activeCount = 0;
+  for (const auto& [dpid, sw] : m_switchMap) {
+    auto it = switchTxBps.find(dpid);
+    if (it != switchTxBps.end() && it->second >= kActiveThresholdBps) ++activeCount;
+  }
+  double totalSw = std::max<size_t>(1, m_switchMap.size());
+  double footprintPenalty = static_cast<double>(activeCount) / totalSw;
+
+  // ---- 6. Reserve-aware traffic penalty ----
+  // For each switch, share_of_total_tx · (1 - residual_frac)². Quadratic
+  // in (1 - residual_frac) so the penalty is near-zero for fresh switches
+  // and spikes sharply for nearly-depleted ones. Drives traffic AWAY from
+  // low-reserve switches.
+  double reserveAwarePenalty = 0.0;
+  if (totalTxBps > 0.0) {
+    for (const auto& [dpid, tx] : switchTxBps) {
+      double frac = 1.0;
+      auto emIt = m_switchEnergyModel.find(dpid);
+      if (emIt != m_switchEnergyModel.end() && emIt->second.initial_energy_j > 0) {
+        auto reIt = m_switchResidualEnergy.find(dpid);
+        if (reIt != m_switchResidualEnergy.end())
+          frac = std::clamp(reIt->second / emIt->second.initial_energy_j, 0.0, 1.0);
+      }
+      double share = tx / totalTxBps;
+      double depletion = 1.0 - frac;
+      reserveAwarePenalty += share * depletion * depletion;
+    }
+  }
+
+  // ---- 7. Residual-energy variance (balance term) ----
+  // stddev across all energy-tracked switches. Low stddev = even depletion;
+  // forces the agent to round-robin its high-traffic paths over time.
+  double stddevResidual = ComputeResidualEnergyStddev();
+  // stddev is already in [0, 0.5] practically (residual_frac ∈ [0,1]);
+  // multiply by 2 to push it into [0, 1] range for weight comparability.
+  double balancePenalty = std::clamp(2.0 * stddevResidual, 0.0, 1.0);
+
+  // ---- Combine ----
+  double R =   m_ml.reward_alpha * delayQuality
+             + m_ml.reward_beta  * lossQuality
+             - m_ml.reward_gamma * powerCost
+             - m_ml.reward_delta * utilPenalty
+             - m_ml.reward_zeta  * footprintPenalty
+             - m_ml.reward_eta   * reserveAwarePenalty
+             - m_ml.reward_theta * balancePenalty;
+
+  NS_LOG_DEBUG("[ML] reward tick=" << m_mlTick
+               << " R=" << R
+               << " d=" << delayQuality << " l=" << lossQuality
+               << " p=" << powerCost     << " u=" << utilPenalty
+               << " f=" << footprintPenalty
+               << " e=" << reserveAwarePenalty
+               << " b=" << balancePenalty
+               << " | P_W=" << currPowerW << " stddev=" << stddevResidual);
   return R;
+}
+
+double ZmqOpenFlowController::ComputeResidualEnergyStddev() const {
+  std::vector<double> fracs;
+  fracs.reserve(m_switchEnergyModel.size());
+  for (const auto& [dpid, em] : m_switchEnergyModel) {
+    if (em.initial_energy_j <= 0) continue;
+    auto reIt = m_switchResidualEnergy.find(dpid);
+    double frac = (reIt != m_switchResidualEnergy.end())
+                      ? std::clamp(reIt->second / em.initial_energy_j, 0.0, 1.0)
+                      : 1.0;
+    fracs.push_back(frac);
+  }
+  if (fracs.size() < 2) return 0.0;
+  double mean = 0.0;
+  for (double f : fracs) mean += f;
+  mean /= fracs.size();
+  double var = 0.0;
+  for (double f : fracs) { double d = f - mean; var += d * d; }
+  var /= fracs.size();
+  return std::sqrt(var);
+}
+
+double ZmqOpenFlowController::CurrentActionScale() const {
+  // Linear taper from action_scale_start → action_scale over taper_ticks.
+  if (m_ml.taper_ticks == 0) return m_ml.action_scale;
+  if (m_mlTick >= m_ml.taper_ticks) return m_ml.action_scale;
+  double t = static_cast<double>(m_mlTick) / m_ml.taper_ticks;
+  return m_ml.action_scale_start
+         + (m_ml.action_scale - m_ml.action_scale_start) * t;
 }
 
 void ZmqOpenFlowController::ApplyDeltaCosts(const std::vector<double>& deltas) {
   size_t n = std::min(deltas.size(), m_mlLinkOrder.size());
+  double scale = CurrentActionScale();
   bool anyChanged = false;
   for (size_t i = 0; i < n; ++i) {
     double d = deltas[i];
-    if (d > m_ml.action_scale)        d = m_ml.action_scale;
-    else if (d < -m_ml.action_scale)  d = -m_ml.action_scale;
+    if (d > scale)        d = scale;
+    else if (d < -scale)  d = -scale;
 
     auto [a, b] = m_mlLinkOrder[i];
     double prev = m_topology.GetLinkMlDelta(a, b);

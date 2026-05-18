@@ -61,14 +61,39 @@ struct SwitchEnergyModel {
 
 // Online FDRL local-agent configuration. Default-constructed = disabled and
 // inert; SetMlConfig() opens the ZMQ socket and schedules the first MlTick.
+//
+// Reward shape (see ComputeMlReward):
+//   R = α·(1 - d/D_ref) + β·(1 - L/L_ref) - γ·(P/P_ref)
+//       - δ·(0.5·meanUtil + 0.5·peakUtil)
+//       - ζ·(activeSwitches/totalSwitches)
+//       - η·Σ_sw (tx_share · (1 - residual_frac)²)
+//       - θ·stddev(residual_frac)
 struct MlConfig {
     bool   enabled                    = false;
     double interval_s                 = 1.0;   // observe→act→learn period
-    double action_scale               = 0.50;  // max |ΔW| as fraction of base cost
-    double reward_alpha               = 1.0;   // delay-improvement weight
-    double reward_beta                = 10.0;  // loss-penalty weight
-    double reward_gamma               = 0.1;   // energy-efficiency weight
-    double reward_delta               = 5.0;   // utilization-penalty weight
+    // Action-scale taper: |ΔW| starts at action_scale_start, tapers linearly
+    // over taper_ticks to action_scale. Big swings early, fine-tune late.
+    double action_scale               = 0.20;  // final |ΔW| as fraction of base cost
+    double action_scale_start         = 0.40;  // initial |ΔW| during taper
+    uint32_t taper_ticks              = 200;   // ticks over which to taper
+    // Reward weights — all terms live in roughly [0, 1] after normalization,
+    // so weights are directly comparable.
+    double reward_alpha               = 1.0;   // delay quality (higher = lower latency reward)
+    double reward_beta                = 2.0;   // loss quality (higher = lower loss reward)
+    double reward_gamma               = 1.5;   // power-consumption penalty
+    double reward_delta               = 1.0;   // utilization penalty (mean+peak)
+    double reward_zeta                = 0.5;   // active-switch footprint penalty
+    double reward_eta                 = 1.5;   // route-through-low-reserve penalty
+    double reward_theta               = 1.0;   // residual-energy variance penalty
+    // Normalization references — terms are normalized by these before weighting.
+    double delay_ref_ms               = 200.0; // ms; baseline target
+    double loss_ref_bps               = 1.0e6; // bits/s; tolerable drop budget
+    double power_ref_w                = 90000.0; // watts; baseline aggregate power
+    // Priority preset: "balanced" (default), "delay_first", "energy_first",
+    // or "custom" (uses weights as set, no preset override).
+    std::string priority_preset       = "balanced";
+    // Exploration control — when false, OU noise is disabled (eval-mode).
+    bool   explore                    = true;
     uint32_t checkpoint_every_n_ticks = 60;    // Python-side checkpoint cadence
     bool   resume                     = true;  // Python loads checkpoint if present
     uint32_t seed                     = 12345; // shared seed for Python RNG
@@ -166,6 +191,12 @@ private:
     std::string BuildMlStatePayload();
     double ComputeMlReward();
     void   ApplyDeltaCosts(const std::vector<double>& deltas);
+    // Stddev of residual_energy_frac across energy-tracked switches.
+    // Used by the reward (balance term) and the state payload.
+    double ComputeResidualEnergyStddev() const;
+    // Effective |ΔW| this tick — linear taper from action_scale_start →
+    // action_scale over taper_ticks ticks. Returns action_scale once tapered.
+    double CurrentActionScale() const;
     // Stub kept for the safety-rollback feature. See plan §"Additional features".
     // void MaybeRollback();
 

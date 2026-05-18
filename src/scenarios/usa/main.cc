@@ -424,13 +424,32 @@ int main(int argc, char* argv[]) {
 
   bool mlEnabled = false;
   double mlIntervalS = 1.0;
-  double mlActionScale = 0.15;
+  // Action-scale taper defaults: 0.40 → 0.20 over the first 200 ticks. Big
+  // swings during exploration, fine-tune once the policy stabilizes.
+  double mlActionScale = 0.20;
+  double mlActionScaleStart = 0.40;
+  uint32_t mlTaperTicks = 200;
+  // Reward weights — left at defaults from MlConfig; preset string can override.
   double mlAlpha = 1.0;
-  double mlBeta = 10.0;
-  double mlGamma = 0.1;
+  double mlBeta = 2.0;
+  double mlGamma = 1.5;
+  double mlDelta = 1.0;
+  double mlZeta = 0.5;
+  double mlEta = 1.5;
+  double mlTheta = 1.0;
+  // Normalization references.
+  double mlDelayRef = 200.0;
+  double mlLossRef = 1.0e6;
+  double mlPowerRef = 90000.0;
+  // "balanced" | "delay_first" | "energy_first" | "custom"
+  std::string mlPriority = "balanced";
+  bool mlExplore = true;
   uint32_t mlCheckpointEveryNTicks = 60;
   bool mlResume = true;
   std::string mlEndpoint = "tcp://127.0.0.1:5555";
+  // Optional: delay FlowMonitor reset until measureStart + evalWindowOffsetS,
+  // so a long learning prefix doesn't pollute the reported numbers. 0 = off.
+  double evalWindowOffsetS = 0.0;
 
   CommandLine cmd(__FILE__);
   cmd.AddValue("trace", "Enable pcap and datapath stats traces", trace);
@@ -449,14 +468,35 @@ int main(int argc, char* argv[]) {
   cmd.AddValue("edgeQueue", "Edge CSMA queue size", edgeQueue);
   cmd.AddValue("ml", "Enable FDRL agent", mlEnabled);
   cmd.AddValue("mlIntervalS", "Agent period (s)", mlIntervalS);
-  cmd.AddValue("mlActionScale", "Max |dW| fraction", mlActionScale);
-  cmd.AddValue("mlAlpha", "Reward weight on delay", mlAlpha);
-  cmd.AddValue("mlBeta", "Reward penalty on loss", mlBeta);
-  cmd.AddValue("mlGamma", "Reward weight on energy", mlGamma);
+  cmd.AddValue("mlActionScale", "Final |dW| fraction (after taper)", mlActionScale);
+  cmd.AddValue("mlActionScaleStart", "Initial |dW| fraction (during taper)",
+               mlActionScaleStart);
+  cmd.AddValue("mlTaperTicks", "Ticks over which action_scale tapers",
+               mlTaperTicks);
+  cmd.AddValue("mlPriority",
+               "Reward preset: balanced | delay_first | energy_first | custom",
+               mlPriority);
+  cmd.AddValue("mlAlpha", "Reward weight α (delay quality)", mlAlpha);
+  cmd.AddValue("mlBeta", "Reward weight β (loss quality)", mlBeta);
+  cmd.AddValue("mlGamma", "Reward weight γ (power-consumption penalty)", mlGamma);
+  cmd.AddValue("mlDelta", "Reward weight δ (utilization penalty)", mlDelta);
+  cmd.AddValue("mlZeta", "Reward weight ζ (active-switch footprint)", mlZeta);
+  cmd.AddValue("mlEta", "Reward weight η (route-through-low-reserve penalty)",
+               mlEta);
+  cmd.AddValue("mlTheta", "Reward weight θ (residual-energy stddev)", mlTheta);
+  cmd.AddValue("mlDelayRef", "Delay reference for normalization (ms)", mlDelayRef);
+  cmd.AddValue("mlLossRef", "Loss reference for normalization (bps)", mlLossRef);
+  cmd.AddValue("mlPowerRef", "Power reference for normalization (W)", mlPowerRef);
+  cmd.AddValue("mlExplore", "Enable OU exploration & training updates",
+               mlExplore);
   cmd.AddValue("mlCheckpointEveryNTicks", "Checkpoint cadence",
                mlCheckpointEveryNTicks);
   cmd.AddValue("mlResume", "Resume from checkpoint", mlResume);
   cmd.AddValue("mlEndpoint", "ZMQ endpoint", mlEndpoint);
+  cmd.AddValue("evalWindowOffsetS",
+               "Delay FlowMonitor reset by this many seconds past warmup "
+               "(0 = report from warmup end)",
+               evalWindowOffsetS);
   cmd.Parse(argc, argv);
 
   RngSeedManager::SetSeed(seed);
@@ -566,9 +606,20 @@ int main(int argc, char* argv[]) {
     mlCfg.enabled = mlEnabled;
     mlCfg.interval_s = mlIntervalS;
     mlCfg.action_scale = mlActionScale;
+    mlCfg.action_scale_start = mlActionScaleStart;
+    mlCfg.taper_ticks = mlTaperTicks;
+    mlCfg.priority_preset = mlPriority;
     mlCfg.reward_alpha = mlAlpha;
     mlCfg.reward_beta = mlBeta;
     mlCfg.reward_gamma = mlGamma;
+    mlCfg.reward_delta = mlDelta;
+    mlCfg.reward_zeta = mlZeta;
+    mlCfg.reward_eta = mlEta;
+    mlCfg.reward_theta = mlTheta;
+    mlCfg.delay_ref_ms = mlDelayRef;
+    mlCfg.loss_ref_bps = mlLossRef;
+    mlCfg.power_ref_w = mlPowerRef;
+    mlCfg.explore = mlExplore;
     mlCfg.checkpoint_every_n_ticks = mlCheckpointEveryNTicks;
     mlCfg.resume = mlResume;
     mlCfg.seed = seed;
@@ -634,8 +685,11 @@ int main(int argc, char* argv[]) {
   FlowMonitorHelper flowmonHelper;
   Ptr<FlowMonitor> monitor = flowmonHelper.InstallAll();
   // Discard anything that flew during warmup so the report reflects only
-  // the measurement window.
-  Simulator::Schedule(Seconds(measureStart),
+  // the measurement window. If evalWindowOffsetS > 0, push the reset further
+  // out — useful for long ML runs where the first chunk is exploration noise
+  // that shouldn't pollute the headline numbers.
+  double resetAt = std::min(measureStart + evalWindowOffsetS, simTime - 1.0);
+  Simulator::Schedule(Seconds(resetAt),
                       [&]() { monitor->ResetAllStats(); });
 
   /* --- 6g. RUN --------------------------------------------------------- */
@@ -711,13 +765,24 @@ int main(int argc, char* argv[]) {
     }
     if (tracked > 0 && simTime > 0) {
       double totalConsumed = totalInitialJ - totalResidualJ;
+      double residualFrac = (totalInitialJ > 0)
+                                ? (totalResidualJ / totalInitialJ) * 100.0
+                                : 0.0;
       std::cout << "  Switches tracked  : " << tracked << std::endl;
       std::cout << "  Total consumed    : " << totalConsumed << " J"
+                << std::endl;
+      std::cout << "  Total residual    : " << totalResidualJ << " J"
                 << std::endl;
       std::cout << "  Total avg power   : " << (totalConsumed / simTime) << " W"
                 << std::endl;
       std::cout << "  Per-switch avg    : "
                 << (totalConsumed / simTime / tracked) << " W" << std::endl;
+      std::cout << "  Per-switch consumed : " << (totalConsumed / tracked)
+                << " J" << std::endl;
+      std::cout << "  Per-switch residual : " << (totalResidualJ / tracked)
+                << " J" << std::endl;
+      std::cout << "  Residual fraction : " << residualFrac << "%"
+                << std::endl;
     } else {
       std::cout << "  (no energy model configured)" << std::endl;
     }

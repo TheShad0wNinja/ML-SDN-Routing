@@ -32,6 +32,7 @@ import os
 import pickle
 import queue
 import random
+import signal
 import threading
 import time
 from collections import deque
@@ -270,12 +271,11 @@ class LocalDDPGAgent:
 def _flatten_state(state: dict) -> "np.ndarray":
     """Flatten the controller's JSON state into a 1D numpy vector.
 
-    Layout: [per_switch[i].{rho, d_ms, p_loss, residual_energy_frac,
-                            echo_rtt_ns, mu_max_bps} for all switches]
-    Per-link features are intentionally *not* flattened into the agent's state
-    — they're available in the payload for richer policies later, but DDPG
-    here treats them as side-channel context. The action_dim is one ΔW per
-    link, so the agent's policy maps (state_dim) → (action_dim) cleanly.
+    Layout (must match BuildMlStatePayload + MlSendHello state_dim):
+      per_switch[i].{rho, d_ms, p_loss, residual_energy_frac, depletion,
+                     echo_rtt_s, mu_max_gbps}                   (7 each)
+      per_link[i].{utilization, cost_norm, tx_share}            (3 each)
+      residual_energy_stddev                                    (1)
     """
     pieces = []
     for sw in state.get("per_switch", []):
@@ -284,9 +284,26 @@ def _flatten_state(state: dict) -> "np.ndarray":
             sw.get("d_ms", 0.0),
             sw.get("p_loss", 0.0),
             sw.get("residual_energy_frac", 1.0),
+            sw.get("depletion", 0.0),
             sw.get("echo_rtt_ns", 0.0) / 1e9,        # scale to seconds
             sw.get("mu_max_bps", 0.0) / 1e9,         # scale to Gbps
         ])
+
+    links = state.get("per_link", [])
+    # Normalize cost by the max in this tick so the agent sees a unit-scale signal.
+    max_cost = max((float(l.get("cost", 1.0)) for l in links), default=1.0)
+    max_cost = max(max_cost, 1e-9)
+    for l in links:
+        cap = float(l.get("capacity_bps", 0.0))
+        tx = float(l.get("tx_bps", 0.0))
+        pieces.extend([
+            float(l.get("utilization", 0.0)),
+            float(l.get("cost", 0.0)) / max_cost,
+            (tx / cap) if cap > 0.0 else 0.0,
+        ])
+
+    pieces.append(float(state.get("residual_energy_stddev", 0.0)))
+
     return np.array(pieces, dtype=np.float32) if _HAS_TORCH else pieces  # type: ignore[return-value]
 
 
@@ -306,7 +323,8 @@ class MLService:
         self.seed = 0
 
         # Worker thread coordination.
-        self._req_q: "queue.Queue[tuple[int, np.ndarray, float]]" = queue.Queue()
+        # Tuple is (tick, state_vec, prev_reward, explore).
+        self._req_q: "queue.Queue[tuple[int, np.ndarray, float, bool]]" = queue.Queue()
         self._stop = threading.Event()
         self._action_lock = threading.Lock()
         # Cached "best action so far". Producer = worker, consumer = main.
@@ -321,6 +339,13 @@ class MLService:
 
     # ------------------------------------------------------------------
     def run(self) -> None:
+        # Turn SIGTERM into a clean shutdown so the `finally` block below saves
+        # the latest checkpoint. Without this, a `kill <pid>` from the test
+        # runner would lose anything since the last periodic save.
+        def _on_sigterm(_signum, _frame):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, _on_sigterm)
+
         print("ML Service listening on tcp://*:5555")
         worker = threading.Thread(target=self._worker_loop, daemon=True)
         worker.start()
@@ -333,8 +358,19 @@ class MLService:
             print("ML Service shutting down.")
         finally:
             self._stop.set()
-            self.rep.close()
-            self.ctx.term()
+            # Persist whatever the agent has learned since the last periodic
+            # save. Cheap insurance against losing the tail of a long run.
+            if self.agent is not None and _HAS_TORCH:
+                try:
+                    self.agent.save_checkpoint()
+                    print("[ML] checkpoint saved on shutdown.")
+                except Exception as exc:
+                    print(f"[ML] shutdown checkpoint save failed: {exc}")
+            try:
+                self.rep.close()
+                self.ctx.term()
+            except Exception:
+                pass
             if self._metrics_fh:
                 self._metrics_fh.close()
 
@@ -344,7 +380,7 @@ class MLService:
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                tick, state_vec, prev_reward = self._req_q.get(timeout=0.5)
+                tick, state_vec, prev_reward, explore = self._req_q.get(timeout=0.5)
             except queue.Empty:
                 continue
             if self.agent is None or not _HAS_TORCH:
@@ -356,12 +392,17 @@ class MLService:
                                 prev_reward, state_vec)
 
             # 2. Train step (no-op until replay has warmup samples).
+            #    Skip gradient updates entirely in eval mode — keeps the policy
+            #    frozen so ML-vs-baseline comparisons are deterministic.
             t0 = time.perf_counter()
-            critic_loss, actor_loss = self.agent.train_step()
+            if explore:
+                critic_loss, actor_loss = self.agent.train_step()
+            else:
+                critic_loss, actor_loss = None, None
             train_ms = (time.perf_counter() - t0) * 1000.0
 
             # 3. Choose next action and publish.
-            next_action = self.agent.act(state_vec, explore=True)
+            next_action = self.agent.act(state_vec, explore=explore)
             with self._action_lock:
                 self._last_action = next_action
 
@@ -466,12 +507,16 @@ class MLService:
     def _handle_observe(self, msg: dict) -> bytes:
         tick = int(msg.get("tick", 0))
         prev_reward = float(msg.get("prev_reward", 0.0))
+        # Default explore=true so behaviour is unchanged for older controllers
+        # that don't send the field.
+        explore = bool(msg.get("explore", True))
         state = msg.get("state", {}) or {}
 
         if not _HAS_TORCH:
-            # Degraded mode: tiny random action.
+            # Degraded mode: tiny random action (zero if eval).
             n = self.action_dim if self.action_dim else len(state.get("per_link", []))
-            action = [random.uniform(-0.02, 0.02) for _ in range(n)]
+            jitter = 0.02 if explore else 0.0
+            action = [random.uniform(-jitter, jitter) for _ in range(n)]
             return json.dumps({"action": action}).encode("utf-8")
 
         state_vec = _flatten_state(state)
@@ -484,7 +529,7 @@ class MLService:
 
         # Enqueue to worker — never block for more than a microsecond.
         try:
-            self._req_q.put_nowait((tick, state_vec, prev_reward))
+            self._req_q.put_nowait((tick, state_vec, prev_reward, explore))
         except queue.Full:
             pass
 
