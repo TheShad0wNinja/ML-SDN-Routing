@@ -1696,17 +1696,10 @@ void ZmqOpenFlowController::ApplyDeltaCosts(const std::vector<double>& deltas) {
 void ZmqOpenFlowController::MlTick() {
   if (!m_ml.enabled) return;
 
-  // Refresh observations: trigger a fresh port-stats sweep so curr obs reflects
-  // the most recent interval. Stats arrive asynchronously, but the ML payload
-  // is built from whatever m_switchObs currently holds — that's the prior
-  // interval's view, which is exactly what the reward needs.
-  for (const auto& kv : m_switchMap) {
-    struct ofl_msg_header* req = BuildPortStatsRequest();
-    if (req) {
-      SendToSwitch(kv.second, req, 0);
-      ofl_msg_free(req, nullptr);
-    }
-  }
+  // Observation refresh is owned by TriggerStats(): when ML is enabled,
+  // m_statsIntervalS is collapsed to m_ml.interval_s so a port+queue stats
+  // sweep already fires every tick. The ML payload below reads m_switchObs,
+  // which TriggerStats keeps current, so there's no need to re-sweep here.
 
   // Freeze node + link order at first tick (after LLDP discovery). Once frozen,
   // additions/removals don't change index assignments; that's OK for static

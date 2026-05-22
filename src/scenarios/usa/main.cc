@@ -121,7 +121,9 @@ class UsaTopologyBuilder {
   UsaTopologyBuilder() {
     m_edgeHelper.SetChannelAttribute("DataRate", StringValue("100Mbps"));
     m_edgeHelper.SetChannelAttribute("Delay", StringValue("1ms"));
+    m_edgeHelper.SetDeviceAttribute("Mtu", UintegerValue(1500));
     m_backboneHelper.SetChannelAttribute("DataRate", StringValue("1Gbps"));
+    m_backboneHelper.SetDeviceAttribute("Mtu", UintegerValue(1500));
   }
 
   void CreateNodes(uint32_t numNodes) {
@@ -322,12 +324,12 @@ class TrafficManager {
     }
   }
 
-  void InstallUdpLoad(double startTime, double simTime, double flowDuration,
+  void InstallTcpLoad(double startTime, double simTime, double flowDuration,
                       const std::string& trafficMode, uint32_t maxRateMbps) {
     uint32_t n = m_hosts.GetN();
     uint16_t port = 9000;
 
-    // Install one sink per host so UDP traffic has a receiver
+    // Install one sink per host so TCP traffic has a receiver
     for (uint32_t i = 0; i < n; ++i) {
       PacketSinkHelper sink("ns3::TcpSocketFactory",
                             InetSocketAddress(Ipv4Address::GetAny(), port));
@@ -351,7 +353,7 @@ class TrafficManager {
         OnOffHelper onoff("ns3::TcpSocketFactory",
                           InetSocketAddress(m_ifaces.GetAddress(dst), port));
         onoff.SetConstantRate(DataRate(rateStr));
-        onoff.SetAttribute("PacketSize", UintegerValue(1024));
+        onoff.SetAttribute("PacketSize", UintegerValue(1448)); // TCP MSS for 1500 MTU
 
         ApplicationContainer app = onoff.Install(m_hosts.Get(src));
         // Spread starts across 5 s, not 0.5 s, to avoid synchronized bursts
@@ -414,13 +416,13 @@ int main(int argc, char* argv[]) {
   uint32_t seed = 12345;
 
   bool pingEnabled = true;
-  bool udpEnabled = false;
+  bool tcpEnabled = false;
   bool failuresEnabled = false;
   bool crippleEnabled = false;
-  uint32_t udpRateCap = 5;  // Mbps per flow cap
-  double udpFlowDuration = 30.0;
-  std::string backboneQueue = "2000p";
-  std::string edgeQueue = "200p";
+  uint32_t tcpRateCap = 5;  // Mbps per flow cap
+  double tcpFlowDuration = 30.0;
+  std::string backboneQueue = "3MB";
+  std::string edgeQueue = "500kB";
 
   bool mlEnabled = false;
   double mlIntervalS = 1.0;
@@ -458,12 +460,12 @@ int main(int argc, char* argv[]) {
   cmd.AddValue("trafficMode", "Traffic: random, central, grouped", trafficMode);
   cmd.AddValue("seed", "Random seed", seed);
   cmd.AddValue("ping", "Enable measurement pings", pingEnabled);
-  cmd.AddValue("udp", "Enable OnOff UDP background load", udpEnabled);
+  cmd.AddValue("tcp", "Enable OnOff TCP background load", tcpEnabled);
   cmd.AddValue("failures", "Enable scheduled link churn", failuresEnabled);
   cmd.AddValue("cripple", "Cripple Missoula node (1Mbps CPU, 100us TCAM)",
                crippleEnabled);
-  cmd.AddValue("udpRateCap", "Max per-flow UDP rate in Mbps", udpRateCap);
-  cmd.AddValue("udpFlowDuration", "UDP flow length (s)", udpFlowDuration);
+  cmd.AddValue("tcpRateCap", "Max per-flow TCP rate in Mbps", tcpRateCap);
+  cmd.AddValue("tcpFlowDuration", "TCP flow length (s)", tcpFlowDuration);
   cmd.AddValue("backboneQueue", "Backbone CSMA queue size", backboneQueue);
   cmd.AddValue("edgeQueue", "Edge CSMA queue size", edgeQueue);
   cmd.AddValue("ml", "Enable FDRL agent", mlEnabled);
@@ -500,6 +502,11 @@ int main(int argc, char* argv[]) {
   cmd.Parse(argc, argv);
 
   RngSeedManager::SetSeed(seed);
+
+  // Flat vector-backed heap; same O(log n) as default MapScheduler but with
+  // better cache locality and no per-event allocation.
+  GlobalValue::Bind("SchedulerType",
+                    StringValue("ns3::PriorityQueueScheduler"));
 
   if (warmupS < 0.0) warmupS = 0.0;
   if (warmupS > simTime - 5.0) warmupS = std::max(0.0, simTime - 5.0);
@@ -660,9 +667,9 @@ int main(int argc, char* argv[]) {
   if (pingEnabled) {
     traffic.InstallPings(measureStart, simTime);
   }
-  if (udpEnabled) {
-    traffic.InstallUdpLoad(measureStart, simTime, udpFlowDuration, trafficMode,
-                           udpRateCap);
+  if (tcpEnabled) {
+    traffic.InstallTcpLoad(measureStart, simTime, tcpFlowDuration, trafficMode,
+                           tcpRateCap);
   }
 
   /* --- 6e. SCHEDULED CHURN --------------------------------------------- */
@@ -682,15 +689,17 @@ int main(int argc, char* argv[]) {
   }
 
   /* --- 6f. FLOW MONITOR ------------------------------------------------ */
+  // Hook the FlowMonitor probes only when measurement begins, not during
+  // warmup. Each probe attaches to Ipv4L3Protocol Tx/Rx/Drop callbacks; if
+  // we installed pre-warmup the 1,122 pair-pings and any pre-measurement
+  // traffic would all run those callbacks and then get thrown away by
+  // ResetAllStats. Late install skips that work entirely.
   FlowMonitorHelper flowmonHelper;
-  Ptr<FlowMonitor> monitor = flowmonHelper.InstallAll();
-  // Discard anything that flew during warmup so the report reflects only
-  // the measurement window. If evalWindowOffsetS > 0, push the reset further
-  // out — useful for long ML runs where the first chunk is exploration noise
-  // that shouldn't pollute the headline numbers.
-  double resetAt = std::min(measureStart + evalWindowOffsetS, simTime - 1.0);
-  Simulator::Schedule(Seconds(resetAt),
-                      [&]() { monitor->ResetAllStats(); });
+  Ptr<FlowMonitor> monitor;
+  double installAt = std::min(measureStart + evalWindowOffsetS, simTime - 1.0);
+  Simulator::Schedule(Seconds(installAt), [&monitor, &flowmonHelper]() {
+    monitor = flowmonHelper.InstallAll();
+  });
 
   /* --- 6g. RUN --------------------------------------------------------- */
   if (trace) {
@@ -705,6 +714,12 @@ int main(int argc, char* argv[]) {
   /* --- 6h. REPORT ------------------------------------------------------ */
   StatsCollector::PrintPingReport();
 
+  // Late-install can leave `monitor` null if simTime was too short for the
+  // scheduled lambda at `installAt` to ever fire. Fall back to an empty
+  // monitor so the report block doesn't deref a null pointer.
+  if (!monitor) {
+    monitor = flowmonHelper.InstallAll();
+  }
   monitor->CheckForLostPackets();
   auto classifier =
       DynamicCast<Ipv4FlowClassifier>(flowmonHelper.GetClassifier());

@@ -15,11 +15,11 @@
 # then summarized to scratch/data/results/summary.csv.
 #
 # Examples:
-#   scratch/run_tests.sh compare --simTime 600 --trafficMode central --udp --failures --cripple
-#   scratch/run_tests.sh presets --simTime 600 --udp --failures --cripple
-#   scratch/run_tests.sh seeds --seeds 5 --ml --priority balanced --simTime 1200 --udp --failures --cripple
+#   scratch/run_tests.sh compare --simTime 600 --trafficMode central --tcp --failures --cripple
+#   scratch/run_tests.sh presets --simTime 600 --tcp --failures --cripple
+#   scratch/run_tests.sh seeds --seeds 5 --ml --priority balanced --simTime 1200 --tcp --failures --cripple
 #   scratch/run_tests.sh matrix --seeds 3 --simTime 600 --priority balanced
-#   scratch/run_tests.sh eval --simTime 200 --priority balanced --udp --failures --cripple
+#   scratch/run_tests.sh eval --simTime 200 --priority balanced --tcp --failures --cripple
 #   scratch/run_tests.sh summary scratch/data/results/logs/<name>.log
 
 set -euo pipefail
@@ -42,7 +42,7 @@ TRAFFIC_MODE="central"
 SEED=12345
 PRIORITY="balanced"
 ML=false
-UDP=true
+TCP=true
 FAILURES=false
 CRIPPLE=false
 EXPLORE=true
@@ -90,7 +90,7 @@ Options:
   --seeds N             Number of seeds for 'seeds' / 'matrix' modes   (default: 5)
   --priority X          balanced | delay_first | energy_first | custom (default: balanced)
   --ml | --no-ml        Enable / disable the ML controller             (default: off)
-  --udp | --no-udp      Toggle UDP background load                     (default: off)
+  --tcp | --no-tcp      Toggle TCP background load                     (default: off)
   --failures | --no-failures   Toggle scheduled link churn             (default: off)
   --cripple  | --no-cripple    Toggle Missoula crippling (USA only)    (default: off)
   --no-explore          Disable OU noise & gradient updates (eval mode)
@@ -222,7 +222,7 @@ build_args() {
   add_if_supported warmupS     "$WARMUP"
   add_if_supported trafficMode "$TRAFFIC_MODE"
   add_if_supported seed        "$SEED"
-  add_bool_if_supported udp      "$UDP"
+  add_bool_if_supported tcp      "$TCP"
   add_bool_if_supported failures "$FAILURES"
   add_bool_if_supported cripple  "$CRIPPLE"
   if $ML; then
@@ -313,7 +313,7 @@ summarize_log() {
   # Append to CSV (created if absent). If the existing CSV has any other
   # header (old flat schema, partial archive, etc.), rotate it aside so we
   # don't mix schemas.
-  local expected_header="timestamp,label,topology,sim_time_s,traffic_mode,seed,controller,priority,udp,failures,cripple,ping_success_pct,rtt_avg_ms,rtt_jitter_ms,pdr_pct,e2e_delay_avg_ms,flows,tx_pkts,rx_pkts,hop_count_avg,energy_total_j,energy_residual_j,power_avg_w,per_sw_consumed_j,per_sw_residual_j,residual_pct,j_per_mb,ml_reward_final,ml_reward_mean_last25,ml_critic_loss_final,ml_actor_loss_final,ml_ticks"
+  local expected_header="timestamp,label,topology,sim_time_s,traffic_mode,seed,controller,priority,tcp,failures,cripple,ping_success_pct,rtt_avg_ms,rtt_jitter_ms,pdr_pct,e2e_delay_avg_ms,flows,tx_pkts,rx_pkts,hop_count_avg,energy_total_j,energy_residual_j,power_avg_w,per_sw_consumed_j,per_sw_residual_j,residual_pct,j_per_mb,ml_reward_final,ml_reward_mean_last25,ml_critic_loss_final,ml_actor_loss_final,ml_ticks"
   if [[ -f "$SUMMARY_CSV" ]] && [[ "$(head -n1 "$SUMMARY_CSV")" != "$expected_header" ]]; then
     local archived="${SUMMARY_CSV%.csv}.$(date +%Y%m%d-%H%M%S).csv"
     mv "$SUMMARY_CSV" "$archived"
@@ -325,7 +325,7 @@ summarize_log() {
   printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
     "$(date -Iseconds)" "$label" "$TOPOLOGY" "$SIM_TIME" "$TRAFFIC_MODE" "$SEED" \
     "$($ML && echo ml || echo baseline)" "$($ML && echo "$PRIORITY" || echo -)" \
-    "$($UDP && echo 1 || echo 0)" "$($FAILURES && echo 1 || echo 0)" "$($CRIPPLE && echo 1 || echo 0)" \
+    "$($TCP && echo 1 || echo 0)" "$($FAILURES && echo 1 || echo 0)" "$($CRIPPLE && echo 1 || echo 0)" \
     "${success:-}" "${rtt:-}" "${jitter:-}" "${delivery:-}" "${delay:-}" \
     "${flows:-}" "${tx:-}" "${rx:-}" "${hops:-}" \
     "${energy:-}" "${residual:-}" "${power:-}" \
@@ -519,8 +519,8 @@ while [[ $# -gt 0 ]]; do
     --evalWindowS)  EVAL_WINDOW="$2"; shift 2 ;;
     --ml)           ML=true; shift ;;
     --no-ml)        ML=false; shift ;;
-    --udp)          UDP=true; shift ;;
-    --no-udp)       UDP=false; shift ;;
+    --tcp)          TCP=true; shift ;;
+    --no-tcp)       TCP=false; shift ;;
     --failures)     FAILURES=true; shift ;;
     --no-failures)  FAILURES=false; shift ;;
     --cripple)      CRIPPLE=true; shift ;;
