@@ -1357,11 +1357,10 @@ void ZmqOpenFlowController::MlSendHello() {
   if (!m_mlSock) return;
 
   // state_dim layout — keep in sync with python's _flatten_state():
-  //   7 per-switch features (rho, d_ms, p_loss, residual_frac, depletion,
-  //                          echo_rtt_s, mu_max_gbps)
+  //   5 per-switch features (rho, d_ms_norm, p_loss, depletion, echo_rtt_norm)
   //   3 per-link features  (utilization, cost_norm, tx_share)
   //   1 global scalar      (residual_energy_stddev)
-  size_t stateDim = 7 * m_switchMap.size() + 3 * m_mlLinkOrder.size() + 1;
+  size_t stateDim = 5 * m_switchMap.size() + 3 * m_mlLinkOrder.size() + 1;
   // action_dim = one ΔW per (deduplicated) link
   size_t actionDim = m_mlLinkOrder.size();
 
@@ -1425,10 +1424,8 @@ std::string ZmqOpenFlowController::BuildMlStatePayload() {
       << ",\"rho\":" << obs.rho
       << ",\"d_ms\":" << obs.d_ms
       << ",\"p_loss\":" << obs.p_loss
-      << ",\"residual_energy_frac\":" << energyFrac
       << ",\"depletion\":" << (1.0 - energyFrac)
       << ",\"echo_rtt_ns\":" << rttNs
-      << ",\"mu_max_bps\":" << obs.mu_max_bps
       << "}";
     firstSw = false;
   }
@@ -1590,15 +1587,39 @@ double ZmqOpenFlowController::ComputeMlReward() {
              - m_ml.reward_eta   * reserveAwarePenalty
              - m_ml.reward_theta * balancePenalty;
 
+  // Affine min-max scale R into [-1, 1] using the analytic bounds. Every term
+  // above is clamped to [0, 1] individually, so R is bounded by:
+  //   R_max =  alpha + beta              (positive-weighted terms maxed out)
+  //   R_min = -(gamma + delta + zeta + eta + theta)
+  // Linear rescale is a bijection over this range — distinct R values stay
+  // distinct in R_norm, so the Critic still sees gradient between "mildly
+  // bad" and "catastrophic" rewards (vs. a hard clamp which would flatten them).
+  const double posBound = m_ml.reward_alpha + m_ml.reward_beta;
+  const double negBound = m_ml.reward_gamma + m_ml.reward_delta
+                        + m_ml.reward_zeta  + m_ml.reward_eta
+                        + m_ml.reward_theta;
+  const double span = posBound + negBound;
+  double R_norm;
+  if (span > 0.0) {
+    R_norm = 2.0 * (R + negBound) / span - 1.0;
+  } else {
+    R_norm = 0.0;
+  }
+  if (R_norm < -1.0 || R_norm > 1.0) {
+    NS_LOG_DEBUG("[ML] reward out of analytic bounds (term-clamp regression?)"
+                 << " R=" << R << " R_norm=" << R_norm);
+    R_norm = std::clamp(R_norm, -1.0, 1.0);
+  }
+
   NS_LOG_DEBUG("[ML] reward tick=" << m_mlTick
-               << " R=" << R
+               << " R=" << R << " R_norm=" << R_norm
                << " d=" << delayQuality << " l=" << lossQuality
                << " p=" << powerCost     << " u=" << utilPenalty
                << " f=" << footprintPenalty
                << " e=" << reserveAwarePenalty
                << " b=" << balancePenalty
                << " | P_W=" << currPowerW << " stddev=" << stddevResidual);
-  return R;
+  return R_norm;
 }
 
 double ZmqOpenFlowController::ComputeResidualEnergyStddev() const {

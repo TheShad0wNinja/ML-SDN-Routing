@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import pickle
 import queue
@@ -58,6 +59,11 @@ _CKPT_PATH = os.path.join(_AGENT_DIR, "abilene_local.pt")
 _REPLAY_PATH = os.path.join(_AGENT_DIR, "replay.pkl")
 _METRICS_PATH = os.path.join(_AGENT_DIR, "metrics.csv")
 
+# Log-scale caps for unbounded queueing telemetry. log1p(1000) ≈ 6.91 — well
+# past typical d_ms (~500ms practical max) and rtt_ms (~1s pathological).
+_MAX_LOG_DELAY = math.log1p(1000.0)
+_MAX_LOG_RTT = math.log1p(1000.0)
+
 
 # ---------------------------------------------------------------------------
 # DDPG networks
@@ -69,8 +75,10 @@ if _HAS_TORCH:
             super().__init__()
             self.net = nn.Sequential(
                 nn.Linear(state_dim, hidden),
+                nn.LayerNorm(hidden),
                 nn.ReLU(),
                 nn.Linear(hidden, hidden),
+                nn.LayerNorm(hidden),
                 nn.ReLU(),
                 nn.Linear(hidden, action_dim),
                 nn.Tanh(),
@@ -84,8 +92,10 @@ if _HAS_TORCH:
             super().__init__()
             self.net = nn.Sequential(
                 nn.Linear(state_dim + action_dim, hidden),
+                nn.LayerNorm(hidden),
                 nn.ReLU(),
                 nn.Linear(hidden, hidden),
+                nn.LayerNorm(hidden),
                 nn.ReLU(),
                 nn.Linear(hidden, 1),
             )
@@ -95,7 +105,7 @@ if _HAS_TORCH:
 
 
 class LocalDDPGAgent:
-    """Single-agent DDPG with OU exploration noise."""
+    """Single-agent DDPG with decaying Gaussian exploration noise."""
 
     def __init__(
         self,
@@ -140,10 +150,11 @@ class LocalDDPGAgent:
 
         self.replay: deque = deque(maxlen=replay_capacity)
 
-        # Ornstein–Uhlenbeck exploration noise.
-        self._ou_state = np.zeros(action_dim, dtype=np.float32)
-        self._ou_theta = 0.15
-        self._ou_sigma = 0.2
+        # Decaying Gaussian exploration noise. Sigma starts wide and decays
+        # per gradient step (so slow scenarios still get the full schedule).
+        self._noise_sigma = 0.2
+        self._noise_sigma_min = 0.05
+        self._noise_sigma_decay = 0.9995
 
     # ------------------------------------------------------------------
     # Replay + training
@@ -173,11 +184,13 @@ class LocalDDPGAgent:
         critic_loss = F.mse_loss(q, q_target)
         self.critic_opt.zero_grad()
         critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
         self.critic_opt.step()
 
         actor_loss = -self.critic(s, self.actor(s)).mean()
         self.actor_opt.zero_grad()
         actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
         self.actor_opt.step()
 
         # Polyak updates
@@ -186,6 +199,9 @@ class LocalDDPGAgent:
                 pt.data.mul_(1 - self.tau).add_(self.tau * p.data)
             for p, pt in zip(self.critic.parameters(), self.critic_target.parameters()):
                 pt.data.mul_(1 - self.tau).add_(self.tau * p.data)
+
+        self._noise_sigma = max(self._noise_sigma_min,
+                                self._noise_sigma * self._noise_sigma_decay)
 
         return float(critic_loss.item()), float(actor_loss.item())
 
@@ -198,10 +214,9 @@ class LocalDDPGAgent:
             a = self.actor(s).squeeze(0).numpy().astype(np.float32)
 
         if explore:
-            dx = self._ou_theta * (-self._ou_state) + self._ou_sigma * np.random.randn(self.action_dim).astype(np.float32)
-            self._ou_state = self._ou_state + dx
-            a = a + self._ou_state
-            a = np.clip(a, -1.0, 1.0)
+            noise = np.random.normal(0.0, self._noise_sigma,
+                                     size=self.action_dim).astype(np.float32)
+            a = np.clip(a + noise, -1.0, 1.0)
         return a
 
     # ------------------------------------------------------------------
@@ -233,6 +248,7 @@ class LocalDDPGAgent:
             "critic_target": self.critic_target.state_dict(),
             "actor_opt": self.actor_opt.state_dict(),
             "critic_opt": self.critic_opt.state_dict(),
+            "noise_sigma": float(self._noise_sigma),
         }, tmp)
         os.replace(tmp, path)
 
@@ -252,6 +268,8 @@ class LocalDDPGAgent:
             self.critic_target.load_state_dict(blob["critic_target"])
             self.actor_opt.load_state_dict(blob["actor_opt"])
             self.critic_opt.load_state_dict(blob["critic_opt"])
+            if "noise_sigma" in blob:
+                self._noise_sigma = float(blob["noise_sigma"])
         except Exception as exc:
             print(f"[ML] checkpoint load failed: {exc}")
             return False
@@ -272,21 +290,26 @@ def _flatten_state(state: dict) -> "np.ndarray":
     """Flatten the controller's JSON state into a 1D numpy vector.
 
     Layout (must match BuildMlStatePayload + MlSendHello state_dim):
-      per_switch[i].{rho, d_ms, p_loss, residual_energy_frac, depletion,
-                     echo_rtt_s, mu_max_gbps}                   (7 each)
-      per_link[i].{utilization, cost_norm, tx_share}            (3 each)
-      residual_energy_stddev                                    (1)
+      per_switch[i].{rho, d_ms_norm, p_loss, depletion, echo_rtt_norm}  (5 each)
+      per_link[i].{utilization, cost_norm, tx_share}                    (3 each)
+      residual_energy_stddev                                            (1)
+
+    d_ms and echo_rtt are log1p-scaled to keep Tanh activations in their
+    linear regime when queues back up — without log scaling, a queue spike
+    from ~5ms to ~500ms would saturate the actor's first layer.
     """
     pieces = []
     for sw in state.get("per_switch", []):
+        d_ms = max(0.0, float(sw.get("d_ms", 0.0)))
+        d_ms_norm = math.log1p(d_ms) / _MAX_LOG_DELAY
+        rtt_ms = max(0.0, float(sw.get("echo_rtt_ns", 0.0))) / 1.0e6
+        rtt_norm = math.log1p(rtt_ms) / _MAX_LOG_RTT
         pieces.extend([
-            sw.get("rho", 0.0),
-            sw.get("d_ms", 0.0),
-            sw.get("p_loss", 0.0),
-            sw.get("residual_energy_frac", 1.0),
-            sw.get("depletion", 0.0),
-            sw.get("echo_rtt_ns", 0.0) / 1e9,        # scale to seconds
-            sw.get("mu_max_bps", 0.0) / 1e9,         # scale to Gbps
+            float(sw.get("rho", 0.0)),
+            float(d_ms_norm),
+            float(sw.get("p_loss", 0.0)),
+            float(sw.get("depletion", 0.0)),
+            float(rtt_norm),
         ])
 
     links = state.get("per_link", [])
