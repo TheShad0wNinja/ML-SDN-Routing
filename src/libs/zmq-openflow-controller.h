@@ -73,9 +73,9 @@ struct MlConfig {
     double interval_s                 = 1.0;   // observe→act→learn period
     // Action-scale taper: |ΔW| starts at action_scale_start, tapers linearly
     // over taper_ticks to action_scale. Big swings early, fine-tune late.
-    double action_scale               = 0.20;  // final |ΔW| as fraction of base cost
-    double action_scale_start         = 0.40;  // initial |ΔW| during taper
-    uint32_t taper_ticks              = 200;   // ticks over which to taper
+    double action_scale               = 0.10;  // final |ΔW| as fraction of base cost
+    double action_scale_start         = 0.20;  // initial |ΔW| during taper
+    uint32_t taper_ticks              = 400;   // ticks over which to taper
     // Reward weights — all terms live in roughly [0, 1] after normalization,
     // so weights are directly comparable.
     double reward_alpha               = 1.0;   // delay quality (higher = lower latency reward)

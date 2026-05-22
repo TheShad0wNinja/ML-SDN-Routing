@@ -154,10 +154,10 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
     m_ml.reward_zeta  = 0.2;  m_ml.reward_eta   = 0.8;
     m_ml.reward_theta = 0.5;
   } else if (m_ml.priority_preset == "energy_first") {
-    m_ml.reward_alpha = 0.5;  m_ml.reward_beta  = 1.5;
-    m_ml.reward_gamma = 3.0;  m_ml.reward_delta = 1.0;
-    m_ml.reward_zeta  = 1.5;  m_ml.reward_eta   = 3.0;
-    m_ml.reward_theta = 2.0;
+    m_ml.reward_alpha = 1.0;  m_ml.reward_beta  = 2.0;   // pos bound = 3.0
+    m_ml.reward_gamma = 2.0;  m_ml.reward_delta = 0.5;
+    m_ml.reward_zeta  = 1.0;  m_ml.reward_eta   = 2.5;
+    m_ml.reward_theta = 1.5;                              // neg bound = 7.5
   }
   // Any other value (including "custom") leaves the weights as-passed.
 

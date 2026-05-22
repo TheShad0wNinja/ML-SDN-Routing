@@ -199,7 +199,7 @@ class LocalDDPGAgent:
         critic_lr: float = 1e-3,
         gamma: float = 0.99,
         tau: float = 0.005,
-        replay_capacity: int = 50_000,
+        replay_capacity: int = 200_000,
         batch_size: int = 64,
         warmup: int = 100,
     ):
@@ -234,9 +234,9 @@ class LocalDDPGAgent:
 
         # Decaying Gaussian exploration noise. Sigma starts wide and decays
         # per gradient step (so slow scenarios still get the full schedule).
-        self._noise_sigma = 0.2
+        self._noise_sigma = 0.3
         self._noise_sigma_min = 0.05
-        self._noise_sigma_decay = 0.9995
+        self._noise_sigma_decay = 0.99995
 
     # ------------------------------------------------------------------
     # Replay + training
