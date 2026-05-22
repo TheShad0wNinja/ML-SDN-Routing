@@ -42,7 +42,7 @@ TRAFFIC_MODE="central"
 SEED=12345
 PRIORITY="balanced"
 ML=false
-UDP=false
+UDP=true
 FAILURES=false
 CRIPPLE=false
 EXPLORE=true
@@ -57,7 +57,7 @@ NS3_VERBOSE=false
 TRAIN_ROUNDS=2
 TRAIN_MODES="central random grouped"
 TRAIN_FAILURES="true false"
-TRAIN_CRIPPLE="true"
+TRAIN_CRIPPLE="true false"
 
 ML_PID=""
 WE_STARTED_ML=false
@@ -432,7 +432,8 @@ cmd_train() {
           TRAFFIC_MODE=$mode
           FAILURES=$fail
           CRIPPLE=$crip
-          SEED=$((base_seed + scenario_idx))
+          # SEED=$((base_seed + scenario_idx))
+          SEED=$(od -An -N4 -tu4 < /dev/urandom | tr -d ' ')
           local label="train-r${r}-${mode}-fail${fail}-crip${crip}-seed${SEED}"
           echo
           echo "########## TRAINING ROUND ${r}/${TRAIN_ROUNDS} — scenario $((scenario_idx + 1)) ##########"
