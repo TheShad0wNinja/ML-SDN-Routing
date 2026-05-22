@@ -370,6 +370,25 @@ std::optional<std::vector<uint64_t>> Topology::ShortestPath(uint64_t src, uint64
     return std::nullopt;
 }
 
+double Topology::AverageHopCount() const
+{
+    // Brute force over every (src, dst) pair. Path cache absorbs the cost on
+    // the second+ call. Networks here are <100 switches so this stays cheap.
+    if (m_graph.size() < 2) return 0.0;
+    uint64_t totalHops = 0;
+    uint64_t pairs = 0;
+    for (const auto& srcKv : m_graph) {
+        for (const auto& dstKv : m_graph) {
+            if (srcKv.first == dstKv.first) continue;
+            auto path = ShortestPath(srcKv.first, dstKv.first);
+            if (!path || path->size() < 2) continue;
+            totalHops += path->size() - 1;
+            ++pairs;
+        }
+    }
+    return (pairs == 0) ? 0.0 : (static_cast<double>(totalHops) / pairs);
+}
+
 std::optional<uint32_t> Topology::GetOutPort(uint64_t src, uint64_t dst) const
 {
     auto srcIt = m_routing.find(src);

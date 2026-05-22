@@ -1356,17 +1356,22 @@ void ZmqOpenFlowController::MlOpenSocket() {
 void ZmqOpenFlowController::MlSendHello() {
   if (!m_mlSock) return;
 
-  // state_dim layout — keep in sync with python's _flatten_state():
-  //   5 per-switch features (rho, d_ms_norm, p_loss, depletion, echo_rtt_norm)
-  //   3 per-link features  (utilization, cost_norm, tx_share)
-  //   1 global scalar      (residual_energy_stddev)
-  size_t stateDim = 5 * m_switchMap.size() + 3 * m_mlLinkOrder.size() + 1;
-  // action_dim = one ΔW per (deduplicated) link
-  size_t actionDim = m_mlLinkOrder.size();
+  // GNN dims — keep in sync with python's _build_graph_data():
+  //   node_feat_dim = 5 (rho, d_ms_norm, p_loss, depletion, echo_rtt_norm)
+  //   edge_feat_dim = 3 (utilization, cost_norm, tx_share)
+  // num_switches / num_links let the Python side allocate buffers and verify
+  // payload shape at runtime. action_dim still maps 1:1 to m_mlLinkOrder.
+  size_t numSwitches = m_mlNodeOrder.size();
+  size_t numLinks    = m_mlLinkOrder.size();
+  size_t actionDim   = numLinks;
 
   std::ostringstream hello;
   hello << "{\"cmd\":\"hello\","
-        << "\"state_dim\":" << stateDim << ","
+        << "\"arch\":\"gnn-v1\","
+        << "\"num_switches\":" << numSwitches << ","
+        << "\"num_links\":" << numLinks << ","
+        << "\"node_feat_dim\":5,"
+        << "\"edge_feat_dim\":3,"
         << "\"action_dim\":" << actionDim << ","
         << "\"seed\":" << m_ml.seed << ","
         << "\"resume\":" << (m_ml.resume ? "true" : "false") << ","
@@ -1388,7 +1393,8 @@ void ZmqOpenFlowController::MlSendHello() {
       NS_LOG_WARN("[ML] hello reply timed out");
       return;
     }
-    NS_LOG_INFO("[ML] hello ack: state_dim=" << stateDim
+    NS_LOG_INFO("[ML] hello ack: num_switches=" << numSwitches
+                << " num_links=" << numLinks
                 << " action_dim=" << actionDim);
   } catch (const std::exception& e) {
     NS_LOG_WARN("[ML] hello failed: " << e.what());
@@ -1404,10 +1410,22 @@ std::string ZmqOpenFlowController::BuildMlStatePayload() {
     << "\"explore\":" << (m_ml.explore ? "true" : "false") << ","
     << "\"state\":{";
 
-  // ---- per-switch features ----
+  // ---- node index (dpid list in frozen order) ----
+  // Position i in this array == GNN node index for that dpid. Python uses it
+  // to map per_link.src/dst → integer indices for edge_index. Re-emitted every
+  // tick because m_mlNodeOrder is immutable after the first tick, and a fresh
+  // copy keeps the payload self-contained for any consumer.
+  s << "\"node_index\":[";
+  for (size_t i = 0; i < m_mlNodeOrder.size(); ++i) {
+    if (i) s << ",";
+    s << m_mlNodeOrder[i];
+  }
+  s << "],";
+
+  // ---- per-switch features (in frozen node order) ----
   s << "\"per_switch\":[";
   bool firstSw = true;
-  for (const auto& [dpid, sw] : m_switchMap) {
+  for (uint64_t dpid : m_mlNodeOrder) {
     SwitchObservation obs = m_switchObs.count(dpid) ? m_switchObs.at(dpid)
                                                     : SwitchObservation{};
     const auto& em = m_switchEnergyModel.count(dpid)
@@ -1690,17 +1708,23 @@ void ZmqOpenFlowController::MlTick() {
     }
   }
 
-  // Freeze link order at first tick (after LLDP discovery). Once frozen, link
-  // additions/removals don't grow the action vector; that's OK for static
+  // Freeze node + link order at first tick (after LLDP discovery). Once frozen,
+  // additions/removals don't change index assignments; that's OK for static
   // topologies and matches the plan's "stable index → link mapping" guarantee.
+  // Node order is what the Python GNN uses to map dpid → 0..N-1 when building
+  // edge_index, so it must be frozen alongside the link order.
   bool firstTick = (m_mlTick == 0);
   if (firstTick) {
+    for (const auto& kv : m_switchMap) {
+      m_mlNodeOrder.push_back(kv.first);
+    }
     for (const auto& link : m_topology.GetAllLinks()) {
       uint64_t a = link.src_dpid, b = link.dst_dpid;
       if (a > b) std::swap(a, b);
       m_mlLinkOrder.push_back({a, b});
     }
-    NS_LOG_INFO("[ML] Frozen link order: " << m_mlLinkOrder.size() << " links");
+    NS_LOG_INFO("[ML] Frozen node order: " << m_mlNodeOrder.size() << " switches"
+                << ", link order: " << m_mlLinkOrder.size() << " links");
     MlSendHello();
   }
 

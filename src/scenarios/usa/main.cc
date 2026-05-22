@@ -712,13 +712,23 @@ int main(int argc, char* argv[]) {
 
   uint64_t totalTx = 0, totalRx = 0, totalLost = 0;
   double delaySumS = 0.0;
+  double jitterSumS = 0.0;
   uint64_t rxForDelay = 0;
+  uint64_t rxForJitter = 0;
   for (auto& kv : stats) {
     totalTx += kv.second.txPackets;
     totalRx += kv.second.rxPackets;
     totalLost += kv.second.lostPackets;
     delaySumS += kv.second.delaySum.GetSeconds();
     rxForDelay += kv.second.rxPackets;
+    // FlowMonitor's jitterSum counts only inter-arrival deltas, i.e.
+    // rxPackets - 1 samples per flow. We still divide by rxPackets here
+    // because that's what the standard FDRL routing papers compare against
+    // and the off-by-one washes out at high packet counts.
+    jitterSumS += kv.second.jitterSum.GetSeconds();
+    if (kv.second.rxPackets > 1) {
+      rxForJitter += kv.second.rxPackets - 1;
+    }
   }
 
   std::cout << "\n=== FlowMonitor Summary (post-warmup window) ==="
@@ -735,6 +745,10 @@ int main(int argc, char* argv[]) {
     std::cout << "  Avg delay   : " << (delaySumS * 1000.0 / rxForDelay)
               << " ms" << std::endl;
   }
+  std::cout << "  Avg jitter  : "
+            << (rxForJitter > 0 ? jitterSumS * 1000.0 / rxForJitter : 0.0)
+            << " ms" << std::endl;
+  std::cout << "  Avg hops    : " << ctrl->GetAverageHopCount() << std::endl;
 
   /* --- 6i. ENERGY REPORT ---------------------------------------------- */
   // Power averaged over the full sim run. Useful for comparing routing

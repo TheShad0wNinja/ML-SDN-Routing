@@ -13,15 +13,22 @@ Architecture
 
 Wire protocol (JSON over ZMQ REQ/REP)
 -------------------------------------
-- `{"cmd":"hello", "state_dim":N, "action_dim":M, "seed":S,
+- `{"cmd":"hello", "arch":"gnn-v1", "num_switches":N, "num_links":L,
+    "node_feat_dim":5, "edge_feat_dim":3, "action_dim":L, "seed":S,
     "resume":bool, "checkpoint_every_n_ticks":K}` → `{"ok":true}`
-- `{"cmd":"observe", "tick":t, "state":{...}, "prev_reward":r}` →
-    `{"action":[float * action_dim]}`
+- `{"cmd":"observe", "tick":t, "state":{...}, "prev_reward":r,
+    "explore":bool}` → `{"action":[float * action_dim]}`
 - `{"cmd":"get_weights"}` → `{"weights":{name: list, ...}}`   (federation hook)
 - `{"cmd":"set_weights", "weights":{...}}` → `{"ok":true}`     (federation hook)
 
-If torch isn't installed, the service runs in degraded mode and returns tiny
-random actions — useful for protocol-only smoke tests.
+The state dict from C++ carries `node_index` (frozen dpid list), `per_switch`
+and `per_link` arrays in canonical order, and `residual_energy_stddev`. Python
+turns it into a `torch_geometric.data.Data` and feeds a GAT actor/critic — so
+weight shapes depend only on feature dims, not on the topology size. That is
+the property federated averaging will rely on.
+
+If torch or torch_geometric isn't installed, the service runs in degraded
+mode and returns tiny random actions — useful for protocol-only smoke tests.
 """
 
 from __future__ import annotations
@@ -46,62 +53,137 @@ try:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
+    from torch_geometric.data import Data, Batch
+    from torch_geometric.nn import GATv2Conv
 
     _HAS_TORCH = True
     torch.set_num_threads(1)
-except Exception as exc:  # pragma: no cover — only fires without torch
+except Exception as exc:  # pragma: no cover — fires without torch or PyG
     _HAS_TORCH = False
     _TORCH_IMPORT_ERROR = exc
 
 
 _AGENT_DIR = "scratch/data/agent"
-_CKPT_PATH = os.path.join(_AGENT_DIR, "abilene_local.pt")
+_CKPT_PATH = os.path.join(_AGENT_DIR, "local.pt")
 _REPLAY_PATH = os.path.join(_AGENT_DIR, "replay.pkl")
 _METRICS_PATH = os.path.join(_AGENT_DIR, "metrics.csv")
+
+# Bumped when the on-disk format changes in a way the loader can't fix up.
+# The GNN refactor invalidates old MLP checkpoints and replay tuples.
+_ARCH_TAG = "gnn-v1"
 
 # Log-scale caps for unbounded queueing telemetry. log1p(1000) ≈ 6.91 — well
 # past typical d_ms (~500ms practical max) and rtt_ms (~1s pathological).
 _MAX_LOG_DELAY = math.log1p(1000.0)
 _MAX_LOG_RTT = math.log1p(1000.0)
 
+# GNN feature dims advertised by the C++ controller. Hardcoded here as defaults
+# so the agent can still be instantiated for smoke tests; the real values come
+# from the hello payload.
+_NODE_FEAT_DIM = 5
+_EDGE_FEAT_DIM = 3
+
 
 # ---------------------------------------------------------------------------
-# DDPG networks
+# DDPG networks — GAT-based actor/critic. Weights depend only on feature
+# dims (not N or L), which is the federated-averaging prerequisite.
 # ---------------------------------------------------------------------------
 if _HAS_TORCH:
 
     class _Actor(nn.Module):
-        def __init__(self, state_dim: int, action_dim: int, hidden: int = 128):
+        """Two-layer GATv2 encoder + per-canonical-edge head.
+
+        Output is shape [E_total]: one action per canonical edge in the (possibly
+        batched) graph. For a single-graph forward this matches the action_dim
+        the C++ side expects.
+        """
+
+        def __init__(self, node_dim: int = _NODE_FEAT_DIM,
+                     edge_dim: int = _EDGE_FEAT_DIM,
+                     hidden: int = 128, heads: int = 4):
             super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(state_dim, hidden),
-                nn.LayerNorm(hidden),
+            assert hidden % heads == 0, "hidden must be divisible by heads"
+            self.gat1 = GATv2Conv(node_dim, hidden // heads, heads=heads,
+                                  edge_dim=edge_dim)
+            self.gat2 = GATv2Conv(hidden, hidden // heads, heads=heads,
+                                  edge_dim=edge_dim)
+            self.ln1 = nn.LayerNorm(hidden)
+            self.ln2 = nn.LayerNorm(hidden)
+            self.head = nn.Sequential(
+                nn.Linear(2 * hidden + edge_dim, hidden),
                 nn.ReLU(),
-                nn.Linear(hidden, hidden),
-                nn.LayerNorm(hidden),
-                nn.ReLU(),
-                nn.Linear(hidden, action_dim),
+                nn.Linear(hidden, 1),
                 nn.Tanh(),
             )
 
-        def forward(self, s: torch.Tensor) -> torch.Tensor:
-            return self.net(s)
+        def forward(self, data) -> torch.Tensor:
+            h = F.relu(self.ln1(self.gat1(data.x, data.edge_index, data.edge_attr)))
+            h = F.relu(self.ln2(self.gat2(h,      data.edge_index, data.edge_attr)))
+            src, dst = data.canonical_edge_index  # each [E_total]
+            feats = torch.cat([h[src], h[dst], data.canonical_edge_attr], dim=-1)
+            return self.head(feats).squeeze(-1)
 
     class _Critic(nn.Module):
-        def __init__(self, state_dim: int, action_dim: int, hidden: int = 128):
+        """Two-layer GATv2 encoder + per-edge MLP + mean-edge pooling.
+
+        Pooling is mean (not sum) so Q magnitude doesn't drift with topology
+        size — that matters when weights are later averaged across controllers
+        on different graphs.
+        """
+
+        def __init__(self, node_dim: int = _NODE_FEAT_DIM,
+                     edge_dim: int = _EDGE_FEAT_DIM,
+                     hidden: int = 128, heads: int = 4):
             super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(state_dim + action_dim, hidden),
-                nn.LayerNorm(hidden),
+            assert hidden % heads == 0
+            self.gat1 = GATv2Conv(node_dim, hidden // heads, heads=heads,
+                                  edge_dim=edge_dim)
+            self.gat2 = GATv2Conv(hidden, hidden // heads, heads=heads,
+                                  edge_dim=edge_dim)
+            self.ln1 = nn.LayerNorm(hidden)
+            self.ln2 = nn.LayerNorm(hidden)
+            # per-edge Q contribution: [h_src ‖ h_dst ‖ edge_attr ‖ action]
+            self.edge_head = nn.Sequential(
+                nn.Linear(2 * hidden + edge_dim + 1, hidden),
                 nn.ReLU(),
                 nn.Linear(hidden, hidden),
-                nn.LayerNorm(hidden),
+            )
+            # global head: [pooled_edges ‖ u] → scalar Q
+            self.global_head = nn.Sequential(
+                nn.Linear(hidden + 1, hidden),
                 nn.ReLU(),
                 nn.Linear(hidden, 1),
             )
 
-        def forward(self, s: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
-            return self.net(torch.cat([s, a], dim=-1))
+        def forward(self, data, action: torch.Tensor) -> torch.Tensor:
+            h = F.relu(self.ln1(self.gat1(data.x, data.edge_index, data.edge_attr)))
+            h = F.relu(self.ln2(self.gat2(h,      data.edge_index, data.edge_attr)))
+            src, dst = data.canonical_edge_index
+            feats = torch.cat([h[src], h[dst], data.canonical_edge_attr,
+                               action.unsqueeze(-1)], dim=-1)
+            edge_repr = self.edge_head(feats)  # [E_total, hidden]
+
+            # Mean-pool edges per graph. For an unbatched single-graph call
+            # data.batch is None, so we pool the whole thing.
+            if getattr(data, "batch", None) is not None:
+                # Map each canonical edge to its graph via its source node.
+                edge_to_graph = data.batch[src]  # [E_total]
+                num_graphs = int(data.batch.max().item()) + 1
+                pooled = torch.zeros(num_graphs, edge_repr.size(1),
+                                     device=edge_repr.device, dtype=edge_repr.dtype)
+                pooled.index_add_(0, edge_to_graph, edge_repr)
+                counts = torch.zeros(num_graphs, device=edge_repr.device,
+                                     dtype=edge_repr.dtype)
+                counts.index_add_(
+                    0, edge_to_graph,
+                    torch.ones_like(edge_to_graph, dtype=edge_repr.dtype))
+                pooled = pooled / counts.clamp_min(1.0).unsqueeze(-1)
+                u = data.u.view(num_graphs, 1)
+            else:
+                pooled = edge_repr.mean(dim=0, keepdim=True)  # [1, hidden]
+                u = data.u.view(1, 1)
+
+            return self.global_head(torch.cat([pooled, u], dim=-1)).squeeze(-1)
 
 
 class LocalDDPGAgent:
@@ -109,8 +191,9 @@ class LocalDDPGAgent:
 
     def __init__(
         self,
-        state_dim: int,
         action_dim: int,
+        node_dim: int = _NODE_FEAT_DIM,
+        edge_dim: int = _EDGE_FEAT_DIM,
         seed: int = 0,
         actor_lr: float = 1e-4,
         critic_lr: float = 1e-3,
@@ -118,18 +201,17 @@ class LocalDDPGAgent:
         tau: float = 0.005,
         replay_capacity: int = 50_000,
         batch_size: int = 64,
-        # 100 transitions = ~100 s of sim time at the default mlIntervalS=1.0.
-        # Anything higher and short runs (5-min Abilene scenarios) finish before
-        # the agent ever takes a gradient step.
         warmup: int = 100,
     ):
         if not _HAS_TORCH:
             raise RuntimeError(
-                f"LocalDDPGAgent requires torch / numpy; import failed: {_TORCH_IMPORT_ERROR}"
+                f"LocalDDPGAgent requires torch + torch_geometric; import failed: "
+                f"{_TORCH_IMPORT_ERROR}"
             )
 
-        self.state_dim = state_dim
         self.action_dim = action_dim
+        self.node_dim = node_dim
+        self.edge_dim = edge_dim
         self.gamma = gamma
         self.tau = tau
         self.batch_size = batch_size
@@ -139,10 +221,10 @@ class LocalDDPGAgent:
         np.random.seed(seed)
         random.seed(seed)
 
-        self.actor = _Actor(state_dim, action_dim)
-        self.critic = _Critic(state_dim, action_dim)
-        self.actor_target = _Actor(state_dim, action_dim)
-        self.critic_target = _Critic(state_dim, action_dim)
+        self.actor = _Actor(node_dim=node_dim, edge_dim=edge_dim)
+        self.critic = _Critic(node_dim=node_dim, edge_dim=edge_dim)
+        self.actor_target = _Actor(node_dim=node_dim, edge_dim=edge_dim)
+        self.critic_target = _Critic(node_dim=node_dim, edge_dim=edge_dim)
         self.actor_target.load_state_dict(self.actor.state_dict())
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
@@ -160,17 +242,25 @@ class LocalDDPGAgent:
     # Replay + training
     # ------------------------------------------------------------------
     def push(self, s, a, r, s_next):
-        self.replay.append((s.astype(np.float32), a.astype(np.float32),
-                            float(r), s_next.astype(np.float32)))
+        """Store one (s, a, r, s') transition.
+
+        s and s_next are torch_geometric Data objects; a is a numpy array of
+        shape [action_dim].
+        """
+        self.replay.append((s, np.asarray(a, dtype=np.float32),
+                            float(r), s_next))
 
     def _sample(self):
         idx = np.random.randint(0, len(self.replay), self.batch_size)
         batch = [self.replay[i] for i in idx]
         s, a, r, s2 = zip(*batch)
-        return (torch.from_numpy(np.stack(s)),
-                torch.from_numpy(np.stack(a)),
-                torch.tensor(r, dtype=torch.float32).unsqueeze(-1),
-                torch.from_numpy(np.stack(s2)))
+        s_batch = Batch.from_data_list(list(s))
+        s2_batch = Batch.from_data_list(list(s2))
+        # Actions are per-canonical-edge; flatten across the batch in the same
+        # order canonical_edge_index is concatenated.
+        a_tensor = torch.from_numpy(np.concatenate(a, axis=0))
+        r_tensor = torch.tensor(r, dtype=torch.float32).unsqueeze(-1)
+        return s_batch, a_tensor, r_tensor, s2_batch
 
     def train_step(self):
         if len(self.replay) < max(self.warmup, self.batch_size):
@@ -179,8 +269,8 @@ class LocalDDPGAgent:
         s, a, r, s2 = self._sample()
         with torch.no_grad():
             a2 = self.actor_target(s2)
-            q_target = r + self.gamma * self.critic_target(s2, a2)
-        q = self.critic(s, a)
+            q_target = r + self.gamma * self.critic_target(s2, a2).unsqueeze(-1)
+        q = self.critic(s, a).unsqueeze(-1)
         critic_loss = F.mse_loss(q, q_target)
         self.critic_opt.zero_grad()
         critic_loss.backward()
@@ -208,14 +298,16 @@ class LocalDDPGAgent:
     # ------------------------------------------------------------------
     # Acting
     # ------------------------------------------------------------------
-    def act(self, state: "np.ndarray", explore: bool = True) -> "np.ndarray":
+    def act(self, data: "Data", explore: bool = True) -> "np.ndarray":
+        """Return per-canonical-edge action vector for a single graph."""
         with torch.no_grad():
-            s = torch.from_numpy(state.astype(np.float32)).unsqueeze(0)
-            a = self.actor(s).squeeze(0).numpy().astype(np.float32)
+            # Wrap into a batch-of-one so downstream code can stay uniform.
+            batch = Batch.from_data_list([data])
+            a = self.actor(batch).cpu().numpy().astype(np.float32)
 
         if explore:
             noise = np.random.normal(0.0, self._noise_sigma,
-                                     size=self.action_dim).astype(np.float32)
+                                     size=a.shape).astype(np.float32)
             a = np.clip(a + noise, -1.0, 1.0)
         return a
 
@@ -224,8 +316,10 @@ class LocalDDPGAgent:
     # ------------------------------------------------------------------
     def export_weights(self) -> dict:
         return {
-            "actor": {k: v.cpu().numpy().tolist() for k, v in self.actor.state_dict().items()},
-            "critic": {k: v.cpu().numpy().tolist() for k, v in self.critic.state_dict().items()},
+            "actor": {k: v.cpu().numpy().tolist()
+                      for k, v in self.actor.state_dict().items()},
+            "critic": {k: v.cpu().numpy().tolist()
+                       for k, v in self.critic.state_dict().items()},
         }
 
     def load_weights(self, payload: dict) -> None:
@@ -238,10 +332,15 @@ class LocalDDPGAgent:
                 {k: torch.tensor(v) for k, v in payload["critic"].items()})
             self.critic_target.load_state_dict(self.critic.state_dict())
 
-    def save_checkpoint(self, path: str = _CKPT_PATH, replay_path: str = _REPLAY_PATH) -> None:
+    def save_checkpoint(self, path: str = _CKPT_PATH,
+                        replay_path: str = _REPLAY_PATH) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
         torch.save({
+            "arch": _ARCH_TAG,
+            "node_dim": self.node_dim,
+            "edge_dim": self.edge_dim,
+            "action_dim": self.action_dim,
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
             "actor_target": self.actor_target.state_dict(),
@@ -254,14 +353,21 @@ class LocalDDPGAgent:
 
         tmp_r = replay_path + ".tmp"
         with open(tmp_r, "wb") as f:
-            pickle.dump(list(self.replay), f, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump({"arch": _ARCH_TAG, "items": list(self.replay)}, f,
+                        protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp_r, replay_path)
 
-    def maybe_load_checkpoint(self, path: str = _CKPT_PATH, replay_path: str = _REPLAY_PATH) -> bool:
+    def maybe_load_checkpoint(self, path: str = _CKPT_PATH,
+                              replay_path: str = _REPLAY_PATH) -> bool:
         if not os.path.exists(path):
             return False
         try:
             blob = torch.load(path, map_location="cpu")
+            arch = blob.get("arch", "mlp-legacy")
+            if arch != _ARCH_TAG:
+                print(f"[ML] checkpoint arch={arch!r} != expected={_ARCH_TAG!r} — "
+                      f"refusing to load (likely a pre-GNN checkpoint). Starting fresh.")
+                return False
             self.actor.load_state_dict(blob["actor"])
             self.critic.load_state_dict(blob["critic"])
             self.actor_target.load_state_dict(blob["actor_target"])
@@ -276,8 +382,12 @@ class LocalDDPGAgent:
         if os.path.exists(replay_path):
             try:
                 with open(replay_path, "rb") as f:
-                    items = pickle.load(f)
-                self.replay = deque(items, maxlen=self.replay.maxlen)
+                    payload = pickle.load(f)
+                if isinstance(payload, dict) and payload.get("arch") == _ARCH_TAG:
+                    self.replay = deque(payload["items"],
+                                        maxlen=self.replay.maxlen)
+                else:
+                    print(f"[ML] replay buffer arch mismatch — discarding.")
             except Exception as exc:
                 print(f"[ML] replay load failed: {exc}")
         return True
@@ -286,48 +396,96 @@ class LocalDDPGAgent:
 # ---------------------------------------------------------------------------
 # Service
 # ---------------------------------------------------------------------------
-def _flatten_state(state: dict) -> "np.ndarray":
-    """Flatten the controller's JSON state into a 1D numpy vector.
+def _build_graph_data(state: dict) -> "Data":
+    """Build a torch_geometric Data object from the controller's state JSON.
 
-    Layout (must match BuildMlStatePayload + MlSendHello state_dim):
-      per_switch[i].{rho, d_ms_norm, p_loss, depletion, echo_rtt_norm}  (5 each)
-      per_link[i].{utilization, cost_norm, tx_share}                    (3 each)
-      residual_energy_stddev                                            (1)
+    Expected schema (from C++ BuildMlStatePayload):
+      state.node_index = [dpid_0, dpid_1, ...]   (frozen canonical order)
+      state.per_switch = [{dpid, rho, d_ms, p_loss, depletion, echo_rtt_ns}, ...]
+      state.per_link   = [{src, dst, tx_bps, capacity_bps, utilization, cost,
+                           base_cost, delay_ms}, ...]
+      state.residual_energy_stddev = float
 
-    d_ms and echo_rtt are log1p-scaled to keep Tanh activations in their
-    linear regime when queues back up — without log scaling, a queue spike
-    from ~5ms to ~500ms would saturate the actor's first layer.
+    Returns Data with:
+      x                    [N, 5]   node features
+      edge_index           [2, 2L]  bidirectional message-passing edges
+      edge_attr            [2L, 3]  features for message-passing edges
+      canonical_edge_index [2, L]   one direction per link (matches action vec)
+      canonical_edge_attr  [L, 3]   features for canonical edges
+      u                    [1]      global residual_energy_stddev
+
+    d_ms and echo_rtt are log1p-scaled to keep Tanh activations in their linear
+    regime when queues back up — a queue spike from ~5ms to ~500ms would
+    otherwise saturate the first GAT layer's attention scores.
     """
-    pieces = []
-    for sw in state.get("per_switch", []):
+    node_index = state.get("node_index", []) or []
+    dpid_to_idx = {int(d): i for i, d in enumerate(node_index)}
+    n = max(len(node_index), 1)
+
+    x = np.zeros((n, _NODE_FEAT_DIM), dtype=np.float32)
+    for sw in state.get("per_switch", []) or []:
+        idx = dpid_to_idx.get(int(sw.get("dpid", -1)), -1)
+        if idx < 0:
+            continue
         d_ms = max(0.0, float(sw.get("d_ms", 0.0)))
         d_ms_norm = math.log1p(d_ms) / _MAX_LOG_DELAY
         rtt_ms = max(0.0, float(sw.get("echo_rtt_ns", 0.0))) / 1.0e6
         rtt_norm = math.log1p(rtt_ms) / _MAX_LOG_RTT
-        pieces.extend([
-            float(sw.get("rho", 0.0)),
-            float(d_ms_norm),
-            float(sw.get("p_loss", 0.0)),
-            float(sw.get("depletion", 0.0)),
-            float(rtt_norm),
-        ])
+        x[idx, 0] = float(sw.get("rho", 0.0))
+        x[idx, 1] = float(d_ms_norm)
+        x[idx, 2] = float(sw.get("p_loss", 0.0))
+        x[idx, 3] = float(sw.get("depletion", 0.0))
+        x[idx, 4] = float(rtt_norm)
 
-    links = state.get("per_link", [])
+    per_link = state.get("per_link", []) or []
+    L = len(per_link)
     # Normalize cost by the max in this tick so the agent sees a unit-scale signal.
-    max_cost = max((float(l.get("cost", 1.0)) for l in links), default=1.0)
+    max_cost = max((float(l.get("cost", 1.0)) for l in per_link), default=1.0)
     max_cost = max(max_cost, 1e-9)
-    for l in links:
+
+    canon_src = np.zeros(max(L, 1), dtype=np.int64)
+    canon_dst = np.zeros(max(L, 1), dtype=np.int64)
+    edge_attr = np.zeros((max(L, 1), _EDGE_FEAT_DIM), dtype=np.float32)
+    for i, l in enumerate(per_link):
+        canon_src[i] = dpid_to_idx.get(int(l.get("src", -1)), 0)
+        canon_dst[i] = dpid_to_idx.get(int(l.get("dst", -1)), 0)
         cap = float(l.get("capacity_bps", 0.0))
         tx = float(l.get("tx_bps", 0.0))
-        pieces.extend([
-            float(l.get("utilization", 0.0)),
-            float(l.get("cost", 0.0)) / max_cost,
-            (tx / cap) if cap > 0.0 else 0.0,
-        ])
+        edge_attr[i, 0] = float(l.get("utilization", 0.0))
+        edge_attr[i, 1] = float(l.get("cost", 0.0)) / max_cost
+        edge_attr[i, 2] = (tx / cap) if cap > 0.0 else 0.0
 
-    pieces.append(float(state.get("residual_energy_stddev", 0.0)))
+    # When L=0 we still emit a dummy self-loop on node 0 so GATConv has something
+    # to chew on. With no real edges the gradient through edge_attr is null
+    # anyway, so this just prevents an empty-tensor crash on the first tick.
+    if L == 0:
+        canon_src[0] = 0
+        canon_dst[0] = 0
+        L_eff = 1
+    else:
+        L_eff = L
 
-    return np.array(pieces, dtype=np.float32) if _HAS_TORCH else pieces  # type: ignore[return-value]
+    canonical_edge_index = np.stack([canon_src[:L_eff], canon_dst[:L_eff]], axis=0)
+    bidir_src = np.concatenate([canon_src[:L_eff], canon_dst[:L_eff]])
+    bidir_dst = np.concatenate([canon_dst[:L_eff], canon_src[:L_eff]])
+    bidir_edge_index = np.stack([bidir_src, bidir_dst], axis=0)
+    bidir_edge_attr = np.concatenate([edge_attr[:L_eff], edge_attr[:L_eff]], axis=0)
+
+    u = np.array([float(state.get("residual_energy_stddev", 0.0))],
+                 dtype=np.float32)
+
+    data = Data(
+        x=torch.from_numpy(x),
+        edge_index=torch.from_numpy(bidir_edge_index),
+        edge_attr=torch.from_numpy(bidir_edge_attr),
+        u=torch.from_numpy(u),
+    )
+    # PyG batching: any attribute whose name contains "_index" is auto-offset
+    # by num_nodes when graphs are batched — exactly what we need so
+    # canonical_edge_index keeps pointing at the right nodes after batching.
+    data.canonical_edge_index = torch.from_numpy(canonical_edge_index)
+    data.canonical_edge_attr = torch.from_numpy(edge_attr[:L_eff].copy())
+    return data
 
 
 class MLService:
@@ -340,19 +498,22 @@ class MLService:
 
         # Agent state — populated by `hello`.
         self.agent: LocalDDPGAgent | None = None
-        self.state_dim = 0
+        self.num_switches = 0
+        self.num_links = 0
+        self.node_feat_dim = _NODE_FEAT_DIM
+        self.edge_feat_dim = _EDGE_FEAT_DIM
         self.action_dim = 0
         self.checkpoint_every = 60
         self.seed = 0
 
         # Worker thread coordination.
-        # Tuple is (tick, state_vec, prev_reward, explore).
-        self._req_q: "queue.Queue[tuple[int, np.ndarray, float, bool]]" = queue.Queue()
+        # Tuple is (tick, graph_data, prev_reward, explore).
+        self._req_q: "queue.Queue[tuple[int, Any, float, bool]]" = queue.Queue()
         self._stop = threading.Event()
         self._action_lock = threading.Lock()
         # Cached "best action so far". Producer = worker, consumer = main.
         self._last_action: "np.ndarray | None" = None
-        self._prev_state: "np.ndarray | None" = None
+        self._prev_state: "Any | None" = None
         self._prev_action: "np.ndarray | None" = None
         self._train_steps = 0
 
@@ -403,7 +564,7 @@ class MLService:
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                tick, state_vec, prev_reward, explore = self._req_q.get(timeout=0.5)
+                tick, graph, prev_reward, explore = self._req_q.get(timeout=0.5)
             except queue.Empty:
                 continue
             if self.agent is None or not _HAS_TORCH:
@@ -412,7 +573,7 @@ class MLService:
             # 1. Store (s, a, r, s') if we have a prior action cached.
             if self._prev_state is not None and self._prev_action is not None:
                 self.agent.push(self._prev_state, self._prev_action,
-                                prev_reward, state_vec)
+                                prev_reward, graph)
 
             # 2. Train step (no-op until replay has warmup samples).
             #    Skip gradient updates entirely in eval mode — keeps the policy
@@ -425,11 +586,11 @@ class MLService:
             train_ms = (time.perf_counter() - t0) * 1000.0
 
             # 3. Choose next action and publish.
-            next_action = self.agent.act(state_vec, explore=explore)
+            next_action = self.agent.act(graph, explore=explore)
             with self._action_lock:
                 self._last_action = next_action
 
-            self._prev_state = state_vec
+            self._prev_state = graph
             self._prev_action = next_action
             self._train_steps += 1
 
@@ -494,19 +655,32 @@ class MLService:
         return json.dumps({"error": f"unknown-cmd:{cmd}"}).encode("utf-8")
 
     def _handle_hello(self, msg: dict) -> bytes:
-        self.state_dim = int(msg.get("state_dim", 0))
-        self.action_dim = int(msg.get("action_dim", 0))
+        arch = str(msg.get("arch", ""))
+        self.num_switches = int(msg.get("num_switches", 0))
+        self.num_links = int(msg.get("num_links", 0))
+        self.node_feat_dim = int(msg.get("node_feat_dim", _NODE_FEAT_DIM))
+        self.edge_feat_dim = int(msg.get("edge_feat_dim", _EDGE_FEAT_DIM))
+        self.action_dim = int(msg.get("action_dim", self.num_links))
         self.checkpoint_every = int(msg.get("checkpoint_every_n_ticks", 60))
         self.seed = int(msg.get("seed", 0))
         resume = bool(msg.get("resume", True))
 
         if not _HAS_TORCH:
-            print(f"[ML] hello received but torch missing — degraded mode "
-                  f"({_TORCH_IMPORT_ERROR})")
+            print(f"[ML] hello received but torch/torch_geometric missing — "
+                  f"degraded mode ({_TORCH_IMPORT_ERROR})")
             return json.dumps({"ok": True, "degraded": True}).encode("utf-8")
 
+        if arch and arch != _ARCH_TAG:
+            print(f"[ML] WARNING: controller arch={arch!r} doesn't match "
+                  f"service arch={_ARCH_TAG!r} — proceeding anyway.")
+
         try:
-            self.agent = LocalDDPGAgent(self.state_dim, self.action_dim, seed=self.seed)
+            self.agent = LocalDDPGAgent(
+                action_dim=self.action_dim,
+                node_dim=self.node_feat_dim,
+                edge_dim=self.edge_feat_dim,
+                seed=self.seed,
+            )
         except Exception as exc:
             print(f"[ML] agent init failed: {exc}")
             self.agent = None
@@ -523,9 +697,17 @@ class MLService:
         with self._action_lock:
             self._last_action = np.zeros(self.action_dim, dtype=np.float32)
 
-        print(f"[ML] hello: state_dim={self.state_dim} action_dim={self.action_dim} "
+        # FL property check: print weight shapes so the topology-invariance is
+        # visible in logs. None of these tuples should contain N or L.
+        actor_shapes = {k: tuple(v.shape)
+                        for k, v in self.agent.actor.state_dict().items()}
+        print(f"[ML] hello: arch={_ARCH_TAG} num_switches={self.num_switches} "
+              f"num_links={self.num_links} node_feat_dim={self.node_feat_dim} "
+              f"edge_feat_dim={self.edge_feat_dim} action_dim={self.action_dim} "
               f"seed={self.seed} resumed={resumed}")
-        return json.dumps({"ok": True, "resumed": resumed}).encode("utf-8")
+        print(f"[ML] actor weight shapes (topology-invariant): {actor_shapes}")
+        return json.dumps({"ok": True, "resumed": resumed,
+                           "arch": _ARCH_TAG}).encode("utf-8")
 
     def _handle_observe(self, msg: dict) -> bytes:
         tick = int(msg.get("tick", 0))
@@ -542,17 +724,17 @@ class MLService:
             action = [random.uniform(-jitter, jitter) for _ in range(n)]
             return json.dumps({"action": action}).encode("utf-8")
 
-        state_vec = _flatten_state(state)
-        # If the dim drifted (shouldn't, after hello), pad/truncate.
-        if state_vec.shape[0] != self.state_dim and self.state_dim > 0:
-            padded = np.zeros(self.state_dim, dtype=np.float32)
-            n = min(state_vec.shape[0], self.state_dim)
-            padded[:n] = state_vec[:n]
-            state_vec = padded
+        try:
+            graph = _build_graph_data(state)
+        except Exception as exc:
+            print(f"[ML] failed to build graph from state: {exc}")
+            return json.dumps(
+                {"action": [0.0] * max(self.action_dim, 1)}
+            ).encode("utf-8")
 
         # Enqueue to worker — never block for more than a microsecond.
         try:
-            self._req_q.put_nowait((tick, state_vec, prev_reward, explore))
+            self._req_q.put_nowait((tick, graph, prev_reward, explore))
         except queue.Full:
             pass
 
@@ -564,10 +746,13 @@ class MLService:
         return json.dumps({"action": action_list}).encode("utf-8")
 
     def _handle_get_weights(self) -> bytes:
-        # Federation hook stub: returns weights if the agent exists, else empty.
+        # Federation hook: returns weights if the agent exists, else empty.
+        # Shapes are topology-invariant after the GNN refactor — see the log
+        # at hello time for the actual tuples.
         if self.agent is None or not _HAS_TORCH:
             return json.dumps({"weights": {}}).encode("utf-8")
-        return json.dumps({"weights": self.agent.export_weights()}).encode("utf-8")
+        return json.dumps({"weights": self.agent.export_weights(),
+                           "arch": _ARCH_TAG}).encode("utf-8")
 
     def _handle_set_weights(self, msg: dict) -> bytes:
         if self.agent is None or not _HAS_TORCH:

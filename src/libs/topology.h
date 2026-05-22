@@ -53,6 +53,12 @@ public:
   };
   std::vector<LinkInfo> GetAllLinks() const;
 
+  // Mean shortest-path hop count over every (src, dst) switch pair where a
+  // path exists. Used as a QoS / routing-cost metric in summary.csv: ML
+  // controllers that push traffic onto longer paths bump this number.
+  // Returns 0.0 if the graph has fewer than 2 switches or no reachable pairs.
+  double AverageHopCount() const;
+
   // Returns: dpid -> set of ports that are on the BFS spanning tree
   std::unordered_map<uint64_t, std::unordered_set<uint32_t>> ComputeSpanningTree() const;
 

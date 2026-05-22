@@ -249,16 +249,19 @@ fmt_W()  { awk -v v="${1:-0}" 'BEGIN{printf (v>=1000)?"%.2f kW":"%.0f W", (v>=10
 
 summarize_log() {
   local f="$1" label="$2"
-  local success loss rtt delivery delay flows tx rx energy power
-  local residual per_sw_consumed per_sw_residual residual_frac
-  success=$(extract '^[[:space:]]+Success[[:space:]]+:' "$f")
-  loss=$(extract    '^[[:space:]]+Loss[[:space:]]+:' "$f")
-  rtt=$(extract     '^[[:space:]]+Avg RTT[[:space:]]+:' "$f")
-  flows=$(extract   '^[[:space:]]+Flows[[:space:]]+:' "$f")
-  tx=$(extract      '^[[:space:]]+Tx packets[[:space:]]+:' "$f")
-  rx=$(extract      '^[[:space:]]+Rx packets[[:space:]]+:' "$f")
+  # ---- QoS ----
+  local success rtt jitter delivery delay flows tx rx hops
+  success=$(extract  '^[[:space:]]+Success[[:space:]]+:' "$f")
+  rtt=$(extract      '^[[:space:]]+Avg RTT[[:space:]]+:' "$f")
+  jitter=$(extract   '^[[:space:]]+Avg jitter[[:space:]]+:' "$f")
   delivery=$(extract '^[[:space:]]+Delivery[[:space:]]+:' "$f")
   delay=$(extract    '^[[:space:]]+Avg delay[[:space:]]+:' "$f")
+  flows=$(extract    '^[[:space:]]+Flows[[:space:]]+:' "$f")
+  tx=$(extract       '^[[:space:]]+Tx packets[[:space:]]+:' "$f")
+  rx=$(extract       '^[[:space:]]+Rx packets[[:space:]]+:' "$f")
+  hops=$(extract     '^[[:space:]]+Avg hops[[:space:]]+:' "$f")
+  # ---- Energy ----
+  local energy residual power per_sw_consumed per_sw_residual residual_frac
   energy=$(extract  '^[[:space:]]+Total consumed[[:space:]]+:' "$f")
   residual=$(extract '^[[:space:]]+Total residual[[:space:]]+:' "$f")
   power=$(extract   '^[[:space:]]+Total avg power[[:space:]]+:' "$f")
@@ -274,20 +277,43 @@ summarize_log() {
     jpermb=$(awk -v e="$energy" -v r="$rx" 'BEGIN{printf "%.3f", e/(r*1024*8/1e6)}')
   fi
 
+  # ---- ML (aggregated from scratch/data/agent/metrics.csv) ----
+  # aggregate_metrics.py prints KEY=value lines. Anything missing (e.g. when
+  # the run was baseline-only) yields empty strings — that's the desired CSV
+  # behaviour, not an error.
+  local ml_ticks ml_reward_final ml_reward_mean ml_critic_loss ml_actor_loss
+  ml_ticks=""; ml_reward_final=""; ml_reward_mean=""
+  ml_critic_loss=""; ml_actor_loss=""
+  if $ML && [[ -f "$CKPT_DIR/metrics.csv" ]]; then
+    local agg
+    agg=$(python3 "$SCRIPT_DIR/python/aggregate_metrics.py" \
+            "$CKPT_DIR/metrics.csv" 2>/dev/null || true)
+    ml_ticks=$(echo       "$agg" | awk -F= '/^ML_TICKS=/{print $2}')
+    ml_reward_final=$(echo "$agg" | awk -F= '/^ML_REWARD_FINAL=/{print $2}')
+    ml_reward_mean=$(echo  "$agg" | awk -F= '/^ML_REWARD_MEAN_LAST25=/{print $2}')
+    ml_critic_loss=$(echo  "$agg" | awk -F= '/^ML_CRITIC_LOSS_FINAL=/{print $2}')
+    ml_actor_loss=$(echo   "$agg" | awk -F= '/^ML_ACTOR_LOSS_FINAL=/{print $2}')
+  fi
+
   echo "── $label ──"
-  printf "  ping success : %s%%\n"   "${success:-—}"
-  printf "  avg RTT      : %s ms\n"  "${rtt:-—}"
-  printf "  delivery     : %s%%\n"   "${delivery:-—}"
-  printf "  avg delay    : %s ms\n"  "${delay:-—}"
+  printf "  ping success : %s%%\n"    "${success:-—}"
+  printf "  avg RTT      : %s ms\n"   "${rtt:-—}"
+  printf "  jitter       : %s ms\n"   "${jitter:-—}"
+  printf "  delivery     : %s%%\n"    "${delivery:-—}"
+  printf "  avg delay    : %s ms\n"   "${delay:-—}"
+  printf "  avg hops     : %s\n"      "${hops:-—}"
   printf "  total energy : %s  (avg %s)\n" "$(fmt_J "${energy:-0}")" "$(fmt_W "${power:-0}")"
   [[ -n "$per_sw_consumed" ]] && printf "  per-switch   : consumed %s, left %s (%s%%)\n" \
     "$(fmt_J "${per_sw_consumed:-0}")" "$(fmt_J "${per_sw_residual:-0}")" "${residual_frac:-—}"
   [[ -n "$jpermb" ]] && printf "  J / Mb delivered : %s\n" "$jpermb"
+  [[ -n "$ml_reward_final" ]] && printf "  ML reward    : final=%s  mean_last25=%s  ticks=%s\n" \
+    "$ml_reward_final" "${ml_reward_mean:-—}" "${ml_ticks:-0}"
   echo
 
-  # Append to CSV (created if absent). If the existing CSV has the older,
-  # shorter header, rotate it aside so we don't mix schemas.
-  local expected_header="timestamp,label,topology,simTime,trafficMode,seed,ml,priority,udp,failures,cripple,success,rtt_ms,delivery,delay_ms,flows,tx,rx,energy_J,residual_J,power_W,per_sw_consumed_J,per_sw_residual_J,residual_pct,j_per_Mb"
+  # Append to CSV (created if absent). If the existing CSV has any other
+  # header (old flat schema, partial archive, etc.), rotate it aside so we
+  # don't mix schemas.
+  local expected_header="timestamp,label,topology,sim_time_s,traffic_mode,seed,controller,priority,udp,failures,cripple,ping_success_pct,rtt_avg_ms,rtt_jitter_ms,pdr_pct,e2e_delay_avg_ms,flows,tx_pkts,rx_pkts,hop_count_avg,energy_total_j,energy_residual_j,power_avg_w,per_sw_consumed_j,per_sw_residual_j,residual_pct,j_per_mb,ml_reward_final,ml_reward_mean_last25,ml_critic_loss_final,ml_actor_loss_final,ml_ticks"
   if [[ -f "$SUMMARY_CSV" ]] && [[ "$(head -n1 "$SUMMARY_CSV")" != "$expected_header" ]]; then
     local archived="${SUMMARY_CSV%.csv}.$(date +%Y%m%d-%H%M%S).csv"
     mv "$SUMMARY_CSV" "$archived"
@@ -296,13 +322,16 @@ summarize_log() {
   if [[ ! -f "$SUMMARY_CSV" ]]; then
     echo "$expected_header" >"$SUMMARY_CSV"
   fi
-  printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
+  printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
     "$(date -Iseconds)" "$label" "$TOPOLOGY" "$SIM_TIME" "$TRAFFIC_MODE" "$SEED" \
     "$($ML && echo ml || echo baseline)" "$($ML && echo "$PRIORITY" || echo -)" \
     "$($UDP && echo 1 || echo 0)" "$($FAILURES && echo 1 || echo 0)" "$($CRIPPLE && echo 1 || echo 0)" \
-    "${success:-}" "${rtt:-}" "${delivery:-}" "${delay:-}" \
-    "${flows:-}" "${tx:-}" "${rx:-}" "${energy:-}" "${residual:-}" "${power:-}" \
+    "${success:-}" "${rtt:-}" "${jitter:-}" "${delivery:-}" "${delay:-}" \
+    "${flows:-}" "${tx:-}" "${rx:-}" "${hops:-}" \
+    "${energy:-}" "${residual:-}" "${power:-}" \
     "${per_sw_consumed:-}" "${per_sw_residual:-}" "${residual_frac:-}" "${jpermb:-}" \
+    "${ml_reward_final:-}" "${ml_reward_mean:-}" "${ml_critic_loss:-}" "${ml_actor_loss:-}" \
+    "${ml_ticks:-}" \
     >>"$SUMMARY_CSV"
 }
 

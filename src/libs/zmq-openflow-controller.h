@@ -114,6 +114,10 @@ public:
     // Read back energy state for reporting. Returns -1 if dpid not configured.
     double GetSwitchInitialEnergyJ(uint64_t dpid) const;
     double GetSwitchResidualEnergyJ(uint64_t dpid) const;
+    // Mean shortest-path hop count over the current routing table. Reported by
+    // scenarios at shutdown so summary.csv can capture how aggressive ML
+    // routing is at picking detour paths.
+    double GetAverageHopCount() const { return m_topology.AverageHopCount(); }
     // Override the stats polling interval (seconds); default is 60 s
     void SetStatsInterval(double seconds);
     // Enable online FDRL local agent. Default-constructed MlConfig keeps it off.
@@ -259,6 +263,9 @@ private:
     // Canonical link ordering — frozen at first MlTick so the action vector index
     // → link mapping is stable across ticks.
     std::vector<std::pair<uint64_t, uint64_t>>                        m_mlLinkOrder;
+    // Canonical node ordering — list of dpids frozen at first MlTick. Defines the
+    // dpid → sequential index mapping the Python GNN uses to build edge_index.
+    std::vector<uint64_t>                                             m_mlNodeOrder;
     // Snapshot of m_switchObs from the *previous* tick, used by ComputeMlReward.
     std::unordered_map<uint64_t, SwitchObservation>                   m_mlPrevObs;
     bool   m_mlHavePrevObs = false;
