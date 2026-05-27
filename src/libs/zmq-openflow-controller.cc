@@ -560,7 +560,6 @@ void ZmqOpenFlowController::HandleLldpPacket(uint64_t dpid, uint32_t inPort,
   bool changed = m_topology.AddLink(chassis_id, port_id, dpid, inPort, delayMs, baseCost);
   NS_LOG_DEBUG("[TRACE] HandleLldp after AddLink changed=" << changed);
   if (changed && capBps > 0) {
-    NS_LOG_INFO("CHANGING LINK CAPACITY");
     m_topology.SetLinkCapacityBps(chassis_id, dpid, capBps);
     m_topology.SetLinkBaseCost(chassis_id, dpid, baseCost);
   }
@@ -958,7 +957,9 @@ void ZmqOpenFlowController::HandlePortStatsReply(
     ps.tx_errors   = s->tx_errors;
     ps.duration_sec = s->duration_sec;
 
-    if (ps.speed_kbps > 0) {
+    // Assign link congestion stats based on usage
+    // Only if the ml is disabled
+    if (!m_ml.enabled && ps.speed_kbps > 0) {
       auto peerDpid = m_topology.GetPeerDpid(dpid, pno);
       if (peerDpid) {
         // Derive congestion factor from utilization with EWMA smoothing.
