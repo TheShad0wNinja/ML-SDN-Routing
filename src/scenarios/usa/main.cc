@@ -78,31 +78,31 @@ class LinkController {
   };
 
   static void BringDown(State* ls) {
-    std::cerr << "[TRACE] LinkController::BringDown ENTER t="
-              << Simulator::Now().GetSeconds() << "s ls=" << ls << std::endl;
+    NS_LOG_DEBUG("[TRACE] LinkController::BringDown ENTER t="
+           << Simulator::Now().GetSeconds() << "s ls=" << ls);
     NS_LOG_INFO("Link DOWN at t=" << Simulator::Now().GetSeconds() << "s");
     SetErrorRate(ls->devA, 1.0);
     SetErrorRate(ls->devB, 1.0);
-    std::cerr << "[TRACE] LinkController::BringDown EXIT" << std::endl;
+    NS_LOG_DEBUG("[TRACE] LinkController::BringDown EXIT");
   }
   static void BringUp(State* ls) {
-    std::cerr << "[TRACE] LinkController::BringUp ENTER t="
-              << Simulator::Now().GetSeconds() << "s ls=" << ls << std::endl;
+    NS_LOG_DEBUG("[TRACE] LinkController::BringUp ENTER t="
+           << Simulator::Now().GetSeconds() << "s ls=" << ls);
     NS_LOG_INFO("Link UP at t=" << Simulator::Now().GetSeconds() << "s");
     SetErrorRate(ls->devA, ls->normalRate);
     SetErrorRate(ls->devB, ls->normalRate);
-    std::cerr << "[TRACE] LinkController::BringUp EXIT" << std::endl;
+    NS_LOG_DEBUG("[TRACE] LinkController::BringUp EXIT");
   }
   static void Degrade(State* ls, double rate) {
-    std::cerr << "[TRACE] LinkController::Degrade ENTER t="
-              << Simulator::Now().GetSeconds() << "s rate=" << rate
-              << " ls=" << ls << std::endl;
+    NS_LOG_DEBUG("[TRACE] LinkController::Degrade ENTER t="
+           << Simulator::Now().GetSeconds() << "s rate=" << rate
+           << " ls=" << ls);
     NS_LOG_INFO("Link DEGRADED loss=" << rate
                                       << " at t="
                                       << Simulator::Now().GetSeconds() << "s");
     SetErrorRate(ls->devA, rate);
     SetErrorRate(ls->devB, rate);
-    std::cerr << "[TRACE] LinkController::Degrade EXIT" << std::endl;
+    NS_LOG_DEBUG("[TRACE] LinkController::Degrade EXIT");
   }
 
   static void SetErrorRate(Ptr<NetDevice> nd, double rate) {
@@ -218,9 +218,8 @@ class StressEvents {
   // controller-side support (see Section D plan); this is the no-controller-
   // change approximation.
   void BlackHoleOn(uint32_t switchIdx) {
-    std::cerr << "[TRACE] BlackHoleOn ENTER t="
-              << Simulator::Now().GetSeconds() << "s sw=" << switchIdx
-              << std::endl;
+    NS_LOG_DEBUG("[TRACE] BlackHoleOn ENTER t="
+           << Simulator::Now().GetSeconds() << "s sw=" << switchIdx);
     NS_LOG_INFO("Black hole ON switch=" << switchIdx
                                         << " at t="
                                         << Simulator::Now().GetSeconds()
@@ -231,7 +230,7 @@ class StressEvents {
       if (!DynamicCast<CsmaNetDevice>(nd)) continue;
       LinkController::SetErrorRate(nd, 1.0);
     }
-    std::cerr << "[TRACE] BlackHoleOn EXIT" << std::endl;
+    NS_LOG_DEBUG("[TRACE] BlackHoleOn EXIT");
   }
 
   // Restore by installing a zero-rate model rather than re-applying a saved
@@ -239,9 +238,8 @@ class StressEvents {
   // path: under --tcp --failures, the saved model could outlive the attribute
   // refresh from BringDown/BringUp on overlapping links.
   void BlackHoleOff(uint32_t switchIdx) {
-    std::cerr << "[TRACE] BlackHoleOff ENTER t="
-              << Simulator::Now().GetSeconds() << "s sw=" << switchIdx
-              << std::endl;
+    NS_LOG_DEBUG("[TRACE] BlackHoleOff ENTER t="
+           << Simulator::Now().GetSeconds() << "s sw=" << switchIdx);
     NS_LOG_INFO("Black hole OFF switch=" << switchIdx
                                          << " at t="
                                          << Simulator::Now().GetSeconds()
@@ -252,7 +250,7 @@ class StressEvents {
       if (!DynamicCast<CsmaNetDevice>(nd)) continue;
       LinkController::SetErrorRate(nd, 0.0);
     }
-    std::cerr << "[TRACE] BlackHoleOff EXIT" << std::endl;
+    NS_LOG_DEBUG("[TRACE] BlackHoleOff EXIT");
   }
 };
 
@@ -1203,21 +1201,20 @@ int main(int argc, char* argv[]) {
 
   NS_LOG_INFO("Starting Simulation (simTime=" << simTime << "s, warmup="
                                               << warmupS << "s)...");
-  std::cerr << "[TRACE] before Simulator::Run simTime=" << simTime
-            << " measureStart=" << measureStart << std::endl;
+  NS_LOG_DEBUG("[TRACE] before Simulator::Run simTime=" << simTime
+               << " measureStart=" << measureStart);
 
   // Heartbeat: print sim time every 1s of wall sim time so we can see exactly
   // when execution stops before a silent SIGSEGV.
   std::function<void()> heartbeat = [&]() {
-    std::cerr << "[TRACE] heartbeat t=" << Simulator::Now().GetSeconds() << "s"
-              << std::endl;
+    NS_LOG_DEBUG("[TRACE] heartbeat t=" << Simulator::Now().GetSeconds() << "s");
     Simulator::Schedule(Seconds(1.0), heartbeat);
   };
   Simulator::Schedule(Seconds(0.0), heartbeat);
 
   Simulator::Stop(Seconds(simTime));
   Simulator::Run();
-  std::cerr << "[TRACE] after Simulator::Run" << std::endl;
+  NS_LOG_DEBUG("[TRACE] after Simulator::Run");
 
   /* --- 6h. REPORT ------------------------------------------------------ */
   StatsCollector::PrintPingReport();

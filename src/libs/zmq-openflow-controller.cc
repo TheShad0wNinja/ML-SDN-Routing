@@ -548,22 +548,22 @@ void ZmqOpenFlowController::HandleLldpPacket(uint64_t dpid, uint32_t inPort,
   // Capacity isn't known until PORT_STATS arrives; seed base_cost from delay
   // with the 10 Mbps capacity floor in ComputeBaseCost, then refine later.
   double baseCost = ComputeBaseCost(delayMs, 0.0);
-  std::cerr << "[TRACE] HandleLldp t=" << Simulator::Now().GetSeconds()
-            << " " << chassis_id << ":" << port_id << " <-> " << dpid
-            << ":" << inPort << " before AddLink" << std::endl;
+  NS_LOG_DEBUG("[TRACE] HandleLldp t=" << Simulator::Now().GetSeconds()
+               << " " << chassis_id << ":" << port_id << " <-> " << dpid
+               << ":" << inPort << " before AddLink");
   bool changed = m_topology.AddLink(chassis_id, port_id, dpid, inPort, delayMs, baseCost);
-  std::cerr << "[TRACE] HandleLldp after AddLink changed=" << changed << std::endl;
+  NS_LOG_DEBUG("[TRACE] HandleLldp after AddLink changed=" << changed);
   if (changed) {
-    std::cerr << "[TRACE] HandleLldp before RebuildSpanningTree" << std::endl;
+    NS_LOG_DEBUG("[TRACE] HandleLldp before RebuildSpanningTree");
     RebuildSpanningTree();
-    std::cerr << "[TRACE] HandleLldp after RebuildSpanningTree" << std::endl;
+    NS_LOG_DEBUG("[TRACE] HandleLldp after RebuildSpanningTree");
   }
   NS_LOG_INFO("[TOPO] Link: " << chassis_id << ":" << port_id << " <-> " << dpid
                               << ":" << inPort << " delay=" << delayMs
                               << "ms base_cost=" << baseCost);
 
-  std::cerr << "[TRACE] HandleLldp before macToLoc flush size="
-            << m_macToLoc.size() << std::endl;
+  NS_LOG_DEBUG("[TRACE] HandleLldp before macToLoc flush size="
+               << m_macToLoc.size());
   // Flush MAC entries learned on now-confirmed switch-link ports
   for (auto mit = m_macToLoc.begin(); mit != m_macToLoc.end();) {
     if (m_topology.IsSwitchLinkPort(mit->second.first, mit->second.second))
@@ -571,7 +571,7 @@ void ZmqOpenFlowController::HandleLldpPacket(uint64_t dpid, uint32_t inPort,
     else
       ++mit;
   }
-  std::cerr << "[TRACE] HandleLldp END" << std::endl;
+  NS_LOG_DEBUG("[TRACE] HandleLldp END");
 
   // WriteStateToJson();
 }
