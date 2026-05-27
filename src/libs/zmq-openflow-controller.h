@@ -207,11 +207,6 @@ class ZmqOpenFlowController : public OFSwitch13Controller {
   void InstallFlow(uint64_t dpid, uint64_t dstMac, uint32_t outPort);
   void InstallOrUpdateFloodGroup(uint64_t dpid);
 
-  static std::array<uint8_t, 60> BuildArpReply(uint64_t targetMac,
-                                               uint32_t targetIp,
-                                               uint64_t requesterMac,
-                                               uint32_t requesterIp);
-
   void RecomputeAllRoutes();
   void RebuildSpanningTree();
 

@@ -16,10 +16,9 @@
 #include <vector>
 
 #include "ns3/log.h"
+#include "ns3/ofswitch13-module.h"
 #include "ns3/simulator.h"
 #include "openflow_builders.h"
-#include <arpa/inet.h>
-#include "ns3/ofswitch13-module.h"
 
 namespace ns3 {
 
@@ -82,7 +81,8 @@ void ZmqOpenFlowController::StartApplication() {
   // Start LLDP early so topology is known before pings at t=2s
   Simulator::Schedule(Seconds(0.5), &ZmqOpenFlowController::TriggerLldp, this);
   Simulator::Schedule(Seconds(1.0), &ZmqOpenFlowController::TriggerEcho, this);
-  Simulator::Schedule(Seconds(m_statsIntervalS), &ZmqOpenFlowController::TriggerStats, this);
+  Simulator::Schedule(Seconds(m_statsIntervalS),
+                      &ZmqOpenFlowController::TriggerStats, this);
 
   OFSwitch13Controller::StartApplication();
 }
@@ -92,16 +92,15 @@ void ZmqOpenFlowController::StopApplication() {
 }
 
 void ZmqOpenFlowController::SetHostAnnotation(uint64_t mac,
-                                               const HostAnnotation& ann) {
+                                              const HostAnnotation& ann) {
   m_hostAnnotations[mac] = ann;
 }
 
 void ZmqOpenFlowController::SetSwitchEnergyModel(uint64_t dpid,
-                                                   double initial_j,
-                                                   double per_byte_j) {
+                                                 double initial_j,
+                                                 double per_byte_j) {
   m_switchEnergyModel[dpid] = {initial_j, per_byte_j};
-  if (initial_j >= 0)
-    m_switchResidualEnergy[dpid] = initial_j;
+  if (initial_j >= 0) m_switchResidualEnergy[dpid] = initial_j;
 }
 
 double ZmqOpenFlowController::GetSwitchInitialEnergyJ(uint64_t dpid) const {
@@ -126,8 +125,8 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
     return;
   }
 
-  // Apply priority preset unless it' scustom
-  switch(cfg.priority_preset){
+  // Apply priority preset unless it' custom
+  switch (cfg.priority_preset) {
     case MlConfig::MlPriority::BALANCED: {
       m_ml.reward_alpha = 1.0;
       m_ml.reward_beta = 2.0;
@@ -155,14 +154,15 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
       m_ml.reward_eta = 2.5;
       m_ml.reward_theta = 1.5;  // neg bound = 7.5
     }
-    default: break;
+    default:
+      break;
   }
 
-  NS_LOG_INFO("[ML] preset=" << m_ml.priority_preset
-              << " α=" << m_ml.reward_alpha << " β=" << m_ml.reward_beta
-              << " γ=" << m_ml.reward_gamma << " δ=" << m_ml.reward_delta
-              << " ζ=" << m_ml.reward_zeta  << " η=" << m_ml.reward_eta
-              << " θ=" << m_ml.reward_theta);
+  NS_LOG_INFO("[ML] preset="
+              << m_ml.priority_preset << " α=" << m_ml.reward_alpha
+              << " β=" << m_ml.reward_beta << " γ=" << m_ml.reward_gamma
+              << " δ=" << m_ml.reward_delta << " ζ=" << m_ml.reward_zeta
+              << " η=" << m_ml.reward_eta << " θ=" << m_ml.reward_theta);
 
   // Make sure stats roll fast enough that the agent gets fresh observations
   // every tick. Without this, the default 60 s interval would starve MlTick.
@@ -192,7 +192,8 @@ void ZmqOpenFlowController::HandshakeSuccessful(Ptr<const RemoteSwitch> swtch) {
   // ARP → controller. Sits above the broadcast→flood-group rule so the
   // controller can answer known targets directly (proxy ARP) and decide
   // when to flood unknown ones.
-  DpctlExecute(swDpId,
+  DpctlExecute(
+      swDpId,
       "flow-mod cmd=add,table=0,prio=20 eth_type=0x0806 apply:output=ctrl:128");
 
   // Request port info from connected switch
@@ -203,9 +204,7 @@ void ZmqOpenFlowController::HandshakeSuccessful(Ptr<const RemoteSwitch> swtch) {
   }
 }
 
-// ------------------------------------------------------------------
-//  Helper: build and send a single-action OFPT_PACKET_OUT
-// ------------------------------------------------------------------
+// Builds and sends a single action OFPT_Packet_Out
 void ZmqOpenFlowController::SendPacketOut(Ptr<const RemoteSwitch> swtch,
                                           uint32_t inPort, uint32_t bufferId,
                                           const uint8_t* data, size_t dataLen,
@@ -237,13 +236,10 @@ void ZmqOpenFlowController::SendPacketOut(Ptr<const RemoteSwitch> swtch,
   free(po);
 }
 
-// ------------------------------------------------------------------
-//  Helper: build and send a PACKET_OUT with a single group action
-// ------------------------------------------------------------------
-void ZmqOpenFlowController::SendPacketOutGroup(Ptr<const RemoteSwitch> swtch,
-                                               uint32_t inPort, uint32_t bufferId,
-                                               const uint8_t* data, size_t dataLen,
-                                               uint32_t groupId) {
+// Build and send a PACKET_OUT with a single group action
+void ZmqOpenFlowController::SendPacketOutGroup(
+    Ptr<const RemoteSwitch> swtch, uint32_t inPort, uint32_t bufferId,
+    const uint8_t* data, size_t dataLen, uint32_t groupId) {
   struct ofl_msg_packet_out* po =
       (struct ofl_msg_packet_out*)malloc(sizeof(*po));
   memset(po, 0, sizeof(*po));
@@ -268,47 +264,6 @@ void ZmqOpenFlowController::SendPacketOutGroup(Ptr<const RemoteSwitch> swtch,
   free(a);
   if (po->data) free(po->data);
   free(po);
-}
-
-// ------------------------------------------------------------------
-//  Build a 42-byte Ethernet+ARP reply frame (proxy ARP)
-// ------------------------------------------------------------------
-std::array<uint8_t, 60>
-ZmqOpenFlowController::BuildArpReply(uint64_t targetMac, uint32_t targetIp,
-                                     uint64_t requesterMac, uint32_t requesterIp) {
-  // Sized to Ethernet minimum frame (60 bytes payload + 4 FCS = 64). The
-  // 18 trailing bytes are zero padding; without it some receivers truncate
-  // the tail of the ARP payload.
-  std::array<uint8_t, 60> f{};
-  // Eth dst: requester MAC
-  for (int i = 0; i < 6; ++i) f[i] = (requesterMac >> (8 * (5 - i))) & 0xFF;
-  // Eth src: target MAC (the host we are proxying for)
-  for (int i = 0; i < 6; ++i) f[6 + i] = (targetMac >> (8 * (5 - i))) & 0xFF;
-  // Ethertype: 0x0806
-  f[12] = 0x08; f[13] = 0x06;
-  // HW type: 1 (Ethernet)
-  f[14] = 0x00; f[15] = 0x01;
-  // Proto type: 0x0800 (IPv4)
-  f[16] = 0x08; f[17] = 0x00;
-  // HW len, proto len
-  f[18] = 6; f[19] = 4;
-  // Op: 2 (reply)
-  f[20] = 0x00; f[21] = 0x02;
-  // Sender HW: target MAC
-  for (int i = 0; i < 6; ++i) f[22 + i] = (targetMac >> (8 * (5 - i))) & 0xFF;
-  // Sender proto: target IP (host byte order in memory; serialize big-endian)
-  f[28] = (targetIp >> 24) & 0xFF;
-  f[29] = (targetIp >> 16) & 0xFF;
-  f[30] = (targetIp >>  8) & 0xFF;
-  f[31] = (targetIp      ) & 0xFF;
-  // Target HW: requester MAC
-  for (int i = 0; i < 6; ++i) f[32 + i] = (requesterMac >> (8 * (5 - i))) & 0xFF;
-  // Target proto: requester IP
-  f[38] = (requesterIp >> 24) & 0xFF;
-  f[39] = (requesterIp >> 16) & 0xFF;
-  f[40] = (requesterIp >>  8) & 0xFF;
-  f[41] = (requesterIp      ) & 0xFF;
-  return f;
 }
 
 // ------------------------------------------------------------------
@@ -355,11 +310,9 @@ void ZmqOpenFlowController::PreInstallAllPaths(
       ++installs;
     }
   }
-  NS_LOG_INFO("PreInstallAllPaths: installed=" << installs
-                                                << " skipped=" << skips
-                                                << " hosts=" << hosts.size()
-                                                << " switches="
-                                                << m_switchMap.size());
+  NS_LOG_INFO("PreInstallAllPaths: installed="
+              << installs << " skipped=" << skips << " hosts=" << hosts.size()
+              << " switches=" << m_switchMap.size());
 }
 
 // ------------------------------------------------------------------
@@ -387,10 +340,9 @@ void ZmqOpenFlowController::InstallExternalHostRoutes(
       ++installs;
     }
   }
-  NS_LOG_INFO("InstallExternalHostRoutes: ctrl_id=" << m_ml.controller_id
-              << " routes=" << routes.size()
-              << " installs=" << installs
-              << " skips=" << skips);
+  NS_LOG_INFO("InstallExternalHostRoutes: ctrl_id="
+              << m_ml.controller_id << " routes=" << routes.size()
+              << " installs=" << installs << " skips=" << skips);
 }
 
 // ------------------------------------------------------------------
@@ -399,7 +351,7 @@ void ZmqOpenFlowController::InstallExternalHostRoutes(
 //  On first install also adds the broadcast→group flow rule.
 // ------------------------------------------------------------------
 void ZmqOpenFlowController::InstallOrUpdateFloodGroup(uint64_t dpid) {
-  std::set<uint32_t> ports; // ordered for stable log output
+  std::set<uint32_t> ports;  // ordered for stable log output
 
   auto portIt = m_switchPorts.find(dpid);
   if (portIt != m_switchPorts.end()) {
@@ -441,8 +393,8 @@ void ZmqOpenFlowController::InstallOrUpdateFloodGroup(uint64_t dpid) {
   }
 
   NS_LOG_INFO("[GROUP] " << (firstInstall ? "Installed" : "Updated")
-              << " flood group on dpid=" << dpid
-              << " ports=[" << logPorts.str() << "]");
+                         << " flood group on dpid=" << dpid << " ports=["
+                         << logPorts.str() << "]");
 }
 
 // Recompute next-hop for every (switch, knownDst) pair; reinstall the flow
@@ -475,7 +427,9 @@ void ZmqOpenFlowController::RecomputeAllRoutes() {
       ++rewrites;
     }
   }
-  if (rewrites) NS_LOG_INFO("[ML] RecomputeAllRoutes rewrote " << rewrites << " flow entries");
+  if (rewrites)
+    NS_LOG_INFO("[ML] RecomputeAllRoutes rewrote " << rewrites
+                                                   << " flow entries");
 }
 
 // ------------------------------------------------------------------
@@ -554,10 +508,12 @@ void ZmqOpenFlowController::HandleLldpPacket(uint64_t dpid, uint32_t inPort,
   if (!kbps) kbps = getSpeed(chassis_id, port_id);
   double capBps = kbps ? static_cast<double>(kbps) * 1000.0 : 0.0;
   double baseCost = ComputeBaseCost(delayMs, capBps);
-  NS_LOG_DEBUG("[TRACE] HandleLldp t=" << Simulator::Now().GetSeconds()
-               << " " << chassis_id << ":" << port_id << " <-> " << dpid
-               << ":" << inPort << " before AddLink");
-  bool changed = m_topology.AddLink(chassis_id, port_id, dpid, inPort, delayMs, baseCost);
+  NS_LOG_DEBUG("[TRACE] HandleLldp t=" << Simulator::Now().GetSeconds() << " "
+                                       << chassis_id << ":" << port_id
+                                       << " <-> " << dpid << ":" << inPort
+                                       << " before AddLink");
+  bool changed =
+      m_topology.AddLink(chassis_id, port_id, dpid, inPort, delayMs, baseCost);
   NS_LOG_DEBUG("[TRACE] HandleLldp after AddLink changed=" << changed);
   if (changed && capBps > 0) {
     m_topology.SetLinkCapacityBps(chassis_id, dpid, capBps);
@@ -570,10 +526,11 @@ void ZmqOpenFlowController::HandleLldpPacket(uint64_t dpid, uint32_t inPort,
   }
   NS_LOG_INFO("[TOPO] Link: " << chassis_id << ":" << port_id << " <-> " << dpid
                               << ":" << inPort << " delay=" << delayMs
-                              << "ms base_cost=" << baseCost << " cap=" << capBps / 1e6 << "Mbps");
+                              << "ms base_cost=" << baseCost
+                              << " cap=" << capBps / 1e6 << "Mbps");
 
-  NS_LOG_DEBUG("[TRACE] HandleLldp before macToLoc flush size="
-               << m_macToLoc.size());
+  NS_LOG_DEBUG(
+      "[TRACE] HandleLldp before macToLoc flush size=" << m_macToLoc.size());
   // Flush MAC entries learned on now-confirmed switch-link ports
   for (auto mit = m_macToLoc.begin(); mit != m_macToLoc.end();) {
     if (m_topology.IsSwitchLinkPort(mit->second.first, mit->second.second))
@@ -706,7 +663,6 @@ ofl_err ZmqOpenFlowController::HandlePacketIn(struct ofl_msg_packet_in* msg,
     const uint8_t* data = msg->data;
     uint16_t ethertype = (uint16_t)data[12] << 8 | (uint16_t)data[13];
 
-
     if (ethertype == 0x88CC) {
       HandleLldpPacket(dpid, inPort, data, msg->data_length);
       ofl_msg_free((struct ofl_msg_header*)msg, nullptr);
@@ -739,17 +695,19 @@ ofl_err ZmqOpenFlowController::HandlePacketIn(struct ofl_msg_packet_in* msg,
           auto ipIt = m_ipToMac.find(targetIp);
           if (ipIt != m_ipToMac.end() && senderMac && senderIp) {
             uint64_t targetMac = ipIt->second;
-            auto reply = BuildArpReply(targetMac, targetIp, senderMac, senderIp);
-            SendPacketOut(swtch, OFPP_CONTROLLER, OFP_NO_BUFFER,
-                          reply.data(), reply.size(), inPort);
-            NS_LOG_INFO("[ARP] Proxy reply " << FormatIp(targetIp)
-                        << " is-at " << FormatMac(targetMac)
-                        << " -> " << FormatIp(senderIp));
+            auto reply =
+                BuildArpReply(targetMac, targetIp, senderMac, senderIp);
+            SendPacketOut(swtch, OFPP_CONTROLLER, OFP_NO_BUFFER, reply.data(),
+                          reply.size(), inPort);
+            NS_LOG_INFO("[ARP] Proxy reply " << FormatIp(targetIp) << " is-at "
+                                             << FormatMac(targetMac) << " -> "
+                                             << FormatIp(senderIp));
             ofl_msg_free((struct ofl_msg_header*)msg, nullptr);
             return 0;
           }
           // Target unknown — flood via spanning tree.
-          NS_LOG_INFO("[ARP] Flood (target " << FormatIp(targetIp) << " unknown)");
+          NS_LOG_INFO("[ARP] Flood (target " << FormatIp(targetIp)
+                                             << " unknown)");
           FloodViaST(swtch, inPort, msg->buffer_id, msg->data,
                      msg->data_length);
           ofl_msg_free((struct ofl_msg_header*)msg, nullptr);
@@ -899,7 +857,8 @@ void ZmqOpenFlowController::HandleQueueStatsReply(
 void ZmqOpenFlowController::HandlePortStatsReply(
     struct ofl_msg_multipart_reply_port* reply, uint64_t dpid) {
   double nowSec = Simulator::Now().GetSeconds();
-  NS_LOG_INFO("[PORT-STATS] Switch " << dpid << ": " << reply->stats_num << " ports");
+  NS_LOG_INFO("[PORT-STATS] Switch " << dpid << ": " << reply->stats_num
+                                     << " ports");
 
   for (size_t i = 0; i < reply->stats_num; ++i) {
     const struct ofl_port_stats* s = reply->stats[i];
@@ -911,50 +870,59 @@ void ZmqOpenFlowController::HandlePortStatsReply(
     // Compute instantaneous bit rates AND drop byte-rates from deltas BEFORE
     // overwriting any prev_* counters. Drop byte-rate ≈ Δdropped_pkts × avg
     // pkt size × 8 / dt — OF1.3 stats only give us packet counts for drops,
-    // so we approximate byte size from the running average over the same window.
+    // so we approximate byte size from the running average over the same
+    // window.
     double dt = (ps.prev_time_s > 0) ? (nowSec - ps.prev_time_s) : 0;
     if (dt > 0) {
-      ps.rx_rate_bps = static_cast<double>(s->rx_bytes - ps.prev_rx_bytes) * 8.0 / dt;
-      ps.tx_rate_bps = static_cast<double>(s->tx_bytes - ps.prev_tx_bytes) * 8.0 / dt;
+      ps.rx_rate_bps =
+          static_cast<double>(s->rx_bytes - ps.prev_rx_bytes) * 8.0 / dt;
+      ps.tx_rate_bps =
+          static_cast<double>(s->tx_bytes - ps.prev_tx_bytes) * 8.0 / dt;
       ps.rx_rate_bps = std::max(0.0, ps.rx_rate_bps);
       ps.tx_rate_bps = std::max(0.0, ps.tx_rate_bps);
 
-      uint64_t dRxPkts  = (s->rx_packets > ps.prev_rx_packets)
-                            ? (s->rx_packets - ps.prev_rx_packets) : 0;
-      uint64_t dTxPkts  = (s->tx_packets > ps.prev_tx_packets)
-                            ? (s->tx_packets - ps.prev_tx_packets) : 0;
-      uint64_t dRxDrop  = (s->rx_dropped > ps.prev_rx_dropped)
-                            ? (s->rx_dropped - ps.prev_rx_dropped) : 0;
-      uint64_t dTxDrop  = (s->tx_dropped > ps.prev_tx_dropped)
-                            ? (s->tx_dropped - ps.prev_tx_dropped) : 0;
-      double avgRxPktB  = dRxPkts > 0
-                            ? static_cast<double>(s->rx_bytes - ps.prev_rx_bytes) / dRxPkts
-                            : 0.0;
-      double avgTxPktB  = dTxPkts > 0
-                            ? static_cast<double>(s->tx_bytes - ps.prev_tx_bytes) / dTxPkts
-                            : 0.0;
+      uint64_t dRxPkts = (s->rx_packets > ps.prev_rx_packets)
+                             ? (s->rx_packets - ps.prev_rx_packets)
+                             : 0;
+      uint64_t dTxPkts = (s->tx_packets > ps.prev_tx_packets)
+                             ? (s->tx_packets - ps.prev_tx_packets)
+                             : 0;
+      uint64_t dRxDrop = (s->rx_dropped > ps.prev_rx_dropped)
+                             ? (s->rx_dropped - ps.prev_rx_dropped)
+                             : 0;
+      uint64_t dTxDrop = (s->tx_dropped > ps.prev_tx_dropped)
+                             ? (s->tx_dropped - ps.prev_tx_dropped)
+                             : 0;
+      double avgRxPktB =
+          dRxPkts > 0
+              ? static_cast<double>(s->rx_bytes - ps.prev_rx_bytes) / dRxPkts
+              : 0.0;
+      double avgTxPktB =
+          dTxPkts > 0
+              ? static_cast<double>(s->tx_bytes - ps.prev_tx_bytes) / dTxPkts
+              : 0.0;
       ps.rx_drop_rate_bps = dRxDrop * avgRxPktB * 8.0 / dt;
       ps.tx_drop_rate_bps = dTxDrop * avgTxPktB * 8.0 / dt;
     }
 
     // Update snapshot for next interval
-    ps.prev_rx_bytes   = s->rx_bytes;
-    ps.prev_tx_bytes   = s->tx_bytes;
+    ps.prev_rx_bytes = s->rx_bytes;
+    ps.prev_tx_bytes = s->tx_bytes;
     ps.prev_rx_packets = s->rx_packets;
     ps.prev_tx_packets = s->tx_packets;
     ps.prev_rx_dropped = s->rx_dropped;
     ps.prev_tx_dropped = s->tx_dropped;
-    ps.prev_time_s     = nowSec;
+    ps.prev_time_s = nowSec;
 
     // Store all raw counters
-    ps.rx_packets  = s->rx_packets;
-    ps.tx_packets  = s->tx_packets;
-    ps.rx_bytes    = s->rx_bytes;
-    ps.tx_bytes    = s->tx_bytes;
-    ps.rx_dropped  = s->rx_dropped;
-    ps.tx_dropped  = s->tx_dropped;
-    ps.rx_errors   = s->rx_errors;
-    ps.tx_errors   = s->tx_errors;
+    ps.rx_packets = s->rx_packets;
+    ps.tx_packets = s->tx_packets;
+    ps.rx_bytes = s->rx_bytes;
+    ps.tx_bytes = s->tx_bytes;
+    ps.rx_dropped = s->rx_dropped;
+    ps.tx_dropped = s->tx_dropped;
+    ps.rx_errors = s->rx_errors;
+    ps.tx_errors = s->tx_errors;
     ps.duration_sec = s->duration_sec;
 
     // Assign link congestion stats based on usage
@@ -964,7 +932,8 @@ void ZmqOpenFlowController::HandlePortStatsReply(
       if (peerDpid) {
         // Derive congestion factor from utilization with EWMA smoothing.
         double capBps = static_cast<double>(ps.speed_kbps) * 1000.0;
-        double util = std::clamp(ps.tx_rate_bps / std::max(1.0, capBps), 0.0, 0.99);
+        double util =
+            std::clamp(ps.tx_rate_bps / std::max(1.0, capBps), 0.0, 0.99);
         double cong = std::min(5.0, util * util / std::max(1e-3, 1.0 - util));
         double prev = m_topology.GetLinkCongestion(dpid, *peerDpid);
         double smooth = 0.7 * prev + 0.3 * cong;
@@ -975,8 +944,8 @@ void ZmqOpenFlowController::HandlePortStatsReply(
       }
     }
 
-    NS_LOG_INFO("[PORT-STATS]   port " << pno
-                << " rx=" << s->rx_bytes << "B tx=" << s->tx_bytes
+    NS_LOG_INFO("[PORT-STATS]   port "
+                << pno << " rx=" << s->rx_bytes << "B tx=" << s->tx_bytes
                 << "B rx_rate=" << ps.rx_rate_bps / 1e6 << " Mbps"
                 << " tx_rate=" << ps.tx_rate_bps / 1e6 << " Mbps");
   }
@@ -1008,7 +977,7 @@ void ZmqOpenFlowController::ComputeSwitchObservations(uint64_t dpid) {
     // the old queue-depth-derived d_ms had.
     if (cap > 0) {
       double txBps = std::max(0.0, ps.tx_rate_bps);
-      double util  = std::clamp(txBps / cap, 0.0, 0.999);
+      double util = std::clamp(txBps / cap, 0.0, 0.999);
       auto peer = m_topology.GetPeerDpid(dpid, pno);
       double baseDelayMs = peer ? m_topology.GetLinkDelay(dpid, *peer) : 1.0;
       double dMs = baseDelayMs * (util / std::max(1e-3, 1.0 - util));
@@ -1016,29 +985,27 @@ void ZmqOpenFlowController::ComputeSwitchObservations(uint64_t dpid) {
     }
     sumLBps += ps.rx_drop_rate_bps + ps.tx_drop_rate_bps;
   }
-  obs.d_ms             = maxDelayMs;
-  obs.L_bps            = sumLBps;
+  obs.d_ms = maxDelayMs;
+  obs.L_bps = sumLBps;
 
   // Drain switch forwarding energy based on total TX rate across all ports
   auto emIt = m_switchEnergyModel.find(dpid);
   if (emIt != m_switchEnergyModel.end() && emIt->second.initial_energy_j >= 0) {
     double totalTxBps = 0.0;
-    for (const auto& [pno2, ps2] : psIt->second)
-      totalTxBps += ps2.tx_rate_bps;
+    for (const auto& [pno2, ps2] : psIt->second) totalTxBps += ps2.tx_rate_bps;
     double bytesForwarded = (totalTxBps / 8.0) * m_statsIntervalS;
     auto reIt = m_switchResidualEnergy.find(dpid);
     if (reIt != m_switchResidualEnergy.end()) {
-      reIt->second = std::max(0.0, reIt->second -
-                                   bytesForwarded * emIt->second.energy_per_byte_j);
+      reIt->second = std::max(
+          0.0, reIt->second - bytesForwarded * emIt->second.energy_per_byte_j);
       obs.residual_energy_j = reIt->second;
     }
   }
 
   m_switchObs[dpid] = obs;
-  NS_LOG_INFO("[OBS] Switch " << dpid
-              << " d_max=" << obs.d_ms << "ms"
-              << " L=" << obs.L_bps / 1e6 << "Mbps"
-              << " E=" << obs.residual_energy_j << "J");
+  NS_LOG_INFO("[OBS] Switch " << dpid << " d_max=" << obs.d_ms << "ms"
+                              << " L=" << obs.L_bps / 1e6 << "Mbps"
+                              << " E=" << obs.residual_energy_j << "J");
 }
 
 // ------------------------------------------------------------------
@@ -1273,7 +1240,7 @@ void ZmqOpenFlowController::WriteStateToJson() {
   json << "  \"hosts\": [";
   first = true;
   for (const auto& kv : m_macToLoc) {
-    uint64_t mac  = kv.first;
+    uint64_t mac = kv.first;
     uint64_t dpid = kv.second.first;
     uint32_t port = kv.second.second;
 
@@ -1307,9 +1274,10 @@ void ZmqOpenFlowController::WriteStateToJson() {
   first = true;
   for (const auto& link : m_topology.GetAllLinks()) {
     if (!first) json << ", ";
-    double deltaPct = (link.base_cost > 0)
-                          ? ((link.cost - link.base_cost) / link.base_cost) * 100.0
-                          : 0.0;
+    double deltaPct =
+        (link.base_cost > 0)
+            ? ((link.cost - link.base_cost) / link.base_cost) * 100.0
+            : 0.0;
     json << "\n    {\n";
     json << "      \"src_dpid\": " << link.src_dpid << ",\n";
     json << "      \"src_port\": " << link.src_port << ",\n";
@@ -1337,22 +1305,23 @@ void ZmqOpenFlowController::WriteStateToJson() {
       const PortStatsEntry& ps = port_kv.second;
       if (!first_port) json << ", ";
       json << "\n      \"" << port_kv.first << "\": {\n";
-      json << "        \"rx_packets\": "  << ps.rx_packets  << ",\n";
-      json << "        \"tx_packets\": "  << ps.tx_packets  << ",\n";
-      json << "        \"rx_bytes\": "    << ps.rx_bytes    << ",\n";
-      json << "        \"tx_bytes\": "    << ps.tx_bytes    << ",\n";
-      json << "        \"rx_dropped\": "  << ps.rx_dropped  << ",\n";
-      json << "        \"tx_dropped\": "  << ps.tx_dropped  << ",\n";
-      json << "        \"rx_errors\": "   << ps.rx_errors   << ",\n";
-      json << "        \"tx_errors\": "   << ps.tx_errors   << ",\n";
+      json << "        \"rx_packets\": " << ps.rx_packets << ",\n";
+      json << "        \"tx_packets\": " << ps.tx_packets << ",\n";
+      json << "        \"rx_bytes\": " << ps.rx_bytes << ",\n";
+      json << "        \"tx_bytes\": " << ps.tx_bytes << ",\n";
+      json << "        \"rx_dropped\": " << ps.rx_dropped << ",\n";
+      json << "        \"tx_dropped\": " << ps.tx_dropped << ",\n";
+      json << "        \"rx_errors\": " << ps.rx_errors << ",\n";
+      json << "        \"tx_errors\": " << ps.tx_errors << ",\n";
       json << "        \"duration_sec\": " << ps.duration_sec << ",\n";
       json << "        \"rx_rate_bps\": " << ps.rx_rate_bps << ",\n";
       json << "        \"tx_rate_bps\": " << ps.tx_rate_bps << ",\n";
       json << "        \"rx_drop_rate_bps\": " << ps.rx_drop_rate_bps << ",\n";
       json << "        \"tx_drop_rate_bps\": " << ps.tx_drop_rate_bps << ",\n";
-      json << "        \"q_tx_errors\": "         << ps.q_tx_errors         << ",\n";
-      json << "        \"q_tx_error_rate_pps\": " << ps.q_tx_error_rate_pps << ",\n";
-      json << "        \"speed_kbps\": "  << ps.speed_kbps  << "\n";
+      json << "        \"q_tx_errors\": " << ps.q_tx_errors << ",\n";
+      json << "        \"q_tx_error_rate_pps\": " << ps.q_tx_error_rate_pps
+           << ",\n";
+      json << "        \"speed_kbps\": " << ps.speed_kbps << "\n";
       json << "      }";
       first_port = false;
     }
@@ -1373,8 +1342,8 @@ void ZmqOpenFlowController::WriteStateToJson() {
     if (!first) json << ", ";
     const SwitchObservation& o = kv.second;
     json << "\n    \"" << kv.first << "\": {\n";
-    json << "      \"d_ms\": "             << o.d_ms             << ",\n";
-    json << "      \"L_bps\": "            << o.L_bps            << ",\n";
+    json << "      \"d_ms\": " << o.d_ms << ",\n";
+    json << "      \"L_bps\": " << o.L_bps << ",\n";
     if (o.residual_energy_j >= 0)
       json << "      \"residual_energy_j\": " << o.residual_energy_j << "\n";
     else
@@ -1390,15 +1359,13 @@ void ZmqOpenFlowController::WriteStateToJson() {
   // src→dst and dst→src explicitly to capture one-way flows correctly.
   json << "  \"atvm\": [";
   first = true;
-  auto emitAtvm = [&](uint64_t srcDpid, uint32_t srcPort,
-                       uint64_t dstDpid) {
+  auto emitAtvm = [&](uint64_t srcDpid, uint32_t srcPort, uint64_t dstDpid) {
     auto psIt = m_portStats.find(srcDpid);
     if (psIt == m_portStats.end()) return;
     auto ppIt = psIt->second.find(srcPort);
     if (ppIt == psIt->second.end()) return;
     if (!first) json << ", ";
-    json << "\n    {\"src\": " << srcDpid
-         << ", \"dst\": " << dstDpid
+    json << "\n    {\"src\": " << srcDpid << ", \"dst\": " << dstDpid
          << ", \"tx_bps\": " << ppIt->second.tx_rate_bps << "}";
     first = false;
   };
@@ -1452,7 +1419,7 @@ void ZmqOpenFlowController::MlOpenSocket() {
     // Short timeouts so a missing Python service can never stall the sim.
     m_mlSock->set(zmq::sockopt::rcvtimeo, 200);
     m_mlSock->set(zmq::sockopt::sndtimeo, 200);
-    m_mlSock->set(zmq::sockopt::linger,   0);
+    m_mlSock->set(zmq::sockopt::linger, 0);
     // REQ sockets normally lock send→recv→send into strict alternation; on a
     // recv timeout the next send would EFSM. REQ_RELAXED + REQ_CORRELATE let
     // us resend after a missed reply (necessary when Python is down).
@@ -1462,7 +1429,7 @@ void ZmqOpenFlowController::MlOpenSocket() {
     NS_LOG_INFO("[ML] Connected ZMQ REQ to " << m_ml.endpoint);
   } catch (const std::exception& e) {
     NS_LOG_WARN("[ML] Failed to open ZMQ socket: " << e.what()
-                << " — agent will be inert");
+                                                   << " — agent will be inert");
     m_mlSock.reset();
     m_mlCtx.reset();
   }
@@ -1477,8 +1444,8 @@ void ZmqOpenFlowController::MlSendHello() {
   // num_switches / num_links let the Python side allocate buffers and verify
   // payload shape at runtime. action_dim still maps 1:1 to m_mlLinkOrder.
   size_t numSwitches = m_mlNodeOrder.size();
-  size_t numLinks    = m_mlLinkOrder.size();
-  size_t actionDim   = numLinks;
+  size_t numLinks = m_mlLinkOrder.size();
+  size_t actionDim = numLinks;
 
   std::ostringstream hello;
   hello << "{\"cmd\":\"hello\","
@@ -1509,8 +1476,8 @@ void ZmqOpenFlowController::MlSendHello() {
       return;
     }
     NS_LOG_INFO("[ML] hello ack: num_switches=" << numSwitches
-                << " num_links=" << numLinks
-                << " action_dim=" << actionDim);
+                                                << " num_links=" << numLinks
+                                                << " action_dim=" << actionDim);
   } catch (const std::exception& e) {
     NS_LOG_WARN("[ML] hello failed: " << e.what());
   }
@@ -1544,22 +1511,20 @@ std::string ZmqOpenFlowController::BuildMlStatePayload() {
   s << "\"per_switch\":[";
   bool firstSw = true;
   for (uint64_t dpid : m_mlNodeOrder) {
-    SwitchObservation obs = m_switchObs.count(dpid) ? m_switchObs.at(dpid)
-                                                    : SwitchObservation{};
+    SwitchObservation obs =
+        m_switchObs.count(dpid) ? m_switchObs.at(dpid) : SwitchObservation{};
     const auto& em = m_switchEnergyModel.count(dpid)
-                        ? m_switchEnergyModel.at(dpid)
-                        : SwitchEnergyModel{};
-    double energyFrac = (em.initial_energy_j > 0 && obs.residual_energy_j >= 0)
-                            ? std::clamp(obs.residual_energy_j / em.initial_energy_j,
-                                         0.0, 1.0)
-                            : 1.0;
+                         ? m_switchEnergyModel.at(dpid)
+                         : SwitchEnergyModel{};
+    double energyFrac =
+        (em.initial_energy_j > 0 && obs.residual_energy_j >= 0)
+            ? std::clamp(obs.residual_energy_j / em.initial_energy_j, 0.0, 1.0)
+            : 1.0;
     double rttNs = m_echoRttNs.count(dpid) ? m_echoRttNs.at(dpid) : 0;
 
     if (!firstSw) s << ",";
-    s << "{\"dpid\":" << dpid
-      << ",\"depletion\":" << (1.0 - energyFrac)
-      << ",\"echo_rtt_ns\":" << rttNs
-      << "}";
+    s << "{\"dpid\":" << dpid << ",\"depletion\":" << (1.0 - energyFrac)
+      << ",\"echo_rtt_ns\":" << rttNs << "}";
     firstSw = false;
   }
   s << "],";
@@ -1570,15 +1535,16 @@ std::string ZmqOpenFlowController::BuildMlStatePayload() {
   // stability); Python uses the src_* fields for the canonical edge_attr
   // and the dst_* fields for the reverse-direction edge in bidirectional
   // message passing.
-  auto findDirStats = [&](uint64_t srcDpid, uint64_t dstDpid,
-                          double& txBpsOut, double& dropRateBpsOut) {
-    txBpsOut = 0.0; dropRateBpsOut = 0.0;
+  auto findDirStats = [&](uint64_t srcDpid, uint64_t dstDpid, double& txBpsOut,
+                          double& dropRateBpsOut) {
+    txBpsOut = 0.0;
+    dropRateBpsOut = 0.0;
     auto psIt = m_portStats.find(srcDpid);
     if (psIt == m_portStats.end()) return;
     for (const auto& [pno, ps] : psIt->second) {
       auto peer = m_topology.GetPeerDpid(srcDpid, pno);
       if (peer && *peer == dstDpid) {
-        txBpsOut       += ps.tx_rate_bps;
+        txBpsOut += ps.tx_rate_bps;
         dropRateBpsOut += ps.tx_drop_rate_bps;
       }
     }
@@ -1587,11 +1553,11 @@ std::string ZmqOpenFlowController::BuildMlStatePayload() {
   s << "\"per_link\":[";
   bool firstLink = true;
   for (const auto& [a, b] : m_mlLinkOrder) {
-    double cost     = m_topology.GetLinkCost(a, b);
+    double cost = m_topology.GetLinkCost(a, b);
     double baseCost = m_topology.GetBaseLinkCost(a, b);
-    double cap      = std::max(m_topology.GetLinkCapacityBps(a, b),
-                               m_topology.GetLinkCapacityBps(b, a));
-    double delayMs  = m_topology.GetLinkDelay(a, b);
+    double cap = std::max(m_topology.GetLinkCapacityBps(a, b),
+                          m_topology.GetLinkCapacityBps(b, a));
+    double delayMs = m_topology.GetLinkDelay(a, b);
 
     double srcTxBps = 0, dstTxBps = 0;
     double srcDropRateBps = 0, dstDropRateBps = 0;
@@ -1602,23 +1568,18 @@ std::string ZmqOpenFlowController::BuildMlStatePayload() {
     double dstUtil = (cap > 0) ? (dstTxBps / cap) : 0.0;
 
     if (!firstLink) s << ",";
-    s << "{\"src\":" << a << ",\"dst\":" << b
+    s << "{\"src\":" << a << ",\"dst\":"
+      << b
       // tx_bps / utilization are aliases for the src-direction (a→b) and
       // kept for backward-compat with non-ML consumers (visualizer, JSON
       // dumpers). Python ML reads src_* / dst_* explicitly for asymmetry.
-      << ",\"tx_bps\":" << srcTxBps
-      << ",\"capacity_bps\":" << cap
-      << ",\"utilization\":" << srcUtil
-      << ",\"cost\":" << cost
-      << ",\"base_cost\":" << baseCost
-      << ",\"delay_ms\":" << delayMs
-      << ",\"src_tx_bps\":"        << srcTxBps
-      << ",\"src_utilization\":"   << srcUtil
+      << ",\"tx_bps\":" << srcTxBps << ",\"capacity_bps\":" << cap
+      << ",\"utilization\":" << srcUtil << ",\"cost\":" << cost
+      << ",\"base_cost\":" << baseCost << ",\"delay_ms\":" << delayMs
+      << ",\"src_tx_bps\":" << srcTxBps << ",\"src_utilization\":" << srcUtil
       << ",\"src_drop_rate_bps\":" << srcDropRateBps
-      << ",\"dst_tx_bps\":"        << dstTxBps
-      << ",\"dst_utilization\":"   << dstUtil
-      << ",\"dst_drop_rate_bps\":" << dstDropRateBps
-      << "}";
+      << ",\"dst_tx_bps\":" << dstTxBps << ",\"dst_utilization\":" << dstUtil
+      << ",\"dst_drop_rate_bps\":" << dstDropRateBps << "}";
     firstLink = false;
   }
   s << "],";
@@ -1635,7 +1596,10 @@ double ZmqOpenFlowController::ComputeMlReward() {
   double currDelay = 0.0;
   uint32_t currN = 0;
   for (const auto& [dpid, o] : m_switchObs) {
-    if (o.d_ms > 0) { currDelay += o.d_ms; ++currN; }
+    if (o.d_ms > 0) {
+      currDelay += o.d_ms;
+      ++currN;
+    }
   }
   double meanCurr = (currN > 0) ? (currDelay / currN) : 0.0;
   double delayRef = std::max(1.0, m_ml.delay_ref_ms);
@@ -1700,7 +1664,8 @@ double ZmqOpenFlowController::ComputeMlReward() {
   uint32_t activeCount = 0;
   for (const auto& [dpid, sw] : m_switchMap) {
     auto it = switchTxBps.find(dpid);
-    if (it != switchTxBps.end() && it->second >= kActiveThresholdBps) ++activeCount;
+    if (it != switchTxBps.end() && it->second >= kActiveThresholdBps)
+      ++activeCount;
   }
   double totalSw = std::max<size_t>(1, m_switchMap.size());
   double footprintPenalty = static_cast<double>(activeCount) / totalSw;
@@ -1715,10 +1680,12 @@ double ZmqOpenFlowController::ComputeMlReward() {
     for (const auto& [dpid, tx] : switchTxBps) {
       double frac = 1.0;
       auto emIt = m_switchEnergyModel.find(dpid);
-      if (emIt != m_switchEnergyModel.end() && emIt->second.initial_energy_j > 0) {
+      if (emIt != m_switchEnergyModel.end() &&
+          emIt->second.initial_energy_j > 0) {
         auto reIt = m_switchResidualEnergy.find(dpid);
         if (reIt != m_switchResidualEnergy.end())
-          frac = std::clamp(reIt->second / emIt->second.initial_energy_j, 0.0, 1.0);
+          frac = std::clamp(reIt->second / emIt->second.initial_energy_j, 0.0,
+                            1.0);
       }
       double share = tx / totalTxBps;
       double depletion = 1.0 - frac;
@@ -1735,13 +1702,11 @@ double ZmqOpenFlowController::ComputeMlReward() {
   double balancePenalty = std::clamp(2.0 * stddevResidual, 0.0, 1.0);
 
   // ---- Combine ----
-  double R =   m_ml.reward_alpha * delayQuality
-             + m_ml.reward_beta  * lossQuality
-             - m_ml.reward_gamma * powerCost
-             - m_ml.reward_delta * utilPenalty
-             - m_ml.reward_zeta  * footprintPenalty
-             - m_ml.reward_eta   * reserveAwarePenalty
-             - m_ml.reward_theta * balancePenalty;
+  double R = m_ml.reward_alpha * delayQuality + m_ml.reward_beta * lossQuality -
+             m_ml.reward_gamma * powerCost - m_ml.reward_delta * utilPenalty -
+             m_ml.reward_zeta * footprintPenalty -
+             m_ml.reward_eta * reserveAwarePenalty -
+             m_ml.reward_theta * balancePenalty;
 
   // Affine min-max scale R into [-1, 1] using the analytic bounds. Every term
   // above is clamped to [0, 1] individually, so R is bounded by:
@@ -1749,11 +1714,12 @@ double ZmqOpenFlowController::ComputeMlReward() {
   //   R_min = -(gamma + delta + zeta + eta + theta)
   // Linear rescale is a bijection over this range — distinct R values stay
   // distinct in R_norm, so the Critic still sees gradient between "mildly
-  // bad" and "catastrophic" rewards (vs. a hard clamp which would flatten them).
+  // bad" and "catastrophic" rewards (vs. a hard clamp which would flatten
+  // them).
   const double posBound = m_ml.reward_alpha + m_ml.reward_beta;
-  const double negBound = m_ml.reward_gamma + m_ml.reward_delta
-                        + m_ml.reward_zeta  + m_ml.reward_eta
-                        + m_ml.reward_theta;
+  const double negBound = m_ml.reward_gamma + m_ml.reward_delta +
+                          m_ml.reward_zeta + m_ml.reward_eta +
+                          m_ml.reward_theta;
   const double span = posBound + negBound;
   double R_norm;
   if (span > 0.0) {
@@ -1767,13 +1733,11 @@ double ZmqOpenFlowController::ComputeMlReward() {
     R_norm = std::clamp(R_norm, -1.0, 1.0);
   }
 
-  NS_LOG_DEBUG("[ML] reward tick=" << m_mlTick
-               << " R=" << R << " R_norm=" << R_norm
-               << " d=" << delayQuality << " l=" << lossQuality
-               << " p=" << powerCost     << " u=" << utilPenalty
-               << " f=" << footprintPenalty
-               << " e=" << reserveAwarePenalty
-               << " b=" << balancePenalty
+  NS_LOG_DEBUG("[ML] reward tick="
+               << m_mlTick << " R=" << R << " R_norm=" << R_norm << " d="
+               << delayQuality << " l=" << lossQuality << " p=" << powerCost
+               << " u=" << utilPenalty << " f=" << footprintPenalty
+               << " e=" << reserveAwarePenalty << " b=" << balancePenalty
                << " | P_W=" << currPowerW << " stddev=" << stddevResidual);
   return R_norm;
 }
@@ -1794,7 +1758,10 @@ double ZmqOpenFlowController::ComputeResidualEnergyStddev() const {
   for (double f : fracs) mean += f;
   mean /= fracs.size();
   double var = 0.0;
-  for (double f : fracs) { double d = f - mean; var += d * d; }
+  for (double f : fracs) {
+    double d = f - mean;
+    var += d * d;
+  }
   var /= fracs.size();
   return std::sqrt(var);
 }
@@ -1804,8 +1771,8 @@ double ZmqOpenFlowController::CurrentActionScale() const {
   if (m_ml.taper_ticks == 0) return m_ml.action_scale;
   if (m_mlTick >= m_ml.taper_ticks) return m_ml.action_scale;
   double t = static_cast<double>(m_mlTick) / m_ml.taper_ticks;
-  return m_ml.action_scale_start
-         + (m_ml.action_scale - m_ml.action_scale_start) * t;
+  return m_ml.action_scale_start +
+         (m_ml.action_scale - m_ml.action_scale_start) * t;
 }
 
 void ZmqOpenFlowController::ApplyDeltaCosts(const std::vector<double>& deltas) {
@@ -1814,8 +1781,10 @@ void ZmqOpenFlowController::ApplyDeltaCosts(const std::vector<double>& deltas) {
   bool anyChanged = false;
   for (size_t i = 0; i < n; ++i) {
     double d = deltas[i];
-    if (d > scale)        d = scale;
-    else if (d < -scale)  d = -scale;
+    if (d > scale)
+      d = scale;
+    else if (d < -scale)
+      d = -scale;
 
     auto [a, b] = m_mlLinkOrder[i];
     double prev = m_topology.GetLinkMlDelta(a, b);
@@ -1854,7 +1823,8 @@ void ZmqOpenFlowController::MlTick() {
       if (a > b) std::swap(a, b);
       m_mlLinkOrder.push_back({a, b});
     }
-    NS_LOG_INFO("[ML] Frozen node order: " << m_mlNodeOrder.size() << " switches"
+    NS_LOG_INFO("[ML] Frozen node order: "
+                << m_mlNodeOrder.size() << " switches"
                 << ", link order: " << m_mlLinkOrder.size() << " links");
     MlSendHello();
   }
@@ -1879,46 +1849,43 @@ void ZmqOpenFlowController::MlTick() {
         if (!rres) {
           NS_LOG_WARN("[ML] ZMQ recv timed out — skipping action this tick");
         } else {
-        // Minimal JSON parse: scan for "action":[ ... ] and split on commas.
-        std::string body(static_cast<const char*>(reply.data()), reply.size());
-        std::vector<double> action;
-        auto k = body.find("\"action\"");
-        if (k != std::string::npos) {
-          auto lb = body.find('[', k);
-          auto rb = body.find(']', lb);
-          if (lb != std::string::npos && rb != std::string::npos && rb > lb) {
-            std::string arr = body.substr(lb + 1, rb - lb - 1);
-            std::stringstream ss(arr);
-            std::string tok;
-            while (std::getline(ss, tok, ',')) {
-              try { action.push_back(std::stod(tok)); } catch (...) {}
+          // Minimal JSON parse: scan for "action":[ ... ] and split on commas.
+          std::string body(static_cast<const char*>(reply.data()),
+                           reply.size());
+          std::vector<double> action;
+          auto k = body.find("\"action\"");
+          if (k != std::string::npos) {
+            auto lb = body.find('[', k);
+            auto rb = body.find(']', lb);
+            if (lb != std::string::npos && rb != std::string::npos && rb > lb) {
+              std::string arr = body.substr(lb + 1, rb - lb - 1);
+              std::stringstream ss(arr);
+              std::string tok;
+              while (std::getline(ss, tok, ',')) {
+                try {
+                  action.push_back(std::stod(tok));
+                } catch (...) {
+                }
+              }
             }
           }
-        }
-        if (!action.empty()) {
-          ApplyDeltaCosts(action);
-        }
+          if (!action.empty()) {
+            ApplyDeltaCosts(action);
+          }
         }  // end inner else (recv ok)
-      }    // end outer else (send ok)
+      }  // end outer else (send ok)
     } catch (const std::exception& e) {
       NS_LOG_WARN("[ML] ZMQ exchange failed: " << e.what());
     }
   }
 
   // Snapshot for next tick's reward computation.
-  m_mlPrevObs       = m_switchObs;
-  m_mlHavePrevObs   = true;
+  m_mlPrevObs = m_switchObs;
+  m_mlHavePrevObs = true;
   m_mlTick++;
 
-  // ---- Safety clamp & rollback (stubbed; flip on later). ----
-  // Trigger condition: mean L_bps triples within 3 ticks → ResetLinkCosts()
-  // + skip 5 ticks. Easy to wire when we have a stable baseline.
-#if 0
-  MaybeRollback();
-#endif
-
-  Simulator::Schedule(Seconds(m_ml.interval_s),
-                      &ZmqOpenFlowController::MlTick, this);
+  Simulator::Schedule(Seconds(m_ml.interval_s), &ZmqOpenFlowController::MlTick,
+                      this);
 }
 
 }  // namespace ns3

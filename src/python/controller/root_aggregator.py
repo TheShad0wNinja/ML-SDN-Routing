@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import math
 import re
 import sys
 import time
@@ -90,7 +91,7 @@ def _average_state_dicts(sds: list[dict]) -> dict:
 
 
 def _l2(sd: dict) -> float:
-    return float(sum(t.float().pow(2).sum() for t in sd.values()).sqrt())
+    return math.sqrt(sum(t.float().pow(2).sum().item() for t in sd.values()))
 
 
 def _shapes_match(sds: list[dict]) -> bool:

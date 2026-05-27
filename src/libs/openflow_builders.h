@@ -1,6 +1,7 @@
 #ifndef OPENFLOW_BUILDERS_H
 #define OPENFLOW_BUILDERS_H
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -63,6 +64,11 @@ struct ofl_msg_header* BuildLldpPacketOut(uint32_t portNo,
 struct ofl_msg_header* BuildPortStatsRequest();
 struct ofl_msg_header* BuildPortDescRequest();
 struct ofl_msg_header* BuildQueueStatsRequest();
+
+std::array<uint8_t, 60> BuildArpReply(uint64_t targetMac,
+                                      uint32_t targetIp,
+                                      uint64_t requesterMac,
+                                      uint32_t requesterIp);
 
 } // namespace ns3
 
