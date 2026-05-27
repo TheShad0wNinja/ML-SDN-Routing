@@ -52,7 +52,6 @@ void ZmqOpenFlowController::DoDispose() {
   m_macToLoc.clear();
   m_switchPorts.clear();
   m_portStats.clear();
-  m_portSpeeds.clear();
   m_switchObs.clear();
   m_hostAnnotations.clear();
   m_switchEnergyModel.clear();
@@ -62,19 +61,6 @@ void ZmqOpenFlowController::DoDispose() {
   m_spanningTree.clear();
   m_lldpSendNs.clear();
   m_topology = Topology();
-
-  if (m_socket) {
-    try {
-      m_socket->close();
-    } catch (...) {
-    }
-  }
-  if (m_zmqContext) {
-    try {
-      m_zmqContext->close();
-    } catch (...) {
-    }
-  }
 
   if (m_mlSock) {
     try {
@@ -140,26 +126,37 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
     return;
   }
 
-  // Apply priority preset — overwrites individual weights unless preset is
-  // "custom". The user can still override individual weights after calling
-  // SetMlConfig if needed; the typical flow is preset-or-custom, not both.
-  if (m_ml.priority_preset == "balanced") {
-    m_ml.reward_alpha = 1.0;  m_ml.reward_beta  = 2.0;
-    m_ml.reward_gamma = 1.5;  m_ml.reward_delta = 1.0;
-    m_ml.reward_zeta  = 0.5;  m_ml.reward_eta   = 1.5;
-    m_ml.reward_theta = 1.0;
-  } else if (m_ml.priority_preset == "delay_first") {
-    m_ml.reward_alpha = 2.5;  m_ml.reward_beta  = 3.0;
-    m_ml.reward_gamma = 0.5;  m_ml.reward_delta = 1.0;
-    m_ml.reward_zeta  = 0.2;  m_ml.reward_eta   = 0.8;
-    m_ml.reward_theta = 0.5;
-  } else if (m_ml.priority_preset == "energy_first") {
-    m_ml.reward_alpha = 1.0;  m_ml.reward_beta  = 2.0;   // pos bound = 3.0
-    m_ml.reward_gamma = 2.0;  m_ml.reward_delta = 0.5;
-    m_ml.reward_zeta  = 1.0;  m_ml.reward_eta   = 2.5;
-    m_ml.reward_theta = 1.5;                              // neg bound = 7.5
+  // Apply priority preset unless it' scustom
+  switch(cfg.priority_preset){
+    case MlConfig::MlPriority::BALANCED: {
+      m_ml.reward_alpha = 1.0;
+      m_ml.reward_beta = 2.0;
+      m_ml.reward_gamma = 1.5;
+      m_ml.reward_delta = 1.0;
+      m_ml.reward_zeta = 0.5;
+      m_ml.reward_eta = 1.5;
+      m_ml.reward_theta = 1.0;
+    }
+    case MlConfig::MlPriority::THROUGHPUT: {
+      m_ml.reward_alpha = 2.5;
+      m_ml.reward_beta = 3.0;
+      m_ml.reward_gamma = 0.5;
+      m_ml.reward_delta = 1.0;
+      m_ml.reward_zeta = 0.2;
+      m_ml.reward_eta = 0.8;
+      m_ml.reward_theta = 0.5;
+    }
+    case MlConfig::MlPriority::ENERGY: {
+      m_ml.reward_alpha = 1.0;
+      m_ml.reward_beta = 2.0;  // pos bound = 3.0
+      m_ml.reward_gamma = 2.0;
+      m_ml.reward_delta = 0.5;
+      m_ml.reward_zeta = 1.0;
+      m_ml.reward_eta = 2.5;
+      m_ml.reward_theta = 1.5;  // neg bound = 7.5
+    }
+    default: break;
   }
-  // Any other value (including "custom") leaves the weights as-passed.
 
   NS_LOG_INFO("[ML] preset=" << m_ml.priority_preset
               << " α=" << m_ml.reward_alpha << " β=" << m_ml.reward_beta
@@ -545,14 +542,28 @@ void ZmqOpenFlowController::HandleLldpPacket(uint64_t dpid, uint32_t inPort,
     }
   }
 
-  // Capacity isn't known until PORT_STATS arrives; seed base_cost from delay
-  // with the 10 Mbps capacity floor in ComputeBaseCost, then refine later.
-  double baseCost = ComputeBaseCost(delayMs, 0.0);
+  // Use real capacity from PORT_DESC if already received; fall back to 10 Mbps
+  // floor so ComputeBaseCost is always finite.
+  auto getSpeed = [&](uint64_t sw, uint32_t pno) -> uint32_t {
+    auto sit = m_portStats.find(sw);
+    if (sit == m_portStats.end()) return 0;
+    auto pit = sit->second.find(pno);
+    return (pit == sit->second.end()) ? 0 : pit->second.speed_kbps;
+  };
+  uint32_t kbps = getSpeed(dpid, inPort);
+  if (!kbps) kbps = getSpeed(chassis_id, port_id);
+  double capBps = kbps ? static_cast<double>(kbps) * 1000.0 : 0.0;
+  double baseCost = ComputeBaseCost(delayMs, capBps);
   NS_LOG_DEBUG("[TRACE] HandleLldp t=" << Simulator::Now().GetSeconds()
                << " " << chassis_id << ":" << port_id << " <-> " << dpid
                << ":" << inPort << " before AddLink");
   bool changed = m_topology.AddLink(chassis_id, port_id, dpid, inPort, delayMs, baseCost);
   NS_LOG_DEBUG("[TRACE] HandleLldp after AddLink changed=" << changed);
+  if (changed && capBps > 0) {
+    NS_LOG_INFO("CHANGING LINK CAPACITY");
+    m_topology.SetLinkCapacityBps(chassis_id, dpid, capBps);
+    m_topology.SetLinkBaseCost(chassis_id, dpid, baseCost);
+  }
   if (changed) {
     NS_LOG_DEBUG("[TRACE] HandleLldp before RebuildSpanningTree");
     RebuildSpanningTree();
@@ -560,7 +571,7 @@ void ZmqOpenFlowController::HandleLldpPacket(uint64_t dpid, uint32_t inPort,
   }
   NS_LOG_INFO("[TOPO] Link: " << chassis_id << ":" << port_id << " <-> " << dpid
                               << ":" << inPort << " delay=" << delayMs
-                              << "ms base_cost=" << baseCost);
+                              << "ms base_cost=" << baseCost << " cap=" << capBps / 1e6 << "Mbps");
 
   NS_LOG_DEBUG("[TRACE] HandleLldp before macToLoc flush size="
                << m_macToLoc.size());
@@ -822,18 +833,20 @@ ofl_err ZmqOpenFlowController::HandlePortStatus(struct ofl_msg_port_status* msg,
 
 void ZmqOpenFlowController::HandlePortDescReply(
     struct ofl_msg_multipart_reply_port_desc* reply, uint64_t dpid) {
-  NS_LOG_INFO("[PORT-DESC] Switch " << dpid << ": " << reply->stats_num << " ports");
+  NS_LOG_INFO("[PORT-DESC] Switch " << dpid << ": " << reply->stats_num
+                                    << " ports");
+
   for (size_t i = 0; i < reply->stats_num; ++i) {
     uint32_t pno = reply->stats[i]->port_no;
-    if (pno < OFPP_MAX) {
-      m_switchPorts[dpid].insert(pno);
-      uint32_t kbps = reply->stats[i]->curr_speed;
-      m_portSpeeds[dpid][pno] = kbps;
-      m_portStats[dpid][pno].speed_kbps = kbps;
-      NS_LOG_INFO("[PORT-DESC]   port " << pno
-                  << " name=" << (reply->stats[i]->name ? reply->stats[i]->name : "?")
-                  << " speed=" << kbps << " kbps");
-    }
+    if (pno >= OFPP_MAX) continue;
+    m_switchPorts[dpid].insert(pno);
+
+    uint32_t kbps = reply->stats[i]->curr_speed;
+    m_portStats[dpid][pno].speed_kbps = kbps;
+    NS_LOG_INFO("[PORT-DESC]   port "
+                << pno << " name="
+                << (reply->stats[i]->name ? reply->stats[i]->name : "?")
+                << " speed=" << kbps << " kbps");
   }
   InstallOrUpdateFloodGroup(dpid);
 }
@@ -945,25 +958,11 @@ void ZmqOpenFlowController::HandlePortStatsReply(
     ps.tx_errors   = s->tx_errors;
     ps.duration_sec = s->duration_sec;
 
-    // Backfill speed from PORT_DESC cache
-    auto spIt = m_portSpeeds.find(dpid);
-    if (spIt != m_portSpeeds.end()) {
-      auto pIt = spIt->second.find(pno);
-      if (pIt != spIt->second.end()) ps.speed_kbps = pIt->second;
-    }
-
-    // Stash the egress capacity into Topology so the ML state payload can
-    // emit per-link absolute headroom even on ticks where stats arrive late.
     if (ps.speed_kbps > 0) {
       auto peerDpid = m_topology.GetPeerDpid(dpid, pno);
       if (peerDpid) {
-        double capBps = static_cast<double>(ps.speed_kbps) * 1000.0;
-        m_topology.SetLinkCapacityBps(dpid, *peerDpid, capBps);
-        // Refine base_cost now that we know real capacity.
-        m_topology.SetLinkBaseCost(dpid, *peerDpid,
-            ComputeBaseCost(m_topology.GetLinkDelay(dpid, *peerDpid), capBps));
-
         // Derive congestion factor from utilization with EWMA smoothing.
+        double capBps = static_cast<double>(ps.speed_kbps) * 1000.0;
         double util = std::clamp(ps.tx_rate_bps / std::max(1.0, capBps), 0.0, 0.99);
         double cong = std::min(5.0, util * util / std::max(1e-3, 1.0 - util));
         double prev = m_topology.GetLinkCongestion(dpid, *peerDpid);

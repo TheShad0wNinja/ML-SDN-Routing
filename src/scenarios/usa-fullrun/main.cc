@@ -512,7 +512,14 @@ int main(int argc, char* argv[]) {
     cfg.action_scale = mlActionScale;
     cfg.action_scale_start = mlActionScaleStart;
     cfg.taper_ticks = mlTaperTicks;
-    cfg.priority_preset = mlPriority;
+    if (mlPriority == "throughput")
+      cfg.priority_preset = MlConfig::MlPriority::THROUGHPUT;
+    else if (mlPriority == "energy")
+      cfg.priority_preset = MlConfig::MlPriority::ENERGY;
+    else if (mlPriority == "custom")
+      cfg.priority_preset = MlConfig::MlPriority::CUSTOM;
+    else
+      cfg.priority_preset = MlConfig::MlPriority::BALANCED;
     cfg.explore = mlExplore;
     cfg.checkpoint_every_n_ticks = mlCheckpointEveryNTicks;
     cfg.resume = mlResume;

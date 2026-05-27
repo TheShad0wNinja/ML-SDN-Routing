@@ -961,8 +961,7 @@ int main(int argc, char* argv[]) {
   double mlDelayRef = 200.0;
   double mlLossRef = 1.0e6;
   double mlPowerRef = 90000.0;
-  // "balanced" | "delay_first" | "energy_first" | "custom"
-  std::string mlPriority = "balanced";
+  MlConfig::MlPriority mlPriority = MlConfig::MlPriority::BALANCED;
   bool mlExplore = true;
   uint32_t mlCheckpointEveryNTicks = 60;
   bool mlResume = true;
@@ -1007,9 +1006,10 @@ int main(int argc, char* argv[]) {
                mlActionScaleStart);
   cmd.AddValue("mlTaperTicks", "Ticks over which action_scale tapers",
                mlTaperTicks);
+  std::string mlPriorityStr = "balanced";
   cmd.AddValue("mlPriority",
-               "Reward preset: balanced | delay_first | energy_first | custom",
-               mlPriority);
+               "Reward preset: balanced | throughput | energy | custom",
+               mlPriorityStr);
   cmd.AddValue("mlAlpha", "Reward weight α (delay quality)", mlAlpha);
   cmd.AddValue("mlBeta", "Reward weight β (loss quality)", mlBeta);
   cmd.AddValue("mlGamma", "Reward weight γ (power-consumption penalty)", mlGamma);
@@ -1039,6 +1039,15 @@ int main(int argc, char* argv[]) {
                "(empty = whole topology)",
                sectionNodes);
   cmd.Parse(argc, argv);
+
+  if (mlPriorityStr == "throughput")
+    mlPriority = MlConfig::MlPriority::THROUGHPUT;
+  else if (mlPriorityStr == "energy")
+    mlPriority = MlConfig::MlPriority::ENERGY;
+  else if (mlPriorityStr == "custom")
+    mlPriority = MlConfig::MlPriority::CUSTOM;
+  else
+    mlPriority = MlConfig::MlPriority::BALANCED;
 
   RngSeedManager::SetSeed(seed);
 
