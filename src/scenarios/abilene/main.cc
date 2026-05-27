@@ -492,6 +492,11 @@ int main(int argc, char* argv[]) {
   if (g_pingRx > 0) {
     std::cout << "  Avg RTT     : " << (g_rttSumMs / g_pingRx) << " ms" << std::endl;
   }
+  // No FlowMonitor in this scenario; emit 0 jitter so summary.csv stays
+  // schema-stable across topologies.
+  std::cout << "  Avg jitter  : 0 ms" << std::endl;
+  std::cout << "  Avg hops    : " << controllerApp->GetAverageHopCount()
+            << std::endl;
 
   Simulator::Destroy();
   NS_LOG_INFO("Simulation Complete.");

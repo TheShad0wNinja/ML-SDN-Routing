@@ -321,10 +321,79 @@ void ZmqOpenFlowController::InstallFlow(uint64_t dpid, uint64_t dstMac,
                                         uint32_t outPort) {
   std::string macStr = FormatMac(dstMac);
   std::ostringstream cmd;
-  cmd << "flow-mod cmd=add,table=0,prio=100,idle=30 eth_dst=" << macStr
+  // No idle timeout. Path freshness is maintained explicitly by
+  // RecomputeAllRoutes (called when ML applies cost deltas) and by
+  // PreInstallAllPaths at scenario boot. Idle expiry under sustained TCP
+  // load triggered a BOFUSS cleanup cascade that crashed simulations
+  // around the 30s mark.
+  cmd << "flow-mod cmd=add,table=0,prio=100 eth_dst=" << macStr
       << " apply:output=" << outPort;
   DpctlExecute(dpid, cmd.str());
   m_installedFlows[dpid][dstMac] = outPort;
+}
+
+// ------------------------------------------------------------------
+//  Proactive installer — see header for invariants.
+// ------------------------------------------------------------------
+void ZmqOpenFlowController::PreInstallAllPaths(
+    const std::vector<HostInfo>& hosts) {
+  for (const auto& h : hosts) {
+    m_macToLoc[h.mac] = {h.dpid, h.port};
+  }
+  uint32_t installs = 0;
+  uint32_t skips = 0;
+  for (const auto& [srcDpid, srcSw] : m_switchMap) {
+    for (const auto& h : hosts) {
+      if (srcDpid == h.dpid) {
+        InstallFlow(srcDpid, h.mac, h.port);
+        ++installs;
+        continue;
+      }
+      auto outOpt = m_topology.GetOutPort(srcDpid, h.dpid);
+      if (!outOpt) {
+        ++skips;
+        continue;
+      }
+      InstallFlow(srcDpid, h.mac, *outOpt);
+      ++installs;
+    }
+  }
+  NS_LOG_INFO("PreInstallAllPaths: installed=" << installs
+                                                << " skipped=" << skips
+                                                << " hosts=" << hosts.size()
+                                                << " switches="
+                                                << m_switchMap.size());
+}
+
+// ------------------------------------------------------------------
+//  Inter-domain (Option A) — pre-install static flow-mods routing every
+//  external MAC toward this domain's border switch, and on the border
+//  switch itself toward the inter-domain CSMA link. See header comment.
+// ------------------------------------------------------------------
+void ZmqOpenFlowController::InstallExternalHostRoutes(
+    const std::vector<ExternalHostRoute>& routes) {
+  uint32_t installs = 0;
+  uint32_t skips = 0;
+  for (const auto& r : routes) {
+    for (const auto& [srcDpid, srcSw] : m_switchMap) {
+      if (srcDpid == r.border_dpid) {
+        InstallFlow(srcDpid, r.dst_mac, r.border_out_port);
+        ++installs;
+        continue;
+      }
+      auto outOpt = m_topology.GetOutPort(srcDpid, r.border_dpid);
+      if (!outOpt) {
+        ++skips;
+        continue;
+      }
+      InstallFlow(srcDpid, r.dst_mac, *outOpt);
+      ++installs;
+    }
+  }
+  NS_LOG_INFO("InstallExternalHostRoutes: ctrl_id=" << m_ml.controller_id
+              << " routes=" << routes.size()
+              << " installs=" << installs
+              << " skips=" << skips);
 }
 
 // ------------------------------------------------------------------
@@ -381,9 +450,8 @@ void ZmqOpenFlowController::InstallOrUpdateFloodGroup(uint64_t dpid) {
 
 // Recompute next-hop for every (switch, knownDst) pair; reinstall the flow
 // only when Dijkstra has moved the path. Called from ApplyDeltaCosts so live
-// UDP flows actually follow the ML-adjusted costs instead of sitting on the
-// path that was current when the flow was first installed (idle=30 means
-// continuous flows never expire on their own).
+// flows actually follow the ML-adjusted costs instead of sitting on the
+// path that was current when the flow was first installed.
 void ZmqOpenFlowController::RecomputeAllRoutes() {
   size_t rewrites = 0;
   for (const auto& [mac, loc] : m_macToLoc) {
@@ -480,14 +548,22 @@ void ZmqOpenFlowController::HandleLldpPacket(uint64_t dpid, uint32_t inPort,
   // Capacity isn't known until PORT_STATS arrives; seed base_cost from delay
   // with the 10 Mbps capacity floor in ComputeBaseCost, then refine later.
   double baseCost = ComputeBaseCost(delayMs, 0.0);
+  std::cerr << "[TRACE] HandleLldp t=" << Simulator::Now().GetSeconds()
+            << " " << chassis_id << ":" << port_id << " <-> " << dpid
+            << ":" << inPort << " before AddLink" << std::endl;
   bool changed = m_topology.AddLink(chassis_id, port_id, dpid, inPort, delayMs, baseCost);
+  std::cerr << "[TRACE] HandleLldp after AddLink changed=" << changed << std::endl;
   if (changed) {
+    std::cerr << "[TRACE] HandleLldp before RebuildSpanningTree" << std::endl;
     RebuildSpanningTree();
+    std::cerr << "[TRACE] HandleLldp after RebuildSpanningTree" << std::endl;
   }
   NS_LOG_INFO("[TOPO] Link: " << chassis_id << ":" << port_id << " <-> " << dpid
                               << ":" << inPort << " delay=" << delayMs
                               << "ms base_cost=" << baseCost);
 
+  std::cerr << "[TRACE] HandleLldp before macToLoc flush size="
+            << m_macToLoc.size() << std::endl;
   // Flush MAC entries learned on now-confirmed switch-link ports
   for (auto mit = m_macToLoc.begin(); mit != m_macToLoc.end();) {
     if (m_topology.IsSwitchLinkPort(mit->second.first, mit->second.second))
@@ -495,6 +571,7 @@ void ZmqOpenFlowController::HandleLldpPacket(uint64_t dpid, uint32_t inPort,
     else
       ++mit;
   }
+  std::cerr << "[TRACE] HandleLldp END" << std::endl;
 
   // WriteStateToJson();
 }
@@ -771,8 +848,40 @@ ofl_err ZmqOpenFlowController::HandleMultipartReply(
   } else if (msg->type == OFPMP_PORT_STATS) {
     HandlePortStatsReply(
         reinterpret_cast<struct ofl_msg_multipart_reply_port*>(msg), dpid);
+  } else if (msg->type == OFPMP_QUEUE) {
+    HandleQueueStatsReply(
+        reinterpret_cast<struct ofl_msg_multipart_reply_queue*>(msg), dpid);
   }
   return OFSwitch13Controller::HandleMultipartReply(msg, swtch, xid);
+}
+
+void ZmqOpenFlowController::HandleQueueStatsReply(
+    struct ofl_msg_multipart_reply_queue* reply, uint64_t dpid) {
+  double nowSec = Simulator::Now().GetSeconds();
+
+  // Aggregate per-queue tx_errors (overrun drops) into a per-port total.
+  // BOFUSS reports stats per (port_no, queue_id); we sum over queue_ids
+  // because the default OFSwitch13 config uses a single queue per port,
+  // but the aggregation is correct for multi-queue configs too.
+  std::unordered_map<uint32_t, uint64_t> portTxErrors;
+  for (size_t i = 0; i < reply->stats_num; ++i) {
+    const struct ofl_queue_stats* s = reply->stats[i];
+    if (s->port_no >= OFPP_MAX) continue;
+    portTxErrors[s->port_no] += s->tx_errors;
+  }
+
+  for (const auto& [pno, errs] : portTxErrors) {
+    PortStatsEntry& ps = m_portStats[dpid][pno];
+    if (ps.prev_time_s > 0) {
+      double dt = nowSec - ps.prev_time_s;
+      if (dt > 0) {
+        ps.q_tx_error_rate_pps =
+            static_cast<double>(errs - ps.prev_q_tx_errors) / dt;
+      }
+    }
+    ps.prev_q_tx_errors = errs;
+    ps.q_tx_errors = errs;
+  }
 }
 
 void ZmqOpenFlowController::HandlePortStatsReply(
@@ -787,19 +896,43 @@ void ZmqOpenFlowController::HandlePortStatsReply(
 
     PortStatsEntry& ps = m_portStats[dpid][pno];
 
-    // Compute instantaneous bit rates
+    // Compute instantaneous bit rates AND drop byte-rates from deltas BEFORE
+    // overwriting any prev_* counters. Drop byte-rate ≈ Δdropped_pkts × avg
+    // pkt size × 8 / dt — OF1.3 stats only give us packet counts for drops,
+    // so we approximate byte size from the running average over the same window.
     double dt = (ps.prev_time_s > 0) ? (nowSec - ps.prev_time_s) : 0;
     if (dt > 0) {
       ps.rx_rate_bps = static_cast<double>(s->rx_bytes - ps.prev_rx_bytes) * 8.0 / dt;
       ps.tx_rate_bps = static_cast<double>(s->tx_bytes - ps.prev_tx_bytes) * 8.0 / dt;
       ps.rx_rate_bps = std::max(0.0, ps.rx_rate_bps);
       ps.tx_rate_bps = std::max(0.0, ps.tx_rate_bps);
+
+      uint64_t dRxPkts  = (s->rx_packets > ps.prev_rx_packets)
+                            ? (s->rx_packets - ps.prev_rx_packets) : 0;
+      uint64_t dTxPkts  = (s->tx_packets > ps.prev_tx_packets)
+                            ? (s->tx_packets - ps.prev_tx_packets) : 0;
+      uint64_t dRxDrop  = (s->rx_dropped > ps.prev_rx_dropped)
+                            ? (s->rx_dropped - ps.prev_rx_dropped) : 0;
+      uint64_t dTxDrop  = (s->tx_dropped > ps.prev_tx_dropped)
+                            ? (s->tx_dropped - ps.prev_tx_dropped) : 0;
+      double avgRxPktB  = dRxPkts > 0
+                            ? static_cast<double>(s->rx_bytes - ps.prev_rx_bytes) / dRxPkts
+                            : 0.0;
+      double avgTxPktB  = dTxPkts > 0
+                            ? static_cast<double>(s->tx_bytes - ps.prev_tx_bytes) / dTxPkts
+                            : 0.0;
+      ps.rx_drop_rate_bps = dRxDrop * avgRxPktB * 8.0 / dt;
+      ps.tx_drop_rate_bps = dTxDrop * avgTxPktB * 8.0 / dt;
     }
 
     // Update snapshot for next interval
-    ps.prev_rx_bytes = s->rx_bytes;
-    ps.prev_tx_bytes = s->tx_bytes;
-    ps.prev_time_s   = nowSec;
+    ps.prev_rx_bytes   = s->rx_bytes;
+    ps.prev_tx_bytes   = s->tx_bytes;
+    ps.prev_rx_packets = s->rx_packets;
+    ps.prev_tx_packets = s->tx_packets;
+    ps.prev_rx_dropped = s->rx_dropped;
+    ps.prev_tx_dropped = s->tx_dropped;
+    ps.prev_time_s     = nowSec;
 
     // Store all raw counters
     ps.rx_packets  = s->rx_packets;
@@ -858,7 +991,6 @@ void ZmqOpenFlowController::HandlePortStatsReply(
 
 void ZmqOpenFlowController::ComputeSwitchObservations(uint64_t dpid) {
   SwitchObservation obs;
-  obs.K = 64; // OFSwitch13 default FIFO queue depth
 
   auto psIt = m_portStats.find(dpid);
   if (psIt == m_portStats.end()) {
@@ -866,60 +998,33 @@ void ZmqOpenFlowController::ComputeSwitchObservations(uint64_t dpid) {
     return;
   }
 
-  double dropRateBps = 0;
-  double minSpeedBps = 0; // bottleneck link speed across all ports
+  double maxDelayMs = 0.0, sumLBps = 0.0;
   for (const auto& [pno, ps] : psIt->second) {
-    obs.lambda_bps += ps.rx_rate_bps; // all incoming traffic, not just host ports
-    double portSpeedBps = static_cast<double>(ps.speed_kbps) * 1000.0;
-    if (portSpeedBps > 0 && (minSpeedBps == 0 || portSpeedBps < minSpeedBps))
-      minSpeedBps = portSpeedBps;
-    // Loss rate summed over all ports
-    dropRateBps += (ps.rx_rate_bps > 0 && ps.rx_dropped > 0)
-                       ? ps.rx_rate_bps * (static_cast<double>(ps.rx_dropped) /
-                                           std::max((uint64_t)1, ps.rx_packets))
-                       : 0;
-  }
-  obs.mu_max_bps = minSpeedBps;
-
-  obs.L_bps = dropRateBps;
-  obs.rbw_bps = std::max(0.0, obs.mu_max_bps - obs.lambda_bps);
-
-  if (obs.mu_max_bps > 0) {
-    obs.rho = obs.lambda_bps / obs.mu_max_bps;
-    obs.rho = std::min(obs.rho, 0.9999); // cap for stable M/M/1
-  }
-
-  // M/M/1/K queue model (finite buffer, more accurate near saturation)
-  if (obs.rho > 0 && obs.mu_max_bps > 0) {
-    double rho = obs.rho;
-    double K   = obs.K;
-    double p0, pK;
-    if (std::abs(rho - 1.0) < 1e-9) {
-      p0 = 1.0 / (K + 1.0);
-    } else {
-      p0 = (1.0 - rho) / (1.0 - std::pow(rho, K + 1.0));
+    double cap = static_cast<double>(ps.speed_kbps) * 1000.0;
+    // M/M/1 wait-time proxy: W ≈ base_delay · u / (1 - u). This is the only
+    // queueing signal a real OF1.3 controller can compute — utilization and
+    // link propagation delay are both standard. ε-guards keep the term
+    // finite at u→1. Per-port `max` preserves the "worst egress" semantic
+    // the old queue-depth-derived d_ms had.
+    if (cap > 0) {
+      double txBps = std::max(0.0, ps.tx_rate_bps);
+      double util  = std::clamp(txBps / cap, 0.0, 0.999);
+      auto peer = m_topology.GetPeerDpid(dpid, pno);
+      double baseDelayMs = peer ? m_topology.GetLinkDelay(dpid, *peer) : 1.0;
+      double dMs = baseDelayMs * (util / std::max(1e-3, 1.0 - util));
+      maxDelayMs = std::max(maxDelayMs, dMs);
     }
-    pK = p0 * std::pow(rho, K);
-    obs.p_loss = std::min(pK, 1.0);
-
-    if (std::abs(rho - 1.0) < 1e-9) {
-      obs.N = K / 2.0;
-    } else {
-      obs.N = rho / (1.0 - rho)
-              - (K + 1.0) * std::pow(rho, K + 1.0) / (1.0 - std::pow(rho, K + 1.0));
-    }
-    obs.N = std::max(0.0, obs.N);
-    if (obs.lambda_bps > 0)
-      obs.d_ms = (obs.N / (obs.lambda_bps / 8.0)) * 1000.0;
+    sumLBps += ps.rx_drop_rate_bps + ps.tx_drop_rate_bps;
   }
+  obs.d_ms             = maxDelayMs;
+  obs.L_bps            = sumLBps;
 
   // Drain switch forwarding energy based on total TX rate across all ports
   auto emIt = m_switchEnergyModel.find(dpid);
   if (emIt != m_switchEnergyModel.end() && emIt->second.initial_energy_j >= 0) {
     double totalTxBps = 0.0;
-    if (psIt != m_portStats.end())
-      for (const auto& [pno2, ps2] : psIt->second)
-        totalTxBps += ps2.tx_rate_bps;
+    for (const auto& [pno2, ps2] : psIt->second)
+      totalTxBps += ps2.tx_rate_bps;
     double bytesForwarded = (totalTxBps / 8.0) * m_statsIntervalS;
     auto reIt = m_switchResidualEnergy.find(dpid);
     if (reIt != m_switchResidualEnergy.end()) {
@@ -931,13 +1036,8 @@ void ZmqOpenFlowController::ComputeSwitchObservations(uint64_t dpid) {
 
   m_switchObs[dpid] = obs;
   NS_LOG_INFO("[OBS] Switch " << dpid
-              << " λ=" << obs.lambda_bps / 1e6 << "Mbps"
-              << " μ=" << obs.mu_max_bps / 1e6 << "Mbps"
-              << " ρ=" << obs.rho
-              << " N=" << obs.N
-              << " d=" << obs.d_ms << "ms"
-              << " P_loss=" << obs.p_loss
-              << " RBW=" << obs.rbw_bps / 1e6 << "Mbps"
+              << " d_max=" << obs.d_ms << "ms"
+              << " L=" << obs.L_bps / 1e6 << "Mbps"
               << " E=" << obs.residual_energy_j << "J");
 }
 
@@ -1132,7 +1232,16 @@ void ZmqOpenFlowController::WriteStateToJson() {
   mkdir("scratch/data", 0755);
   mkdir(state_dir.c_str(), 0755);
 
-  std::string output_file = state_dir + "/sdn_state.json";
+  // Multi-controller (Phase 2): each instance writes to its own file so
+  // simultaneously-running controllers don't clobber each other's state.
+  // Default controller_id=0 keeps the legacy filename for single-ctrl runs.
+  std::string output_file;
+  if (m_ml.controller_id == 0) {
+    output_file = state_dir + "/sdn_state.json";
+  } else {
+    output_file = state_dir + "/sdn_state_ctrl" +
+                  std::to_string(m_ml.controller_id) + ".json";
+  }
 
   std::ostringstream json;
   json << std::fixed << std::setprecision(3);
@@ -1142,8 +1251,9 @@ void ZmqOpenFlowController::WriteStateToJson() {
   json << "  \"timestamp\": " << now << ",\n";
 
   json << "  \"controller\": {\n";
-  json << "    \"id\": \"sdn-controller\",\n";
-  json << "    \"label\": \"SDN Controller\",\n";
+  json << "    \"id\": \"sdn-controller-" << m_ml.controller_id << "\",\n";
+  json << "    \"label\": \"SDN Controller " << m_ml.controller_id << "\",\n";
+  json << "    \"controller_id\": " << m_ml.controller_id << ",\n";
   json << "    \"detail\": \"OpenFlow 1.3 Controller\"\n";
   json << "  },\n";
 
@@ -1238,6 +1348,10 @@ void ZmqOpenFlowController::WriteStateToJson() {
       json << "        \"duration_sec\": " << ps.duration_sec << ",\n";
       json << "        \"rx_rate_bps\": " << ps.rx_rate_bps << ",\n";
       json << "        \"tx_rate_bps\": " << ps.tx_rate_bps << ",\n";
+      json << "        \"rx_drop_rate_bps\": " << ps.rx_drop_rate_bps << ",\n";
+      json << "        \"tx_drop_rate_bps\": " << ps.tx_drop_rate_bps << ",\n";
+      json << "        \"q_tx_errors\": "         << ps.q_tx_errors         << ",\n";
+      json << "        \"q_tx_error_rate_pps\": " << ps.q_tx_error_rate_pps << ",\n";
       json << "        \"speed_kbps\": "  << ps.speed_kbps  << "\n";
       json << "      }";
       first_port = false;
@@ -1249,22 +1363,18 @@ void ZmqOpenFlowController::WriteStateToJson() {
   if (!first) json << "\n  ";
   json << "},\n";
 
-  // Per-switch DDPG observation vectors
+  // Per-switch observation snapshot — reward-debug fields only. The ML
+  // observation now flows through edge_attr (see BuildMlStatePayload),
+  // so the legacy M/M/1/K aggregates (lambda_bps, mu_max_bps, rho, K, N,
+  // p_loss, rbw_bps) are gone.
   json << "  \"switch_observations\": {";
   first = true;
   for (const auto& kv : m_switchObs) {
     if (!first) json << ", ";
     const SwitchObservation& o = kv.second;
     json << "\n    \"" << kv.first << "\": {\n";
-    json << "      \"lambda_bps\": "  << o.lambda_bps << ",\n";
-    json << "      \"mu_max_bps\": "  << o.mu_max_bps << ",\n";
-    json << "      \"rho\": "         << o.rho        << ",\n";
-    json << "      \"K\": "           << o.K          << ",\n";
-    json << "      \"N\": "           << o.N          << ",\n";
-    json << "      \"d_ms\": "        << o.d_ms       << ",\n";
-    json << "      \"p_loss\": "      << o.p_loss     << ",\n";
-    json << "      \"L_bps\": "       << o.L_bps      << ",\n";
-    json << "      \"rbw_bps\": "     << o.rbw_bps    << ",\n";
+    json << "      \"d_ms\": "             << o.d_ms             << ",\n";
+    json << "      \"L_bps\": "            << o.L_bps            << ",\n";
     if (o.residual_energy_j >= 0)
       json << "      \"residual_energy_j\": " << o.residual_energy_j << "\n";
     else
@@ -1299,10 +1409,15 @@ void ZmqOpenFlowController::WriteStateToJson() {
   if (!first) json << "\n  ";
   json << "],\n";
 
-  // Global μ_max — maximum per-switch mu_max_bps (ATVM normalisation constant)
+  // Global μ_max — max port speed across the topology (ATVM normalisation
+  // constant). Used by the visualizer; no longer derived from the gone
+  // per-switch mu_max_bps M/M/1/K aggregate.
   double muMaxGlobal = 0;
-  for (const auto& kv : m_switchObs)
-    muMaxGlobal = std::max(muMaxGlobal, kv.second.mu_max_bps);
+  for (const auto& sw_kv : m_portStats)
+    for (const auto& port_kv : sw_kv.second) {
+      double cap = static_cast<double>(port_kv.second.speed_kbps) * 1000.0;
+      muMaxGlobal = std::max(muMaxGlobal, cap);
+    }
   json << "  \"mu_max_global_bps\": " << muMaxGlobal << ",\n";
 
   // Control links
@@ -1357,8 +1472,8 @@ void ZmqOpenFlowController::MlSendHello() {
   if (!m_mlSock) return;
 
   // GNN dims — keep in sync with python's _build_graph_data():
-  //   node_feat_dim = 5 (rho, d_ms_norm, p_loss, depletion, echo_rtt_norm)
-  //   edge_feat_dim = 3 (utilization, cost_norm, tx_share)
+  //   node_feat_dim = 2 (depletion, echo_rtt_norm)
+  //   edge_feat_dim = 3 (drop_norm, utilization, cost_norm)
   // num_switches / num_links let the Python side allocate buffers and verify
   // payload shape at runtime. action_dim still maps 1:1 to m_mlLinkOrder.
   size_t numSwitches = m_mlNodeOrder.size();
@@ -1367,10 +1482,10 @@ void ZmqOpenFlowController::MlSendHello() {
 
   std::ostringstream hello;
   hello << "{\"cmd\":\"hello\","
-        << "\"arch\":\"gnn-v1\","
+        << "\"arch\":\"gnn-v3\","
         << "\"num_switches\":" << numSwitches << ","
         << "\"num_links\":" << numLinks << ","
-        << "\"node_feat_dim\":5,"
+        << "\"node_feat_dim\":2,"
         << "\"edge_feat_dim\":3,"
         << "\"action_dim\":" << actionDim << ","
         << "\"seed\":" << m_ml.seed << ","
@@ -1423,6 +1538,9 @@ std::string ZmqOpenFlowController::BuildMlStatePayload() {
   s << "],";
 
   // ---- per-switch features (in frozen node order) ----
+  // Health-only signals now. Traffic physics (queue depth, drop rate,
+  // utilization) has moved to per_link edge_attr where the GAT can attend
+  // over per-port truth instead of a switch-level reduction.
   s << "\"per_switch\":[";
   bool firstSw = true;
   for (uint64_t dpid : m_mlNodeOrder) {
@@ -1439,9 +1557,6 @@ std::string ZmqOpenFlowController::BuildMlStatePayload() {
 
     if (!firstSw) s << ",";
     s << "{\"dpid\":" << dpid
-      << ",\"rho\":" << obs.rho
-      << ",\"d_ms\":" << obs.d_ms
-      << ",\"p_loss\":" << obs.p_loss
       << ",\"depletion\":" << (1.0 - energyFrac)
       << ",\"echo_rtt_ns\":" << rttNs
       << "}";
@@ -1450,6 +1565,25 @@ std::string ZmqOpenFlowController::BuildMlStatePayload() {
   s << "],";
 
   // ---- per-link features ----
+  // Each canonical link (a, b) carries both directions of traffic physics.
+  // m_mlLinkOrder is one entry per physical link (frozen for action-vector
+  // stability); Python uses the src_* fields for the canonical edge_attr
+  // and the dst_* fields for the reverse-direction edge in bidirectional
+  // message passing.
+  auto findDirStats = [&](uint64_t srcDpid, uint64_t dstDpid,
+                          double& txBpsOut, double& dropRateBpsOut) {
+    txBpsOut = 0.0; dropRateBpsOut = 0.0;
+    auto psIt = m_portStats.find(srcDpid);
+    if (psIt == m_portStats.end()) return;
+    for (const auto& [pno, ps] : psIt->second) {
+      auto peer = m_topology.GetPeerDpid(srcDpid, pno);
+      if (peer && *peer == dstDpid) {
+        txBpsOut       += ps.tx_rate_bps;
+        dropRateBpsOut += ps.tx_drop_rate_bps;
+      }
+    }
+  };
+
   s << "\"per_link\":[";
   bool firstLink = true;
   for (const auto& [a, b] : m_mlLinkOrder) {
@@ -1459,27 +1593,31 @@ std::string ZmqOpenFlowController::BuildMlStatePayload() {
                                m_topology.GetLinkCapacityBps(b, a));
     double delayMs  = m_topology.GetLinkDelay(a, b);
 
-    // ATVM: tx_bps from src→dst egress port
-    double txBps = 0.0;
-    auto psIt = m_portStats.find(a);
-    if (psIt != m_portStats.end()) {
-      for (const auto& [pno, ps] : psIt->second) {
-        auto peer = m_topology.GetPeerDpid(a, pno);
-        if (peer && *peer == b) {
-          txBps += ps.tx_rate_bps;
-        }
-      }
-    }
-    double util = (cap > 0) ? (txBps / cap) : 0.0;
+    double srcTxBps = 0, dstTxBps = 0;
+    double srcDropRateBps = 0, dstDropRateBps = 0;
+    findDirStats(a, b, srcTxBps, srcDropRateBps);
+    findDirStats(b, a, dstTxBps, dstDropRateBps);
+
+    double srcUtil = (cap > 0) ? (srcTxBps / cap) : 0.0;
+    double dstUtil = (cap > 0) ? (dstTxBps / cap) : 0.0;
 
     if (!firstLink) s << ",";
     s << "{\"src\":" << a << ",\"dst\":" << b
-      << ",\"tx_bps\":" << txBps
+      // tx_bps / utilization are aliases for the src-direction (a→b) and
+      // kept for backward-compat with non-ML consumers (visualizer, JSON
+      // dumpers). Python ML reads src_* / dst_* explicitly for asymmetry.
+      << ",\"tx_bps\":" << srcTxBps
       << ",\"capacity_bps\":" << cap
-      << ",\"utilization\":" << util
+      << ",\"utilization\":" << srcUtil
       << ",\"cost\":" << cost
       << ",\"base_cost\":" << baseCost
       << ",\"delay_ms\":" << delayMs
+      << ",\"src_tx_bps\":"        << srcTxBps
+      << ",\"src_utilization\":"   << srcUtil
+      << ",\"src_drop_rate_bps\":" << srcDropRateBps
+      << ",\"dst_tx_bps\":"        << dstTxBps
+      << ",\"dst_utilization\":"   << dstUtil
+      << ",\"dst_drop_rate_bps\":" << dstDropRateBps
       << "}";
     firstLink = false;
   }
@@ -1686,10 +1824,10 @@ void ZmqOpenFlowController::ApplyDeltaCosts(const std::vector<double>& deltas) {
       anyChanged = true;
     }
   }
-  // Critical: existing flow entries are keyed only on eth_dst with idle=30s,
-  // so continuous UDP flows never re-PacketIn and never see the new costs.
-  // Walk the routing table now and rewrite next-hop ports where Dijkstra has
-  // moved.
+  // Critical: existing flow entries are keyed only on eth_dst and never
+  // expire, so continuous flows never re-PacketIn and never see the new
+  // costs. Walk the routing table now and rewrite next-hop ports where
+  // Dijkstra has moved.
   if (anyChanged) RecomputeAllRoutes();
 }
 

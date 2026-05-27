@@ -26,25 +26,30 @@ struct PortStatsEntry {
     uint32_t duration_sec = 0;
     // For rate calculation (not serialised to JSON)
     uint64_t prev_rx_bytes = 0, prev_tx_bytes = 0;
+    uint64_t prev_rx_packets = 0, prev_tx_packets = 0;
+    uint64_t prev_rx_dropped = 0, prev_tx_dropped = 0;
     double   prev_time_s   = 0.0;
     // Derived rates in bits/s — updated on each PORT_STATS reply
     double rx_rate_bps = 0.0, tx_rate_bps = 0.0;
+    // Empirical per-port drop byte-rates (delta dropped packets × avg pkt size × 8 / dt).
+    // Computed from OF1.3-standard tx_dropped / rx_dropped counters — deployable.
+    double rx_drop_rate_bps = 0.0, tx_drop_rate_bps = 0.0;
+    // OFPMP_QUEUE aggregated counters (port-level sum across queue_ids).
+    // q_tx_errors = packets dropped by the queue due to overrun.
+    uint64_t q_tx_errors = 0;
+    uint64_t prev_q_tx_errors = 0;
+    double   q_tx_error_rate_pps = 0.0;
     // Link speed captured from PORT_DESC (kbps)
     uint32_t speed_kbps = 0;
 };
 
-// Per-switch DDPG observation vector (M/M/1 queue model approximations)
+// Per-switch observation — reward-only (Python no longer sees these values;
+// they're aggregated to a scalar reward in ComputeMlReward and that's it).
+// The ML observation now flows through edge-attr; see BuildMlStatePayload.
 struct SwitchObservation {
-    double lambda_bps        = 0;  // aggregate arrival rate on host-facing ports (bits/s)
-    double mu_max_bps        = 0;  // sum of host-port link capacities (bits/s)
-    double rho               = 0;  // traffic intensity = lambda / mu_max
-    double K                 = 64; // system capacity (queue slots, 64-packet FIFO default)
-    double N                 = 0;  // expected queue occupancy [M/M/1/K]
-    double p_loss            = 0;  // M/M/1/K packet-loss probability (blocking probability P_K)
-    double d_ms              = 0;  // expected delay via Little's law (ms)
-    double L_bps             = 0;  // loss rate = sum of dropped-bytes rate (bits/s)
-    double rbw_bps           = 0;  // residual bandwidth = mu_max - lambda
-    double residual_energy_j = -1; // joules remaining; -1 = not tracked
+    double   d_ms              = 0;  // max over ports of M/M/1 wait-time proxy: base_delay·u/(1-u)
+    double   L_bps             = 0;  // sum over ports of (rx_drop_rate_bps + tx_drop_rate_bps)
+    double   residual_energy_j = -1; // joules remaining; -1 = not tracked
 };
 
 // Host display annotation (name + node_type for topology viewer grouping)
@@ -98,6 +103,12 @@ struct MlConfig {
     bool   resume                     = true;  // Python loads checkpoint if present
     uint32_t seed                     = 12345; // shared seed for Python RNG
     std::string endpoint              = "tcp://127.0.0.1:5555";
+    // Hierarchical-SDN Phase 2: which Local Controller this is in the
+    // section partition. Used to disambiguate per-controller artifacts
+    // (e.g. sdn_state_ctrl<id>.json) when multiple controllers run in the
+    // same ns-3 process. Default 0 keeps single-controller scenarios
+    // bit-identical to today.
+    uint32_t controller_id            = 0;
 };
 
 class ZmqOpenFlowController : public OFSwitch13Controller {
@@ -109,6 +120,38 @@ public:
 
     // Called from scenario before Simulator::Run() to annotate hosts (name + type only)
     void SetHostAnnotation(uint64_t mac, const HostAnnotation& ann);
+
+    // Proactive routing seed. Pass one entry per host with (mac, attached dpid,
+    // OF egress port on that dpid). Call AFTER LLDP convergence (typically
+    // t≈warmupS) so m_topology has discovered every backbone link. Walks all
+    // (switch, host) pairs, installs a flow-mod on every switch with an
+    // egress port from Dijkstra. Removes the need for 1,122 pair-pings during
+    // warmup and — with no idle timeout — eliminates the reactive churn that
+    // crashes BOFUSS under sustained load.
+    struct HostInfo {
+        uint64_t mac;
+        uint64_t dpid;
+        uint32_t port;
+    };
+    void PreInstallAllPaths(const std::vector<HostInfo>& hosts);
+
+    // Hierarchical-SDN Phase 2 — inter-domain static routes. Each entry
+    // associates an external (= belongs to another section's controller)
+    // destination MAC with the local border switch + egress port that
+    // exits this domain toward the destination's domain. For each entry
+    // we walk every switch in m_switchMap, run Dijkstra to border_dpid,
+    // and install a flow-mod with the next-hop port; on the border
+    // switch itself the egress port is border_out_port. Reuses the same
+    // m_topology / InstallFlow machinery as PreInstallAllPaths, so it
+    // must run AFTER LLDP convergence (typically t≈warmupS, same as
+    // PreInstallAllPaths).
+    struct ExternalHostRoute {
+        uint64_t dst_mac;
+        uint64_t border_dpid;
+        uint32_t border_out_port;
+    };
+    void InstallExternalHostRoutes(const std::vector<ExternalHostRoute>& routes);
+
     // Configure forwarding-energy model for a switch (by DPID)
     void SetSwitchEnergyModel(uint64_t dpid, double initial_j, double per_byte_j);
     // Read back energy state for reporting. Returns -1 if dpid not configured.
@@ -184,6 +227,7 @@ private:
     void RebuildSpanningTree();
     void HandlePortDescReply(struct ofl_msg_multipart_reply_port_desc* reply, uint64_t dpid);
     void HandlePortStatsReply(struct ofl_msg_multipart_reply_port* reply, uint64_t dpid);
+    void HandleQueueStatsReply(struct ofl_msg_multipart_reply_queue* reply, uint64_t dpid);
     void ComputeSwitchObservations(uint64_t dpid);
     void FloodViaST(Ptr<const RemoteSwitch> inSwtch, uint32_t inPort,
                     uint32_t bufferId, const uint8_t* data, size_t dataLen);

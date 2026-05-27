@@ -69,6 +69,72 @@ print('Patched ofswitch13-controller.h')\
 # Inject real ns-3 DataRate into OpenFlow port speed fields 
 RUN  python3 -c "path='/workspace/ns-3.40/contrib/ofswitch13/model/ofswitch13-port.cc'; old='    m_swPort->conf->curr_speed = port_speed(m_swPort->conf->curr);\n    m_swPort->conf->max_speed = port_speed(m_swPort->conf->supported);'; new='    m_swPort->conf->curr_speed = port_speed(m_swPort->conf->curr);\n    m_swPort->conf->max_speed = port_speed(m_swPort->conf->supported);\n\n    // Patch: override with actual ns-3 DataRate in kbps.\n    DataRate rate;\n    Ptr<Channel> channel = m_netDev->GetChannel();\n    if (channel)\n      {\n        Ptr<CsmaChannel> csmaChannel = channel->GetObject<CsmaChannel>();\n        if (csmaChannel)\n          {\n            DataRateValue drv;\n            csmaChannel->GetAttribute(\"DataRate\", drv);\n            rate = drv.Get();\n          }\n      }\n    if (rate.GetBitRate() > 0)\n      {\n        m_swPort->conf->curr_speed = static_cast<uint32_t>(rate.GetBitRate() / 1000);\n        m_swPort->conf->max_speed = static_cast<uint32_t>(rate.GetBitRate() / 1000);\n      }'; f=open(path); c=f.read(); f.close(); c=c.replace(old,new); f=open(path,'w'); f.write(c); f.close()"
 
+# Patch ns-3 TcpSocketBase persist timeout null dereference crash
+# Patch ns-3 TcpSocketBase eager connection
+# Execute standard sh block to parse heredoc
+RUN /bin/sh -c "\
+cat << 'EOF' > /tmp/tcp-fix.patch \n\
+diff --git a/src/internet/model/tcp-socket-base.cc b/src/internet/model/tcp-socket-base.cc \n\
+--- a/src/internet/model/tcp-socket-base.cc \n\
++++ b/src/internet/model/tcp-socket-base.cc \n\
+@@ -1409,21 +1409,6 @@ \n\
+         UpdateWindowSize(tcpHeader); \n\
+     } \n\
+  \n\
+-    if (m_rWnd.Get() == 0 && m_persistEvent.IsExpired()) \n\
+-    { // Zero window: Enter persist state to send 1 byte to probe \n\
+-        NS_LOG_LOGIC(this << \" Enter zerowindow persist state\"); \n\
+-        NS_LOG_LOGIC( \n\
+-            this << \" Cancelled ReTxTimeout event which was set to expire at \" \n\
+-                 << (Simulator::Now() + Simulator::GetDelayLeft(m_retxEvent)).GetSeconds()); \n\
+-        m_retxEvent.Cancel(); \n\
+-        NS_LOG_LOGIC(\"Schedule persist timeout at time \" \n\
+-                     << Simulator::Now().GetSeconds() << \" to expire at time \" \n\
+-                     << (Simulator::Now() + m_persistTimeout).GetSeconds()); \n\
+-        m_persistEvent = \n\
+-            Simulator::Schedule(m_persistTimeout, &TcpSocketBase::PersistTimeout, this); \n\
+-        NS_ASSERT(m_persistTimeout == Simulator::GetDelayLeft(m_persistEvent)); \n\
+-    } \n\
+- \n\
+     // TCP state machine code in different process functions \n\
+     // C.f.: tcp_rcv_state_process() in tcp_input.c in Linux kernel \n\
+     switch (m_state) \n\
+@@ -1475,7 +1460,21 @@ \n\
+         break; \n\
+     } \n\
+  \n\
+-    if (m_rWnd.Get() != 0 && m_persistEvent.IsRunning()) \n\
++    if (m_connected && m_rWnd.Get() == 0 && m_persistEvent.IsExpired()) \n\
++    { // Zero window: Enter persist state to send 1 byte to probe \n\
++        NS_LOG_LOGIC(this << \" Enter zerowindow persist state\"); \n\
++        NS_LOG_LOGIC( \n\
++            this << \" Cancelled ReTxTimeout event which was set to expire at \" \n\
++                 << (Simulator::Now() + Simulator::GetDelayLeft(m_retxEvent)).GetSeconds()); \n\
++        m_retxEvent.Cancel(); \n\
++        NS_LOG_LOGIC(\"Schedule persist timeout at time \" \n\
++                     << Simulator::Now().GetSeconds() << \" to expire at time \" \n\
++                     << (Simulator::Now() + m_persistTimeout).GetSeconds()); \n\
++        m_persistEvent = \n\
++            Simulator::Schedule(m_persistTimeout, &TcpSocketBase::PersistTimeout, this); \n\
++        NS_ASSERT(m_persistTimeout == Simulator::GetDelayLeft(m_persistEvent)); \n\
++    } \n\
++    else if (m_connected && m_rWnd.Get() != 0 && m_persistEvent.IsRunning()) \n\
+     { // persist probes end, the other end has increased the window \n\
+         NS_ASSERT(m_connected); \n\
+         NS_LOG_LOGIC(this << \" Leaving zerowindow persist state\"); \n\
+@@ -3901,7 +3901,8 @@ \n\
+     NS_LOG_LOGIC(\"PersistTimeout expired at \" << Simulator::Now().GetSeconds()); \n\
+     m_persistTimeout = \n\
+         std::min(Seconds(60), Time(2 * m_persistTimeout)); // max persist timeout = 60s \n\
+-    Ptr<Packet> p = m_txBuffer->CopyFromSequence(1, m_tcb->m_nextTxSequence)->GetPacketCopy(); \n\
++    TcpTxItem* item = m_txBuffer->CopyFromSequence(1, m_tcb->m_nextTxSequence); \n\
++    Ptr<Packet> p = (item != nullptr) ? item->GetPacketCopy() : Create<Packet>(); \n\
+     m_txBuffer->ResetLastSegmentSent(); \n\
+     TcpHeader tcpHeader; \n\
+     tcpHeader.SetSequenceNumber(m_tcb->m_nextTxSequence); \n\
+EOF\n\
+patch -p1 -d /workspace/ns-3.40 < /tmp/tcp-fix.patch"
+
 # Configure and build
 RUN ./ns3 configure --disable-examples --disable-tests
 RUN ./ns3 build

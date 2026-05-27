@@ -1,0 +1,10 @@
+pyzmq>=25
+numpy>=1.24
+# torch is heavy and optional: the ML service falls back to a random-action
+# degraded mode when it isn't installed. Install one of the CPU-only wheels
+# for a smaller footprint, e.g. `pip install torch --index-url
+# https://download.pytorch.org/whl/cpu`.
+torch>=2.0
+# Graph neural network library. Required by the GAT-based actor/critic; the
+# service raises at startup if torch is installed but torch_geometric is not.
+torch_geometric>=2.4

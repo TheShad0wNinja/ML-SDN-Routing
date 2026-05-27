@@ -2,14 +2,24 @@
 # scratch/run_tests.sh — drive ns-3 SDN test variants.
 #
 # Modes:
-#   single    one run with whatever flags you pass
-#   compare   baseline + one ML run, same seed/params
-#   presets   baseline + balanced + delay_first + energy_first ML runs
-#   seeds     repeat the same config across N consecutive seeds
-#   matrix    full statistical matrix (seeds × trafficMode × failures, ml vs baseline)
-#   eval      pretrained eval-only run (--mlExplore=false --mlResume=true)
-#   summary   parse a saved log and print headline numbers
-#   clean     wipe checkpoints + replay buffer (forces fresh learning)
+#   single     one run with whatever flags you pass
+#   compare    baseline + one ML run, same seed/params
+#   presets    baseline + balanced + delay_first + energy_first ML runs
+#   seeds      repeat the same config across N consecutive seeds
+#   matrix     full statistical matrix (seeds × trafficMode × failures, ml vs baseline)
+#   train      curriculum-style training: cycle the agent through traffic
+#              modes × failures × cripple, persisting weights across runs
+#   eval       pretrained eval-only run (--mlExplore=false --mlResume=true)
+#   federated  Hierarchical SDN Phase 1 — M ns-3 processes (one per section
+#              of sections.json), each its own Local Controller + RL agent,
+#              FedAvg'd by root_aggregator.py via scratch/data/federated_weights/
+#   fullrun    Hierarchical SDN Phase 2 — ONE ns-3 process running the FULL
+#              topology with M Local Controllers (one per section). Inter-
+#              domain routing uses static border-switch flow-mods (Option A)
+#              precomputed from sections.json. FedAvg is opt-in via
+#              --fedAvgEverySteps; when on, reuses Phase 1's root_aggregator.
+#   summary    parse a saved log and print headline numbers
+#   clean      wipe checkpoints + replay buffer (forces fresh learning)
 #
 # Each ns3 run is teed to scratch/data/results/logs/ with a timestamped name,
 # then summarized to scratch/data/results/summary.csv.
@@ -20,6 +30,10 @@
 #   scratch/run_tests.sh seeds --seeds 5 --ml --priority balanced --simTime 1200 --tcp --failures --cripple
 #   scratch/run_tests.sh matrix --seeds 3 --simTime 600 --priority balanced
 #   scratch/run_tests.sh eval --simTime 200 --priority balanced --tcp --failures --cripple
+#   scratch/run_tests.sh federated --simTime 30 --warmupS 3 \
+#       --fedAvgEverySteps 5 --fedAvgTimeoutS 60 -- --mlIntervalS=0.5
+#   scratch/run_tests.sh fullrun --simTime 120 --ml --priority balanced \
+#       --fedAvgEverySteps 200
 #   scratch/run_tests.sh summary scratch/data/results/logs/<name>.log
 
 set -euo pipefail
@@ -52,6 +66,20 @@ EVAL_WINDOW=0
 EXTRA_ARGS=()
 AUTO_ML=true
 NS3_VERBOSE=false
+WORKERS=1                 # parallel ns-3 processes (and ML services if --ml)
+ML_PORT_BASE=5555         # worker w binds tcp://*:$((ML_PORT_BASE+w))
+
+# Federated learning (Phase 1 of hierarchical SDN). Each worker simulates one
+# section of the topology and the root aggregator FedAvgs their weights every
+# FEDAVG_EVERY training steps. FEDAVG_EVERY=0 disables federation entirely
+# (default — backward-compat with all existing modes).
+FEDAVG_DIR=""
+FEDAVG_EVERY=0
+FEDAVG_TIMEOUT=300
+FEDAVG_AGG_LOG_DIR=""
+SECTIONS_JSON=""
+AGG_PID=""
+WE_STARTED_AGG=false
 
 # `train` mode curriculum — overrideable via flags.
 TRAIN_ROUNDS=2
@@ -61,6 +89,13 @@ TRAIN_CRIPPLE="true false"
 
 ML_PID=""
 WE_STARTED_ML=false
+# Parallel-mode bookkeeping: per-worker pids and dirs.
+declare -a WORKER_ML_PIDS=()
+declare -a WORKER_AGENT_DIRS=()
+# Federated-mode bookkeeping: per-worker (= per-section) topology slice.
+# Empty arrays = non-federated mode; run_one ignores these.
+declare -a WORKER_SECTION_IDS=()
+declare -a WORKER_SECTION_NODES=()
 
 # ----- usage -----------------------------------------------------------------
 usage() {
@@ -78,11 +113,30 @@ Modes:
                         --mlResume=true. Run this BEFORE compare/eval so the
                         agent is well-trained.
   eval                  ML run with --mlExplore=false --mlResume=true (deterministic eval)
+  federated             Phase-1 hierarchical SDN: launch one ns-3 process per
+                        topology section (read from sections.json), each with
+                        its own Local Controller and RL agent. A root
+                        aggregator FedAvgs all sections' weights every
+                        --fedAvgEverySteps training steps via a shared
+                        directory (scratch/data/federated_weights/).
+  fullrun               Phase-2 hierarchical SDN: ONE ns-3 process running the
+                        FULL topology with M Local Controllers (one per
+                        section of sections.json). Inter-domain routing is
+                        Option A — static border-switch flow-mods derived from
+                        sections.json's inter_domain_routes block, pre-installed
+                        after warmup. Each controller still runs its own
+                        ml_service.py on its own port; pass
+                        --fedAvgEverySteps to also FedAvg the M controllers'
+                        weights via the same root_aggregator.py as Phase 1.
+                        This is the defense/demo configuration — proves the
+                        hierarchical architecture end-to-end on one box.
   summary FILE          Print headline stats from a saved log file
   clean                 Remove ML checkpoint + replay buffer
 
 Options:
-  --topology X          usa | abilene | mini-geant | two-switch-ping  (default: usa)
+  --topology X          usa | usa-fullrun | abilene | mini-geant |
+                        two-switch-ping                                (default: usa)
+                        Note: 'fullrun' mode forces topology=usa-fullrun
   --simTime N           Simulation duration in seconds                 (default: 600)
   --warmupS N           Warmup window                                  (default: 10)
   --trafficMode X       random | central | grouped                     (default: central)
@@ -98,12 +152,30 @@ Options:
   --evalWindowS N       Delay FlowMonitor reset by N seconds past warmup
   --no-auto-ml          Don't auto-start the Python ML service
   --verbose             Pass NS_LOG to surface controller info
+  --workers N           Parallel ns-3 processes (and per-worker ML services).
+                        Only seeds + matrix modes actually parallelize; train
+                        is sequential (curriculum needs ordering). With --ml
+                        each worker w gets its own port (5555+w) and its own
+                        checkpoint dir (scratch/data/agent-w<N>) — N
+                        INDEPENDENT agents, not one shared agent.
 
 Train-mode curriculum (defaults give 12 scenarios × 2 rounds = 24 runs):
   --trainRounds N       How many times to loop the whole curriculum (default 2)
   --trainModes "..."    Space-separated traffic modes (default: "central random grouped")
   --trainFailures "..." Space-separated bool values  (default: "true false")
   --trainCripple "..."  Space-separated bool values  (default: "true")
+
+Federated / fullrun-mode flags:
+  --sectionsJson PATH       Topology partition file. Used by BOTH 'federated'
+                            (multi-process) and 'fullrun' (single-process)
+                            modes (default: scratch/scenarios/usa/sections.json)
+  --fedAvgEverySteps K      Workers submit weights every K training steps,
+                            and block on the global model (default: 0 = off).
+                            In 'federated' this is the cross-process FedAvg
+                            cadence; in 'fullrun' it FedAvgs the in-process
+                            controllers via the same shared directory.
+  --fedAvgTimeoutS S        Per-round timeout: aggregator drops the round and
+                            workers continue with local weights (default: 300)
 
   -- arg1 arg2 ...      Forward extra args verbatim to ns3 (after --)
 
@@ -113,75 +185,172 @@ EOF
 }
 
 # ----- ML service lifecycle --------------------------------------------------
-ml_service_running() {
-  # Probe by attempting a TCP connect — more reliable than parsing `ss`/`lsof`
-  # output, which varies wildly across containers.
-  python3 - <<'PY' 2>/dev/null
-import socket, sys
-s = socket.socket()
-s.settimeout(0.4)
+ml_port_for_slot()      { echo $((ML_PORT_BASE + $1)); }
+ml_endpoint_for_slot()  { echo "tcp://127.0.0.1:$(ml_port_for_slot "$1")"; }
+ml_agent_dir_for_slot() {
+  if (( WORKERS <= 1 )); then echo "$CKPT_DIR"
+  else echo "${CKPT_DIR}-w$1"; fi
+}
+
+ml_port_listening() {
+  # True only when the python service is actually pumping its REP loop, not
+  # just bound. A TCP-connect check returns true the instant bind() runs,
+  # but service.run() may still be inside the torch import — sending a real
+  # ZMQ request and waiting for any reply forces us to wait until the
+  # dispatch loop is alive.
+  local port="$1"
+  python3 - "$port" <<'PY' 2>/dev/null
+import sys
 try:
-    s.connect(("127.0.0.1", 5555))
-    s.close()
+    import zmq
+except ImportError:
+    # No pyzmq available — fall back to TCP-connect probe (less reliable).
+    import socket
+    port = int(sys.argv[1])
+    s = socket.socket(); s.settimeout(0.4)
+    try: s.connect(("127.0.0.1", port)); s.close(); sys.exit(0)
+    except OSError: sys.exit(1)
+port = int(sys.argv[1])
+ctx = zmq.Context()
+sock = ctx.socket(zmq.REQ)
+sock.setsockopt(zmq.RCVTIMEO, 800)
+sock.setsockopt(zmq.SNDTIMEO, 800)
+sock.setsockopt(zmq.LINGER, 0)
+try:
+    sock.connect(f"tcp://127.0.0.1:{port}")
+    # get_action is a cheap idempotent request; service returns a zero-vector
+    # if no agent is initialized yet — that's fine, we only need any reply.
+    sock.send(b'{"cmd":"get_action"}')
+    sock.recv()
     sys.exit(0)
-except OSError:
+except Exception:
     sys.exit(1)
+finally:
+    sock.close(0); ctx.term()
 PY
 }
 
+# Start one ML service per worker slot. Each slot gets its own port + dir.
+# Existing service on a slot's port is reused.
 start_ml_service() {
   $AUTO_ML || return 0
-  if ml_service_running; then
-    echo "[run_tests] ML service already running on :5555 — reusing."
-    return 0
-  fi
-  echo "[run_tests] Starting ML service in background…"
-  (
-    cd "$NS3_ROOT"
-    exec python3 -u "$ML_SERVICE_PY"
-  ) >"$LOG_DIR/ml-service.log" 2>&1 &
-  ML_PID=$!
-  WE_STARTED_ML=true
-  # First-run torch import can take >10s. Wait up to 30s, polling once a
-  # second, but bail early if the python process dies.
-  local elapsed=0 max=30
-  while (( elapsed < max )); do
-    if ! kill -0 "$ML_PID" 2>/dev/null; then
-      echo "[run_tests] ERROR: ML service died during startup. Last log lines:" >&2
-      tail -20 "$LOG_DIR/ml-service.log" >&2 || true
-      WE_STARTED_ML=false
-      ML_PID=""
-      return 1
+  WORKER_ML_PIDS=()
+  WORKER_AGENT_DIRS=()
+  local s
+  for ((s=0; s<WORKERS; s++)); do
+    local port; port=$(ml_port_for_slot "$s")
+    local dir;  dir=$(ml_agent_dir_for_slot "$s")
+    mkdir -p "$dir"
+    WORKER_AGENT_DIRS[$s]="$dir"
+
+    if ml_port_listening "$port"; then
+      echo "[run_tests] ML service already on :$port — reusing (slot $s, dir $dir)."
+      WORKER_ML_PIDS[$s]=""
+      continue
     fi
-    if ml_service_running; then
-      echo "[run_tests] ML service ready (pid $ML_PID, took ~${elapsed}s)."
-      return 0
-    fi
-    sleep 1
-    elapsed=$((elapsed + 1))
+
+    echo "[run_tests] Starting ML service slot=$s port=$port dir=$dir…"
+    (
+      cd "$NS3_ROOT"
+      NS3_ML_PORT="$port" \
+        NS3_ML_AGENT_DIR="$dir" \
+        NS3_WORKER_ID="$s" \
+        NS3_FEDAVG_DIR="${FEDAVG_DIR:-}" \
+        NS3_FEDAVG_EVERY_STEPS="${FEDAVG_EVERY:-0}" \
+        NS3_FEDAVG_WAIT_TIMEOUT_S="${FEDAVG_TIMEOUT:-300}" \
+        exec python3 -u "$ML_SERVICE_PY"
+    ) >"$LOG_DIR/ml-service-w$s.log" 2>&1 &
+    WORKER_ML_PIDS[$s]=$!
+    WE_STARTED_ML=true
   done
-  echo "[run_tests] WARN: ML service did not bind :5555 within ${max}s. Last log lines:" >&2
-  tail -10 "$LOG_DIR/ml-service.log" >&2 || true
+
+  # Wait for every slot we started to bind. Torch import is the slow part on
+  # cold start (~10s); allow 30s.
+  local s elapsed=0 max=30 all_ready=false
+  while (( elapsed < max )); do
+    all_ready=true
+    for ((s=0; s<WORKERS; s++)); do
+      local pid="${WORKER_ML_PIDS[$s]:-}"
+      [[ -z "$pid" ]] && continue   # was already running
+      if ! kill -0 "$pid" 2>/dev/null; then
+        echo "[run_tests] ERROR: ML slot $s died during startup. Last log lines:" >&2
+        tail -20 "$LOG_DIR/ml-service-w$s.log" >&2 || true
+        return 1
+      fi
+      ml_port_listening "$(ml_port_for_slot "$s")" || all_ready=false
+    done
+    $all_ready && { echo "[run_tests] All $WORKERS ML services ready (~${elapsed}s)."; return 0; }
+    sleep 1; elapsed=$((elapsed + 1))
+  done
+  echo "[run_tests] WARN: not all ML services bound within ${max}s." >&2
+  return 1
 }
 
 stop_ml_service() {
-  if $WE_STARTED_ML && [[ -n "$ML_PID" ]]; then
-    echo "[run_tests] Stopping ML service (pid $ML_PID)…"
-    # SIGTERM gives the service a chance to save its checkpoint before dying.
-    kill -TERM "$ML_PID" 2>/dev/null || true
-    # Give it up to 10 s to finish the save.
-    local waited=0
-    while (( waited < 20 )) && kill -0 "$ML_PID" 2>/dev/null; do
-      sleep 0.5
-      waited=$((waited + 1))
+  $WE_STARTED_ML || return 0
+  local s
+  for ((s=0; s<${#WORKER_ML_PIDS[@]}; s++)); do
+    local pid="${WORKER_ML_PIDS[$s]:-}"
+    [[ -z "$pid" ]] && continue
+    echo "[run_tests] Stopping ML slot=$s (pid $pid)…"
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  # Give each service up to 10 s to finish saving its checkpoint.
+  local waited=0
+  while (( waited < 20 )); do
+    local any_alive=false
+    for pid in "${WORKER_ML_PIDS[@]}"; do
+      [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && { any_alive=true; break; }
     done
-    kill -KILL "$ML_PID" 2>/dev/null || true
-    wait "$ML_PID" 2>/dev/null || true
-    WE_STARTED_ML=false
-    ML_PID=""
+    $any_alive || break
+    sleep 0.5; waited=$((waited + 1))
+  done
+  for pid in "${WORKER_ML_PIDS[@]}"; do
+    [[ -n "$pid" ]] || continue
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
+  WORKER_ML_PIDS=()
+  WE_STARTED_ML=false
+}
+
+# ----- Root aggregator lifecycle (federated mode only) ----------------------
+start_aggregator() {
+  $WE_STARTED_AGG && return 0
+  [[ -n "$FEDAVG_DIR" ]] || return 0
+  mkdir -p "$FEDAVG_DIR" "$FEDAVG_AGG_LOG_DIR"
+  echo "[run_tests] Starting root aggregator (workers=$WORKERS dir=$FEDAVG_DIR every=$FEDAVG_EVERY)…"
+  (
+    cd "$NS3_ROOT"
+    exec python3 -u "$SCRIPT_DIR/python/controller/root_aggregator.py" \
+      --dir "$FEDAVG_DIR" \
+      --num-workers "$WORKERS" \
+      --round-timeout-s "$FEDAVG_TIMEOUT" \
+      --log-dir "$FEDAVG_AGG_LOG_DIR"
+  ) >"$LOG_DIR/root-aggregator.log" 2>&1 &
+  AGG_PID=$!
+  WE_STARTED_AGG=true
+  # Give it a second to start scanning the dir. Aggregator is lightweight —
+  # no torch import — so it's ready almost immediately.
+  sleep 1
+  if ! kill -0 "$AGG_PID" 2>/dev/null; then
+    echo "[run_tests] ERROR: root aggregator died at startup. Last lines:" >&2
+    tail -20 "$LOG_DIR/root-aggregator.log" >&2 || true
+    return 1
   fi
 }
-trap stop_ml_service EXIT INT TERM
+
+stop_aggregator() {
+  $WE_STARTED_AGG || return 0
+  [[ -z "$AGG_PID" ]] && return 0
+  echo "[run_tests] Stopping root aggregator (pid $AGG_PID)…"
+  kill -TERM "$AGG_PID" 2>/dev/null || true
+  wait "$AGG_PID" 2>/dev/null || true
+  AGG_PID=""
+  WE_STARTED_AGG=false
+}
+
+trap 'stop_ml_service; stop_aggregator' EXIT INT TERM
 
 # ----- argument assembly -----------------------------------------------------
 # Which flags each topology accepts. USA has the full set; abilene has the old
@@ -190,6 +359,14 @@ topology_supports_flag() {
   local topo="$1" flag="$2"
   case "$topo" in
     usa) return 0 ;;  # all flags
+    usa-fullrun)
+      # usa-fullrun handles ML directly per-controller (mlPortBase, not
+      # mlEndpoint) and exposes a subset of usa's knobs. It has no
+      # trafficMode/tcp/failures/cripple — pings are full-mesh by default.
+      case "$flag" in
+        simTime|warmupS|seed|ml|mlPriority|mlIntervalS|mlActionScale|mlActionScaleStart|mlTaperTicks|mlExplore|mlResume|mlCheckpointEveryNTicks|backboneQueue|edgeQueue|sectionNodes|borderSwitches|interDomainRoutes|mlPortBase|pingIntervalS|pingCount) return 0 ;;
+        *) return 1 ;;
+      esac ;;
     abilene)
       case "$flag" in
         simTime|warmupS|trafficMode|seed|ml|mlIntervalS|mlActionScale|mlAlpha|mlBeta|mlGamma|mlResume|mlEndpoint) return 0 ;;
@@ -338,34 +515,98 @@ summarize_log() {
 # ----- runner ----------------------------------------------------------------
 ns3_log_env() {
   if $NS3_VERBOSE; then
-    echo 'NS_LOG="ZmqOpenFlowController=info"'
+    echo 'NS_LOG="ZmqOpenFlowController=level_info|prefix_time"'
   else
     echo ''
   fi
 }
 
+# Build once up front so parallel ./ns3 run --no-build invocations don't race
+# on CMake/Ninja in the shared build/ dir. Concurrent cmake runs corrupt the
+# build.ninja file and the slower-to-finish ones die.
+BUILT_TARGETS=()
+ensure_built() {
+  local target="$1"
+  for t in "${BUILT_TARGETS[@]:-}"; do
+    [[ "$t" == "$target" ]] && return 0
+  done
+  echo "[run_tests] Pre-building $target (avoids parallel cmake race)…"
+  (cd "$NS3_ROOT" && ./ns3 build "$target") || {
+    echo "[run_tests] WARN: ./ns3 build $target failed; falling back to per-run build." >&2
+    return 1
+  }
+  BUILT_TARGETS+=("$target")
+}
+
 run_one() {
   local label="$1"
+  local slot="${2:-0}"
   build_args
+  # Slot-aware ML endpoint injection. Only matters when --ml is on; harmless
+  # otherwise (the binary ignores --mlEndpoint when ML is disabled).
+  if $ML && topology_supports_flag "$TOPOLOGY" mlEndpoint; then
+    NS3_ARGS+=("--mlEndpoint=$(ml_endpoint_for_slot "$slot")")
+  fi
+  # Federated-mode per-slot section args. cmd_federated populates the global
+  # WORKER_SECTION_* arrays; an empty slot entry means "not sectioned".
+  if [[ -n "${WORKER_SECTION_NODES[$slot]:-}" ]]; then
+    NS3_ARGS+=("--sectionId=${WORKER_SECTION_IDS[$slot]}")
+    NS3_ARGS+=("--sectionNodes=${WORKER_SECTION_NODES[$slot]}")
+    # flashCrowdDst / blackHoleSwitch reference original (pre-filter) indices
+    # that may not survive into this section. Use safe defaults: host 0 is
+    # always present in any non-empty section after renumbering; switch 99
+    # never matches anything, so the black-hole event becomes a no-op.
+    NS3_ARGS+=("--flashCrowdDst=0")
+    NS3_ARGS+=("--blackHoleSwitch=99")
+  fi
   local logfile="$LOG_DIR/$(date +%Y%m%d-%H%M%S)-${label}.log"
+  (( WORKERS > 1 )) && logfile="$LOG_DIR/$(date +%Y%m%d-%H%M%S)-${label}-w${slot}.log"
   local cmd="$TOPOLOGY ${NS3_ARGS[*]}"
 
+  # Skip cmake/ninja per-invocation — we pre-built. Critical for parallel
+  # safety: concurrent ./ns3 run calls corrupt build.ninja otherwise.
+  local nobuild_flag=""
+  for t in "${BUILT_TARGETS[@]:-}"; do
+    [[ "$t" == "$TOPOLOGY" ]] && nobuild_flag="--no-build" && break
+  done
+
   echo "════════════════════════════════════════════════════════════════"
-  echo "[run_tests] $label"
-  echo "[run_tests] ./ns3 run \"$cmd\""
+  echo "[run_tests] $label (slot=$slot)"
+  echo "[run_tests] ./ns3 run $nobuild_flag \"$cmd\""
   echo "[run_tests] → $logfile"
   echo "════════════════════════════════════════════════════════════════"
 
   (
     cd "$NS3_ROOT"
     if $NS3_VERBOSE; then
-      NS_LOG="ZmqOpenFlowController=info" ./ns3 run "$cmd"
+      NS_LOG="ZmqOpenFlowController=level_info|prefix_time" ./ns3 run $nobuild_flag "$cmd"
     else
-      ./ns3 run "$cmd"
+      ./ns3 run $nobuild_flag "$cmd"
     fi
   ) 2>&1 | tee "$logfile"
 
   summarize_log "$logfile" "$label"
+}
+
+# Run jobs in parallel batches. Each job is a single string of bash that
+# eval's. Caller passes job specs; we batch them into groups of $WORKERS
+# and wait for the whole batch before starting the next. Each job gets
+# its slot index as the first positional arg ($1).
+dispatch_parallel() {
+  local jobs=("$@")
+  local total=${#jobs[@]}
+  local idx=0
+  while [[ $idx -lt $total ]]; do
+    local pids=()
+    local s=0
+    while [[ $s -lt $WORKERS && $idx -lt $total ]]; do
+      ( eval "${jobs[$idx]}" "$s" ) &
+      pids+=($!)
+      s=$((s + 1)); idx=$((idx + 1))
+    done
+    local pid
+    for pid in "${pids[@]}"; do wait "$pid" || true; done
+  done
 }
 
 # ----- mode implementations --------------------------------------------------
@@ -402,30 +643,33 @@ cmd_presets() {
 cmd_seeds() {
   if $ML; then start_ml_service; fi
   local base=$SEED
+  local jobs=()
+  local tag
+  tag="$($ML && echo "ml-${PRIORITY}" || echo "baseline")"
   for i in $(seq 0 $((N_SEEDS - 1))); do
-    SEED=$((base + i))
-    local tag
-    tag="$($ML && echo "ml-${PRIORITY}" || echo "baseline")"
-    run_one "${TOPOLOGY}-${tag}-${TRAFFIC_MODE}-seed${SEED}"
+    local seed=$((base + i))
+    # Quote the closure so it runs in a subshell at dispatch time. $1 will
+    # be the slot index supplied by dispatch_parallel.
+    jobs+=("SEED=$seed run_one \"${TOPOLOGY}-${tag}-${TRAFFIC_MODE}-seed${seed}\"")
   done
+  dispatch_parallel "${jobs[@]}"
   SEED=$base
 }
 
 cmd_matrix() {
   start_ml_service
-  local base_seed=$SEED save_mode=$TRAFFIC_MODE save_fail=$FAILURES save_ml=$ML
+  local base_seed=$SEED
+  local jobs=()
   for mode in central random grouped; do
     for fail in true false; do
-      TRAFFIC_MODE=$mode
-      FAILURES=$fail
       for i in $(seq 0 $((N_SEEDS - 1))); do
-        SEED=$((base_seed + i))
-        ML=false; run_one "${TOPOLOGY}-baseline-${mode}-fail${fail}-seed${SEED}"
-        ML=true;  run_one "${TOPOLOGY}-ml-${PRIORITY}-${mode}-fail${fail}-seed${SEED}"
+        local seed=$((base_seed + i))
+        jobs+=("ML=false TRAFFIC_MODE=$mode FAILURES=$fail SEED=$seed run_one \"${TOPOLOGY}-baseline-${mode}-fail${fail}-seed${seed}\"")
+        jobs+=("ML=true  TRAFFIC_MODE=$mode FAILURES=$fail SEED=$seed run_one \"${TOPOLOGY}-ml-${PRIORITY}-${mode}-fail${fail}-seed${seed}\"")
       done
     done
   done
-  SEED=$base_seed; TRAFFIC_MODE=$save_mode; FAILURES=$save_fail; ML=$save_ml
+  dispatch_parallel "${jobs[@]}"
 }
 
 cmd_eval() {
@@ -479,6 +723,171 @@ cmd_train() {
   echo "[run_tests] Run \`scratch/run_tests.sh eval ...\` or \`compare ...\` to evaluate."
 }
 
+## Federated mode: each section runs as its own ns-3 process with its own
+## Local Controller and RL agent; the root aggregator FedAvgs their weights
+## every $FEDAVG_EVERY training steps. The sections.json file partitions
+## the topology; M = len(sections.json["sections"]).
+cmd_federated() {
+  : "${SECTIONS_JSON:=$SCRIPT_DIR/scenarios/$TOPOLOGY/sections.json}"
+  if [[ ! -f "$SECTIONS_JSON" ]]; then
+    echo "[run_tests] ERROR: sections.json not found at $SECTIONS_JSON" >&2
+    echo "[run_tests] Provide --sectionsJson <path> or add one for topology '$TOPOLOGY'." >&2
+    exit 1
+  fi
+
+  # Resolve M and the per-section node CSV via Python — avoids hand-rolling
+  # JSON parsing in shell. Output is one section per line, "<id>\t<csv>".
+  local sections_dump
+  sections_dump=$(python3 - "$SECTIONS_JSON" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    spec = json.load(f)
+for sec in spec["sections"]:
+    nodes = ",".join(str(n) for n in sec["nodes"])
+    print(f"{sec['id']}\t{nodes}")
+PY
+  )
+  local num_sections=0
+  WORKER_SECTION_IDS=()
+  WORKER_SECTION_NODES=()
+  while IFS=$'\t' read -r sid scsv; do
+    [[ -z "$sid" ]] && continue
+    WORKER_SECTION_IDS+=("$sid")
+    WORKER_SECTION_NODES+=("$scsv")
+    num_sections=$((num_sections + 1))
+  done <<<"$sections_dump"
+
+  if (( num_sections < 2 )); then
+    echo "[run_tests] ERROR: federated mode needs >=2 sections; got $num_sections." >&2
+    exit 1
+  fi
+
+  ML=true
+  EXPLORE=true
+  RESUME=true
+  WORKERS=$num_sections
+  FEDAVG_DIR="$SCRIPT_DIR/data/federated_weights"
+  FEDAVG_AGG_LOG_DIR="$SCRIPT_DIR/data/fedavg"
+
+  echo "[run_tests] Federated training: topology=$TOPOLOGY, sections=$num_sections, "
+  echo "[run_tests]   fedavg_every=$FEDAVG_EVERY steps, timeout=$FEDAVG_TIMEOUT s,"
+  echo "[run_tests]   sections.json=$SECTIONS_JSON"
+  echo "[run_tests]   weights_dir=$FEDAVG_DIR"
+
+  # Fresh state — leftover worker_*.pt or global_*.pt from a previous run
+  # would confuse the aggregator's round-counter resume logic.
+  mkdir -p "$FEDAVG_DIR" "$FEDAVG_AGG_LOG_DIR"
+  rm -f "$FEDAVG_DIR"/*.pt "$FEDAVG_DIR"/*.pt.tmp 2>/dev/null || true
+
+  start_aggregator
+  start_ml_service
+
+  local jobs=()
+  local i
+  for ((i=0; i<num_sections; i++)); do
+    local sid="${WORKER_SECTION_IDS[$i]}"
+    local label="${TOPOLOGY}-fed-s${sid}-seed${SEED}"
+    # Section info lives in the WORKER_SECTION_* globals; run_one reads the
+    # entry that matches its dispatch slot. No fragile per-job arg quoting.
+    jobs+=("run_one \"$label\"")
+  done
+  dispatch_parallel "${jobs[@]}"
+
+  echo
+  echo "[run_tests] Federated run complete. Aggregator round log:"
+  echo "[run_tests]   $FEDAVG_AGG_LOG_DIR/rounds.csv"
+}
+
+## Fullrun mode (Phase 2 of hierarchical SDN). One ns-3 process, the FULL
+## topology, M Local Controllers, each owning its section. Inter-domain
+## routing via static border-switch flow-mods (Option A) precomputed from
+## sections.json's inter_domain_routes block. M ML services run on
+## consecutive ports (mlPortBase + 0..M-1). FedAvg is opt-in via
+## --fedAvgEverySteps; when on, the same root_aggregator.py from Phase 1
+## FedAvgs the in-process controllers' weights via the shared dir.
+cmd_fullrun() {
+  : "${SECTIONS_JSON:=$SCRIPT_DIR/scenarios/usa/sections.json}"
+  if [[ ! -f "$SECTIONS_JSON" ]]; then
+    echo "[run_tests] ERROR: sections.json not found at $SECTIONS_JSON" >&2
+    echo "[run_tests] Provide --sectionsJson <path>." >&2
+    exit 1
+  fi
+
+  # Parse sections.json once. Output is three lines: section count, then
+  # ';'-separated nodes CSVs, then ';'-separated border-switch CSVs, then
+  # the inter_domain_routes "from:to:via:next,..." string.
+  local parsed
+  parsed=$(python3 - "$SECTIONS_JSON" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    spec = json.load(f)
+sections = spec.get("sections", [])
+nodes   = ";".join(",".join(str(n) for n in s["nodes"]) for s in sections)
+borders = ";".join(",".join(str(n) for n in s.get("border_switches", [])) for s in sections)
+idr = spec.get("inter_domain_routes", [])
+idr_csv = ",".join(
+    f"{r['from_section']}:{r['to_section']}:{r['via_switch']}:{r['next_switch']}"
+    for r in idr
+)
+print(len(sections))
+print(nodes)
+print(borders)
+print(idr_csv)
+PY
+  )
+  local num_sections nodes_csv borders_csv idr_csv
+  num_sections=$(echo "$parsed" | sed -n 1p)
+  nodes_csv=$(echo   "$parsed" | sed -n 2p)
+  borders_csv=$(echo "$parsed" | sed -n 3p)
+  idr_csv=$(echo     "$parsed" | sed -n 4p)
+
+  if (( num_sections < 2 )); then
+    echo "[run_tests] ERROR: fullrun needs sections.json with >=2 sections; got $num_sections." >&2
+    exit 1
+  fi
+
+  # In fullrun, M = number of in-process controllers AND number of ML
+  # services. The scenario itself is single-process — WORKERS is reused
+  # to size start_ml_service's per-controller port allocation.
+  ML=true
+  EXPLORE=true
+  RESUME=true
+  WORKERS=$num_sections
+  TOPOLOGY="usa-fullrun"
+
+  if (( FEDAVG_EVERY > 0 )); then
+    FEDAVG_DIR="$SCRIPT_DIR/data/federated_weights"
+    FEDAVG_AGG_LOG_DIR="$SCRIPT_DIR/data/fedavg"
+    echo "[run_tests] Fullrun: topology=$TOPOLOGY sections=$num_sections fedavg=$FEDAVG_EVERY"
+    mkdir -p "$FEDAVG_DIR" "$FEDAVG_AGG_LOG_DIR"
+    rm -f "$FEDAVG_DIR"/*.pt "$FEDAVG_DIR"/*.pt.tmp 2>/dev/null || true
+    start_aggregator
+  else
+    echo "[run_tests] Fullrun: topology=$TOPOLOGY sections=$num_sections fedavg=off"
+  fi
+  echo "[run_tests]   sections.json=$SECTIONS_JSON"
+
+  ensure_built "$TOPOLOGY"
+  start_ml_service
+
+  # Section config + ML port base are passed directly via EXTRA_ARGS.
+  # The scenario reads sectionNodes/borderSwitches/interDomainRoutes and
+  # builds the multi-controller wiring; mlPortBase tells each controller
+  # i to dial tcp://127.0.0.1:(mlPortBase+i).
+  EXTRA_ARGS+=("--sectionNodes=$nodes_csv")
+  EXTRA_ARGS+=("--borderSwitches=$borders_csv")
+  EXTRA_ARGS+=("--interDomainRoutes=$idr_csv")
+  EXTRA_ARGS+=("--mlPortBase=$ML_PORT_BASE")
+
+  run_one "${TOPOLOGY}-seed${SEED}"
+
+  if (( FEDAVG_EVERY > 0 )); then
+    echo
+    echo "[run_tests] Fullrun done. Aggregator round log:"
+    echo "[run_tests]   $FEDAVG_AGG_LOG_DIR/rounds.csv"
+  fi
+}
+
 cmd_summary() {
   local f="${1:-}"
   [[ -n "$f" && -f "$f" ]] || { echo "summary: file not found: $f" >&2; exit 1; }
@@ -529,24 +938,32 @@ while [[ $# -gt 0 ]]; do
     --no-resume)    RESUME=false; shift ;;
     --no-auto-ml)   AUTO_ML=false; shift ;;
     --verbose)      NS3_VERBOSE=true; shift ;;
+    --workers)      WORKERS="$2"; shift 2 ;;
     --trainRounds)    TRAIN_ROUNDS="$2"; shift 2 ;;
     --trainModes)     TRAIN_MODES="$2"; shift 2 ;;
     --trainFailures)  TRAIN_FAILURES="$2"; shift 2 ;;
     --trainCripple)   TRAIN_CRIPPLE="$2"; shift 2 ;;
+    --sectionsJson)       SECTIONS_JSON="$2"; shift 2 ;;
+    --fedAvgEverySteps)   FEDAVG_EVERY="$2"; shift 2 ;;
+    --fedAvgTimeoutS)     FEDAVG_TIMEOUT="$2"; shift 2 ;;
     -h|--help)      usage; exit 0 ;;
     --)             shift; EXTRA_ARGS=("$@"); break ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac
 done
 
+ensure_built "$TOPOLOGY"
+
 case "$MODE" in
-  single)  cmd_single ;;
-  compare) cmd_compare ;;
-  presets) cmd_presets ;;
-  seeds)   cmd_seeds ;;
-  matrix)  cmd_matrix ;;
-  eval)    cmd_eval ;;
-  train)   cmd_train ;;
+  single)    cmd_single ;;
+  compare)   cmd_compare ;;
+  presets)   cmd_presets ;;
+  seeds)     cmd_seeds ;;
+  matrix)    cmd_matrix ;;
+  eval)      cmd_eval ;;
+  train)     cmd_train ;;
+  federated) cmd_federated ;;
+  fullrun)   cmd_fullrun ;;
   *) echo "Unknown mode: $MODE" >&2; usage; exit 1 ;;
 esac
 

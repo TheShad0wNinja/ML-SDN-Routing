@@ -13,8 +13,8 @@ Architecture
 
 Wire protocol (JSON over ZMQ REQ/REP)
 -------------------------------------
-- `{"cmd":"hello", "arch":"gnn-v1", "num_switches":N, "num_links":L,
-    "node_feat_dim":5, "edge_feat_dim":3, "action_dim":L, "seed":S,
+- `{"cmd":"hello", "arch":"gnn-v3", "num_switches":N, "num_links":L,
+    "node_feat_dim":2, "edge_feat_dim":3, "action_dim":L, "seed":S,
     "resume":bool, "checkpoint_every_n_ticks":K}` → `{"ok":true}`
 - `{"cmd":"observe", "tick":t, "state":{...}, "prev_reward":r,
     "explore":bool}` → `{"action":[float * action_dim]}`
@@ -63,24 +63,39 @@ except Exception as exc:  # pragma: no cover — fires without torch or PyG
     _TORCH_IMPORT_ERROR = exc
 
 
-_AGENT_DIR = "scratch/data/agent"
+# Per-worker agent state. Set NS3_ML_AGENT_DIR to isolate parallel workers.
+_AGENT_DIR = os.environ.get("NS3_ML_AGENT_DIR", "scratch/data/agent")
 _CKPT_PATH = os.path.join(_AGENT_DIR, "local.pt")
 _REPLAY_PATH = os.path.join(_AGENT_DIR, "replay.pkl")
 _METRICS_PATH = os.path.join(_AGENT_DIR, "metrics.csv")
 
-# Bumped when the on-disk format changes in a way the loader can't fix up.
-# The GNN refactor invalidates old MLP checkpoints and replay tuples.
-_ARCH_TAG = "gnn-v1"
+# Federation. When NS3_FEDAVG_DIR is set and NS3_FEDAVG_EVERY_STEPS > 0, the
+# worker dumps its (actor, critic) state dicts to a shared directory every K
+# train steps and blocks until the root aggregator publishes the averaged
+# model. NS3_WORKER_ID identifies this worker in the shared dir (must be
+# unique across the M participating workers).
+_FEDAVG_DIR = os.environ.get("NS3_FEDAVG_DIR", "")
+_FEDAVG_EVERY = int(os.environ.get("NS3_FEDAVG_EVERY_STEPS", "0") or 0)
+_WORKER_ID = int(os.environ.get("NS3_WORKER_ID", "0"))
+_FEDAVG_WAIT_TIMEOUT_S = float(
+    os.environ.get("NS3_FEDAVG_WAIT_TIMEOUT_S", "300") or 300)
 
-# Log-scale caps for unbounded queueing telemetry. log1p(1000) ≈ 6.91 — well
-# past typical d_ms (~500ms practical max) and rtt_ms (~1s pathological).
-_MAX_LOG_DELAY = math.log1p(1000.0)
+# Bumped when the on-disk format changes in a way the loader can't fix up.
+# v3: dropped Oracle queue_depth — edge features shrank from 5→3
+# (drop_norm, util, cost_norm). drop_norm is now normalized dynamically
+# against per-link capacity, not against magic constants, so the GNN is
+# scale-invariant across heterogeneous topologies and the trained model
+# is deployable on stock OF1.3 hardware. Old checkpoints are incompatible.
+_ARCH_TAG = "gnn-v3"
+
+# Log-scale cap for unbounded RTT telemetry. log1p(1000) ≈ 6.91 — well past
+# typical rtt_ms (~1s pathological).
 _MAX_LOG_RTT = math.log1p(1000.0)
 
 # GNN feature dims advertised by the C++ controller. Hardcoded here as defaults
 # so the agent can still be instantiated for smoke tests; the real values come
 # from the hello payload.
-_NODE_FEAT_DIM = 5
+_NODE_FEAT_DIM = 2
 _EDGE_FEAT_DIM = 3
 
 
@@ -399,24 +414,34 @@ class LocalDDPGAgent:
 def _build_graph_data(state: dict) -> "Data":
     """Build a torch_geometric Data object from the controller's state JSON.
 
-    Expected schema (from C++ BuildMlStatePayload):
+    Expected schema (from C++ BuildMlStatePayload, gnn-v3):
       state.node_index = [dpid_0, dpid_1, ...]   (frozen canonical order)
-      state.per_switch = [{dpid, rho, d_ms, p_loss, depletion, echo_rtt_ns}, ...]
+      state.per_switch = [{dpid, depletion, echo_rtt_ns}, ...]
       state.per_link   = [{src, dst, tx_bps, capacity_bps, utilization, cost,
-                           base_cost, delay_ms}, ...]
+                           base_cost, delay_ms,
+                           src_tx_bps, src_utilization, src_drop_rate_bps,
+                           dst_tx_bps, dst_utilization, dst_drop_rate_bps}, ...]
       state.residual_energy_stddev = float
 
     Returns Data with:
-      x                    [N, 5]   node features
+      x                    [N, 2]   node features: depletion, log1p(rtt_ms)/X
       edge_index           [2, 2L]  bidirectional message-passing edges
-      edge_attr            [2L, 3]  features for message-passing edges
+      edge_attr            [2L, 3]  features per direction (asymmetric):
+                                     [drop_norm, utilization, cost_norm]
       canonical_edge_index [2, L]   one direction per link (matches action vec)
-      canonical_edge_attr  [L, 3]   features for canonical edges
+      canonical_edge_attr  [L, 3]   src-direction features for canonical edges
       u                    [1]      global residual_energy_stddev
 
-    d_ms and echo_rtt are log1p-scaled to keep Tanh activations in their linear
-    regime when queues back up — a queue spike from ~5ms to ~500ms would
-    otherwise saturate the first GAT layer's attention scores.
+    Drop rate is normalized against per-link capacity (not a magic constant),
+    so the feature stays in [0, 1] across heterogeneous topologies — a 1 Mbps
+    drop on a 10 Gbps core link reads ~0.0001 while the same drop on a 10 Mbps
+    edge link reads 0.1. The GNN learns capacity-relative congestion physics
+    instead of memorizing raw byte counts.
+
+    Traffic physics lives on edges, not nodes — congestion is a property of
+    a port, not a switch. The reverse-direction message-passing edge uses
+    `dst_*` fields so the GAT can attend asymmetrically (a saturated egress
+    port on one side of a link doesn't imply backpressure on the other).
     """
     node_index = state.get("node_index", []) or []
     dpid_to_idx = {int(d): i for i, d in enumerate(node_index)}
@@ -427,15 +452,10 @@ def _build_graph_data(state: dict) -> "Data":
         idx = dpid_to_idx.get(int(sw.get("dpid", -1)), -1)
         if idx < 0:
             continue
-        d_ms = max(0.0, float(sw.get("d_ms", 0.0)))
-        d_ms_norm = math.log1p(d_ms) / _MAX_LOG_DELAY
         rtt_ms = max(0.0, float(sw.get("echo_rtt_ns", 0.0))) / 1.0e6
         rtt_norm = math.log1p(rtt_ms) / _MAX_LOG_RTT
-        x[idx, 0] = float(sw.get("rho", 0.0))
-        x[idx, 1] = float(d_ms_norm)
-        x[idx, 2] = float(sw.get("p_loss", 0.0))
-        x[idx, 3] = float(sw.get("depletion", 0.0))
-        x[idx, 4] = float(rtt_norm)
+        x[idx, 0] = float(sw.get("depletion", 0.0))
+        x[idx, 1] = float(rtt_norm)
 
     per_link = state.get("per_link", []) or []
     L = len(per_link)
@@ -443,17 +463,30 @@ def _build_graph_data(state: dict) -> "Data":
     max_cost = max((float(l.get("cost", 1.0)) for l in per_link), default=1.0)
     max_cost = max(max_cost, 1e-9)
 
+    def edge_features(l: dict, drop_bps: float, util: float) -> np.ndarray:
+        cap = float(l.get("capacity_bps", 0.0))
+        safe_cap = cap if cap > 0.0 else 1.0   # avoid /0 on dead links
+        return np.array([
+            min(1.0, max(0.0, drop_bps) / safe_cap),
+            float(util),
+            float(l.get("cost", 0.0)) / max_cost,
+        ], dtype=np.float32)
+
     canon_src = np.zeros(max(L, 1), dtype=np.int64)
     canon_dst = np.zeros(max(L, 1), dtype=np.int64)
-    edge_attr = np.zeros((max(L, 1), _EDGE_FEAT_DIM), dtype=np.float32)
+    canon_attr = np.zeros((max(L, 1), _EDGE_FEAT_DIM), dtype=np.float32)
+    reverse_attr = np.zeros((max(L, 1), _EDGE_FEAT_DIM), dtype=np.float32)
     for i, l in enumerate(per_link):
         canon_src[i] = dpid_to_idx.get(int(l.get("src", -1)), 0)
         canon_dst[i] = dpid_to_idx.get(int(l.get("dst", -1)), 0)
-        cap = float(l.get("capacity_bps", 0.0))
-        tx = float(l.get("tx_bps", 0.0))
-        edge_attr[i, 0] = float(l.get("utilization", 0.0))
-        edge_attr[i, 1] = float(l.get("cost", 0.0)) / max_cost
-        edge_attr[i, 2] = (tx / cap) if cap > 0.0 else 0.0
+        canon_attr[i] = edge_features(
+            l,
+            float(l.get("src_drop_rate_bps", 0.0)),
+            float(l.get("src_utilization", l.get("utilization", 0.0))))
+        reverse_attr[i] = edge_features(
+            l,
+            float(l.get("dst_drop_rate_bps", 0.0)),
+            float(l.get("dst_utilization", 0.0)))
 
     # When L=0 we still emit a dummy self-loop on node 0 so GATConv has something
     # to chew on. With no real edges the gradient through edge_attr is null
@@ -469,7 +502,10 @@ def _build_graph_data(state: dict) -> "Data":
     bidir_src = np.concatenate([canon_src[:L_eff], canon_dst[:L_eff]])
     bidir_dst = np.concatenate([canon_dst[:L_eff], canon_src[:L_eff]])
     bidir_edge_index = np.stack([bidir_src, bidir_dst], axis=0)
-    bidir_edge_attr = np.concatenate([edge_attr[:L_eff], edge_attr[:L_eff]], axis=0)
+    # Canonical (src→dst) attrs first; reverse (dst→src) attrs second — matching
+    # the bidir_src/bidir_dst concatenation order above.
+    bidir_edge_attr = np.concatenate([canon_attr[:L_eff], reverse_attr[:L_eff]],
+                                     axis=0)
 
     u = np.array([float(state.get("residual_energy_stddev", 0.0))],
                  dtype=np.float32)
@@ -484,7 +520,7 @@ def _build_graph_data(state: dict) -> "Data":
     # by num_nodes when graphs are batched — exactly what we need so
     # canonical_edge_index keeps pointing at the right nodes after batching.
     data.canonical_edge_index = torch.from_numpy(canonical_edge_index)
-    data.canonical_edge_attr = torch.from_numpy(edge_attr[:L_eff].copy())
+    data.canonical_edge_attr = torch.from_numpy(canon_attr[:L_eff].copy())
     return data
 
 
@@ -521,6 +557,12 @@ class MLService:
         self._metrics_fh = None
         self._metrics_writer = None
 
+        # Federation round counter. Incremented after each fedavg submit+load
+        # regardless of outcome — the aggregator is the source of truth for
+        # round numbering, but workers need to track which round they're on
+        # so a re-derived (train_steps // K) formula doesn't skip round 0.
+        self._fedavg_round = 0
+
     # ------------------------------------------------------------------
     def run(self) -> None:
         # Turn SIGTERM into a clean shutdown so the `finally` block below saves
@@ -551,8 +593,9 @@ class MLService:
                 except Exception as exc:
                     print(f"[ML] shutdown checkpoint save failed: {exc}")
             try:
+                self.rep.setsockopt(zmq.LINGER, 0)
                 self.rep.close()
-                self.ctx.term()
+                self.ctx.destroy(linger=0)
             except Exception:
                 pass
             if self._metrics_fh:
@@ -612,6 +655,83 @@ class MLService:
                     self.agent.save_checkpoint()
                 except Exception as exc:
                     print(f"[ML] checkpoint save failed: {exc}")
+
+            # 6. Federation. Dump weights, block on the global average.
+            #    The IO thread keeps serving `act()` with the last cached
+            #    action during the wait, so ns-3 never stalls. The round
+            #    counter advances unconditionally — if a worker hits the
+            #    wait timeout, it still moves to the next round so it stays
+            #    in lockstep with the aggregator.
+            if (_FEDAVG_DIR and _FEDAVG_EVERY > 0
+                    and self._train_steps % _FEDAVG_EVERY == 0):
+                try:
+                    self._do_fedavg_round()
+                except Exception as exc:
+                    print(f"[ML] fedavg round failed: {exc}")
+                self._fedavg_round += 1
+
+    # ------------------------------------------------------------------
+    def _do_fedavg_round(self) -> None:
+        """Submit local weights to the shared dir, wait for the global model,
+        and replace local actor/critic with the averaged version.
+
+        Files written:  {_FEDAVG_DIR}/worker_{worker_id}_round_{r}.pt
+        File polled:    {_FEDAVG_DIR}/global_round_{r}.pt
+        """
+        if self.agent is None or not _HAS_TORCH:
+            return
+        r = self._fedavg_round
+        os.makedirs(_FEDAVG_DIR, exist_ok=True)
+        worker_path = os.path.join(
+            _FEDAVG_DIR, f"worker_{_WORKER_ID}_round_{r}.pt")
+        global_path = os.path.join(_FEDAVG_DIR, f"global_round_{r}.pt")
+
+        # 1. Snapshot — atomic write (.tmp then rename) so the aggregator
+        #    never sees a partial file.
+        t0 = time.perf_counter()
+        blob = {
+            "arch": _ARCH_TAG,
+            "worker_id": _WORKER_ID,
+            "round": r,
+            "actor": self.agent.actor.state_dict(),
+            "critic": self.agent.critic.state_dict(),
+        }
+        tmp = worker_path + ".tmp"
+        torch.save(blob, tmp)
+        os.replace(tmp, worker_path)
+
+        # 2. Wait for the aggregator. Soft timeout: keep training with the
+        #    pre-round local weights rather than hanging the sim.
+        deadline = t0 + _FEDAVG_WAIT_TIMEOUT_S
+        while not os.path.exists(global_path):
+            if self._stop.is_set():
+                return
+            if time.perf_counter() > deadline:
+                print(f"[ML] fedavg round {r} wait timed out after "
+                      f"{_FEDAVG_WAIT_TIMEOUT_S:.0f}s — continuing without "
+                      f"the global update.")
+                return
+            time.sleep(0.5)
+
+        # 3. Load. Replace actor+critic and re-sync the target nets so the
+        #    polyak update doesn't immediately undo the average.
+        try:
+            global_blob = torch.load(global_path, map_location="cpu")
+        except Exception as exc:
+            print(f"[ML] fedavg load failed for round {r}: {exc}")
+            return
+        if global_blob.get("arch") != _ARCH_TAG:
+            print(f"[ML] fedavg round {r}: global arch="
+                  f"{global_blob.get('arch')!r} != {_ARCH_TAG!r} — skipping.")
+            return
+        self.agent.actor.load_state_dict(global_blob["actor"])
+        self.agent.actor_target.load_state_dict(self.agent.actor.state_dict())
+        self.agent.critic.load_state_dict(global_blob["critic"])
+        self.agent.critic_target.load_state_dict(
+            self.agent.critic.state_dict())
+        wait_ms = (time.perf_counter() - t0) * 1000.0
+        print(f"[ML] fedavg round {r}: loaded global "
+              f"(wait={wait_ms:.0f}ms, worker={_WORKER_ID})")
 
     # ------------------------------------------------------------------
     def _log_metrics(self, **row) -> None:
@@ -765,5 +885,16 @@ class MLService:
 
 
 if __name__ == "__main__":
-    service = MLService()
+    # Per-worker config via env vars (evaluated at module load, so they reach
+    # the AgentDDPG default-arg paths). Run multiple instances by setting
+    # NS3_ML_PORT and NS3_ML_AGENT_DIR to per-worker values.
+    port = int(os.environ.get("NS3_ML_PORT", "5555"))
+    service = MLService(bind_endpoint=f"tcp://*:{port}")
+    fed_summary = (
+        f"fedavg=on dir={_FEDAVG_DIR} worker_id={_WORKER_ID} "
+        f"every={_FEDAVG_EVERY} steps"
+        if _FEDAVG_DIR and _FEDAVG_EVERY > 0
+        else "fedavg=off"
+    )
+    print(f"[ML] bound port={port} agent_dir={_AGENT_DIR} {fed_summary}")
     service.run()

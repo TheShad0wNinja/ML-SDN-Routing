@@ -197,17 +197,25 @@ document.getElementById('link-count').textContent = edges.length;
 (function renderGlobal(){
   const panel = document.getElementById('global-stats');
   if (!switchObs || Object.keys(switchObs).length===0) return;
-  let totalRho=0, nRho=0, maxLambda=0;
-  for (const o of Object.values(switchObs)) {
-    if (o.rho != null) { totalRho += o.rho; nRho++; }
-    if ((o.lambda_bps||0) > maxLambda) maxLambda = o.lambda_bps;
+  // Aggregate per-port rx_rate_bps for an arrival-rate summary (was lambda_bps
+  // in the old M/M/1/K schema). Walk the stats block since switch_observations
+  // no longer carries an aggregate.
+  let maxArrival=0, maxQDepth=0, totalLBps=0;
+  for (const [dpid, ports] of Object.entries(statsData||{})) {
+    let sumRx=0;
+    for (const ps of Object.values(ports||{})) sumRx += (ps.rx_rate_bps||0);
+    if (sumRx > maxArrival) maxArrival = sumRx;
   }
-  const avgRho = nRho > 0 ? totalRho/nRho : null;
+  for (const o of Object.values(switchObs)) {
+    if ((o.max_qdepth_bytes||0) > maxQDepth) maxQDepth = o.max_qdepth_bytes;
+    totalLBps += (o.L_bps||0);
+  }
   panel.innerHTML =
     '<hr style="border-color:#334155;margin:10px 0;">'+
     '<h4 style="margin-top:0">Network-Wide State</h4>'+
-    (avgRho != null ? metricRow('Avg ρ (utilisation)', (avgRho*100).toFixed(1)+'%', rhoClass(avgRho)) : '')+
-    metricRow('Peak λ (arrival)',    fmtBps(maxLambda))+
+    metricRow('Peak rx-rate',          fmtBps(maxArrival))+
+    metricRow('Peak queue depth',      maxQDepth.toLocaleString()+' B')+
+    metricRow('Total drop rate',       fmtBps(totalLBps))+
     (muMaxGlobal>0 ? metricRow('μ_max (global cap)', fmtBps(muMaxGlobal)) : '');
 })();
 
@@ -481,19 +489,14 @@ network.on('click', function(params) {
     // Per-port stats (read early so obs section can use port speeds)
     const swStats = statsData[String(nodeId)];
 
-    // DDPG observation vector
+    // Switch observation — empirical reductions of per-port truth (used by
+    // the C++ reward only; the GNN now reads per-link edge_attr directly).
     const obs = switchObs[String(nodeId)];
     if (obs) {
-      html += '<h4>Switch Observation (M/M/1/K)</h4>';
-      html += metricRow('λ (arrival rate)',  fmtBps(obs.lambda_bps || 0));
-      if (obs.mu_max_bps != null) html += metricRow('μ_max (capacity)', fmtBps(obs.mu_max_bps));
-      if (obs.rho        != null) html += metricRow('ρ (utilisation)',  (obs.rho*100).toFixed(2)+'%', rhoClass(obs.rho));
-      html += metricRow('K (queue cap)', (obs.K||0).toFixed(0)+' pkts');
-      if (obs.N    != null) html += metricRow('N (queue depth)', obs.N.toFixed(3)+' pkts', obs.N>32?'crit':obs.N>10?'warn':'');
-      if (obs.d_ms   != null) html += metricRow('d (delay est.)',   obs.d_ms.toFixed(3)+' ms',          obs.d_ms>50?'crit':obs.d_ms>10?'warn':'');
-      if (obs.p_loss != null) html += metricRow('P_loss (blocking)',(obs.p_loss*100).toFixed(4)+'%',   obs.p_loss>0.05?'crit':obs.p_loss>0.01?'warn':'');
-      html += metricRow('L (loss rate)', fmtBps(obs.L_bps || 0));
-      if (obs.rbw_bps != null) html += metricRow('RBW', fmtBps(obs.rbw_bps));
+      html += '<h4>Switch Observation</h4>';
+      if (obs.d_ms != null) html += metricRow('d (max port residence)', obs.d_ms.toFixed(3)+' ms', obs.d_ms>50?'crit':obs.d_ms>10?'warn':'');
+      html += metricRow('L (drop rate, sum)', fmtBps(obs.L_bps || 0));
+      if (obs.max_qdepth_bytes != null) html += metricRow('Peak queue depth', obs.max_qdepth_bytes.toLocaleString()+' B', obs.max_qdepth_bytes>500000?'crit':obs.max_qdepth_bytes>100000?'warn':'');
 
       if (obs.residual_energy_j != null && obs.residual_energy_j >= 0) {
         const ej = obs.residual_energy_j;
@@ -507,14 +510,18 @@ network.on('click', function(params) {
     }
     if (swStats && Object.keys(swStats).length>0) {
       html += '<h4>Port Statistics</h4>';
-      html += '<table><tr><th>Port</th><th>RX</th><th>TX</th><th>RX rate</th><th>TX rate</th><th>Drop</th></tr>';
+      html += '<table><tr><th>Port</th><th>RX</th><th>TX</th><th>RX rate</th><th>TX rate</th><th>Queue (B)</th><th>Queue (pkts)</th><th>Drop rate</th><th>Drop (total)</th></tr>';
       for (const [pno, s] of Object.entries(swStats)) {
+        const dropRate = (s.rx_drop_rate_bps??0) + (s.tx_drop_rate_bps??0);
         html += '<tr>';
         html += '<td>'+pno+'</td>';
         html += '<td>'+fmtBytes(s.rx_bytes??0)+'</td>';
         html += '<td>'+fmtBytes(s.tx_bytes??0)+'</td>';
         html += '<td>'+(s.rx_rate_bps!=null?fmtBps(s.rx_rate_bps):'—')+'</td>';
         html += '<td>'+(s.tx_rate_bps!=null?fmtBps(s.tx_rate_bps):'—')+'</td>';
+        html += '<td>'+(s.queue_depth_bytes??0).toLocaleString()+'</td>';
+        html += '<td>'+(s.queue_depth_pkts??0)+'</td>';
+        html += '<td>'+(dropRate>0?fmtBps(dropRate):'—')+'</td>';
         html += '<td>'+((s.rx_dropped??0)+(s.tx_dropped??0))+'</td>';
         html += '</tr>';
       }
