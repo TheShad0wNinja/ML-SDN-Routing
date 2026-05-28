@@ -46,7 +46,7 @@ ZmqOpenFlowController::ZmqOpenFlowController() {}
 ZmqOpenFlowController::~ZmqOpenFlowController() {}
 
 void ZmqOpenFlowController::DoDispose() {
-  WriteStateToJson();
+  // WriteStateToJson();
   m_switchMap.clear();
   m_macToLoc.clear();
   m_switchPorts.clear();

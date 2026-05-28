@@ -64,6 +64,14 @@ AUTO_ML=true
 NS3_VERBOSE=false
 ML_PORT_BASE=5555
 
+# Agent directory layout. Switched by mode (not by WORKERS) so training scratch
+# never collides with deployment runtime.
+#   flat   — single dir at $base (single-controller modes; the canonical model)
+#   train  — $base/train/w<id>/  (per-worker training scratch; FedAvg producer)
+#   deploy — $base/deploy/s<id>/ (per-section deployment runtime; seeded from
+#            $base/local.pt before each multiController run)
+ML_LAYOUT="flat"
+
 # Federated training (used by `train` mode).
 FED_ROUNDS=1              # back-to-back rounds in one invocation
 FED_RESET=false           # --reset: wipe priority's training state before training
@@ -113,9 +121,13 @@ Options:
   --seed N              Base random seed                           (default: 12345)
   --seeds N             Number of seeds for seeds/matrix modes     (default: 5)
   --priority X          balanced | throughput | energy | custom (default: balanced)
-                        Each priority has its own checkpoint dir under
-                        scratch/data/agent/<priority>/ — train all three
-                        independently and switch between them via this flag.
+                        Each priority has its own dir under
+                        scratch/data/agent/<priority>/ — train independently
+                        and switch via this flag. Layout:
+                          local.pt          canonical model (FedAvg result)
+                          train/w<id>/      per-worker training scratch
+                          deploy/s<id>/     per-section multiController runtime
+                                            (re-seeded from local.pt each run)
   --ml | --no-ml        Enable / disable the ML controller         (default: off)
   --mixedLoad | --no-mixedLoad
                         Toggle mixed-protocol (TCP+UDP) background load
@@ -164,8 +176,32 @@ ml_port_for_slot()      { echo $((ML_PORT_BASE + $1)); }
 ml_endpoint_for_slot()  { echo "tcp://127.0.0.1:$(ml_port_for_slot "$1")"; }
 ml_agent_dir_for_slot() {
   local base; base=$(ckpt_dir_for_priority "$PRIORITY")
-  if (( WORKERS <= 1 )); then echo "$base"
-  else echo "$base/w$1"; fi
+  case "$ML_LAYOUT" in
+    train)      echo "$base/train/w$1" ;;
+    deploy)     echo "$base/deploy/s$1" ;;
+    flat|*)     echo "$base" ;;
+  esac
+}
+
+# Copy the canonical $base/local.pt into each deploy section dir so every
+# controller in a --multiController run loads the same FedAvg'd weights.
+# Called from cmd_single before start_ml_service when ML_LAYOUT=deploy.
+seed_deploy_dirs() {
+  local base; base=$(ckpt_dir_for_priority "$PRIORITY")
+  local src="$base/local.pt"
+  if [[ ! -f "$src" ]]; then
+    echo "[run_tests] WARN: no $src — deploy sections will start from random init." >&2
+    echo "[run_tests]       Train first (run_tests.sh train …) or provide weights." >&2
+    return 0
+  fi
+  local s
+  for ((s=0; s<WORKERS; s++)); do
+    local d; d=$(ml_agent_dir_for_slot "$s")
+    mkdir -p "$d"
+    cp "$src" "$d/local.pt"
+    rm -f "$d/replay.pkl"            # stale replay would confound a fresh deploy
+  done
+  echo "[run_tests] Seeded $WORKERS deploy section(s) from $src"
 }
 
 # True only when the python service is actually pumping its REP loop. A
@@ -600,6 +636,8 @@ cmd_single() {
     if (( SECTIONS > 1 )); then
       WORKERS=$SECTIONS
       EXTRA_ARGS+=("--sections=$SECTIONS")
+      ML_LAYOUT="deploy"
+      seed_deploy_dirs
     fi
   fi
   if $ML || $MULTI_CONTROLLER; then start_ml_service; fi
@@ -693,6 +731,7 @@ cmd_train() {
   RESUME=true
   MIXED_LOAD=true           # need traffic for the agent to learn from
   WORKERS=$total            # ml services + dispatch use the total
+  ML_LAYOUT="train"         # workers write to $base/train/w<id>/
   FEDAVG_DIR="$SCRIPT_DIR/data/federated_weights/$PRIORITY"
   FEDAVG_AGG_LOG_DIR="$SCRIPT_DIR/data/fedavg/$PRIORITY"
 
@@ -786,6 +825,18 @@ cmd_train() {
   echo
   echo "[run_tests] Training complete ($FED_ROUNDS rounds, $total workers/round)."
   echo "[run_tests]   Aggregator round log: $FEDAVG_AGG_LOG_DIR/rounds.csv"
+
+  # Publish the canonical model: latest global_round_*.pt → $base/local.pt.
+  # This is what eval / single / --multiController will load.
+  local base; base=$(ckpt_dir_for_priority "$PRIORITY")
+  local latest; latest=$(ls -v "$FEDAVG_DIR"/global_round_*.pt 2>/dev/null | tail -1 || true)
+  if [[ -n "$latest" ]]; then
+    mkdir -p "$base"
+    cp "$latest" "$base/local.pt"
+    echo "[run_tests]   Published canonical model: $base/local.pt (← $(basename "$latest"))"
+  else
+    echo "[run_tests]   WARN: no global_round_*.pt produced; $base/local.pt untouched." >&2
+  fi
 }
 
 cmd_summary() {

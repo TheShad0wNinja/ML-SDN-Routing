@@ -1,1 +1,5 @@
 # Machine Learning Routing in a Distributed Software Defined Network
+
+## Install
+Required to run this due to hidden symbosl breaking running of the sscript on linux.
+`sed -i 's/\r$//' ./scratch/run_tests.sh`
