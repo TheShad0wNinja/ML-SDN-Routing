@@ -1494,6 +1494,7 @@ std::string ZmqOpenFlowController::BuildMlStatePayload() {
     << "\"tick\":" << m_mlTick << ","
     << "\"prev_reward\":" << m_mlPrevReward << ","
     << "\"explore\":" << (m_ml.explore ? "true" : "false") << ","
+    << "\"learn\":" << (m_ml.learn ? "true" : "false") << ","
     << "\"state\":{";
 
   // ---- node index (dpid list in frozen order) ----

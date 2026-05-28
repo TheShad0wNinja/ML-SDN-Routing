@@ -607,7 +607,7 @@ class MLService:
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                tick, graph, prev_reward, explore = self._req_q.get(timeout=0.5)
+                tick, graph, prev_reward, explore, learn = self._req_q.get(timeout=0.5)
             except queue.Empty:
                 continue
             if self.agent is None or not _HAS_TORCH:
@@ -619,10 +619,12 @@ class MLService:
                                 prev_reward, graph)
 
             # 2. Train step (no-op until replay has warmup samples).
-            #    Skip gradient updates entirely in eval mode — keeps the policy
-            #    frozen so ML-vs-baseline comparisons are deterministic.
+            #    Gated on `learn` so eval mode (learn=false) keeps the policy
+            #    frozen for deterministic ML-vs-baseline comparisons, while
+            #    online fine-tuning (explore=false, learn=true) can keep
+            #    updating weights without injecting action noise.
             t0 = time.perf_counter()
-            if explore:
+            if learn:
                 critic_loss, actor_loss = self.agent.train_step()
             else:
                 critic_loss, actor_loss = None, None
@@ -835,6 +837,10 @@ class MLService:
         # Default explore=true so behaviour is unchanged for older controllers
         # that don't send the field.
         explore = bool(msg.get("explore", True))
+        # `learn` gates train_step independently of action noise. Default to
+        # `explore` so older controllers (which only send `explore`) keep the
+        # original coupled semantics.
+        learn = bool(msg.get("learn", explore))
         state = msg.get("state", {}) or {}
 
         if not _HAS_TORCH:
@@ -854,7 +860,7 @@ class MLService:
 
         # Enqueue to worker — never block for more than a microsecond.
         try:
-            self._req_q.put_nowait((tick, graph, prev_reward, explore))
+            self._req_q.put_nowait((tick, graph, prev_reward, explore, learn))
         except queue.Full:
             pass
 

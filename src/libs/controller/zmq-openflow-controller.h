@@ -101,7 +101,8 @@ struct MlConfig {
   MlPriority priority_preset = BALANCED;
 
   // Exploration control
-  bool explore = true;                     // Gausssian noise enabled
+  bool explore = true;                     // Gaussian action noise enabled
+  bool learn = true;                       // Gradient updates / train_step enabled
   uint32_t checkpoint_every_n_ticks = 60;  // Python-side checkpoint cadence
   bool resume = true;                      // Python loads checkpoint if present
   uint32_t seed = 12345;                   // shared seed for Python RNG

@@ -21,6 +21,7 @@ struct MlOptions {
   double zeta = 0.5, eta = 1.5, theta = 1.0, kappa = 1.0;
   double delayRefMs = 200.0, lossRefBps = 1.0e6, powerRefW = 90000.0;
   bool explore = true;
+  bool learn = true;
   uint32_t checkpointEveryNTicks = 60;
   bool resume = true;
   std::string endpoint = "tcp://127.0.0.1:5555";

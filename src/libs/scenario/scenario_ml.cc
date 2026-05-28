@@ -31,7 +31,9 @@ void MlOptions::Register(CommandLine& cmd) {
   cmd.AddValue("mlPowerRef", "Power reference for normalization (W)",
                powerRefW);
   cmd.AddValue("mlExplore",
-               "Enable OU exploration & training updates", explore);
+               "Enable Gaussian action noise", explore);
+  cmd.AddValue("mlLearn",
+               "Enable gradient updates / train_step", learn);
   cmd.AddValue("mlCheckpointEveryNTicks", "Checkpoint cadence",
                checkpointEveryNTicks);
   cmd.AddValue("mlResume", "Resume from checkpoint", resume);
@@ -58,6 +60,7 @@ MlConfig MlOptions::BuildMlConfig(uint32_t seedIn) const {
   cfg.loss_ref_bps = lossRefBps;
   cfg.power_ref_w = powerRefW;
   cfg.explore = explore;
+  cfg.learn = learn;
   cfg.checkpoint_every_n_ticks = checkpointEveryNTicks;
   cfg.resume = resume;
   cfg.seed = seedIn;

@@ -8,7 +8,7 @@
 #   presets    baseline + 3 ML priority variants
 #   seeds      repeat one config across N consecutive seeds (in parallel)
 #   matrix     seeds × {central,random,grouped} × {failures} × {ml,baseline}
-#   eval       pretrained eval-only run (--mlExplore=false --mlResume=true)
+#   eval       pretrained eval-only run (--mlExplore=false --mlLearn=false --mlResume=true)
 #   train      federated training. --sections N --workers M --rounds R.
 #              Spawns N*M ns-3 processes total (M replicas per section),
 #              FedAvg'd by root_aggregator.py via scratch/data/federated_weights/.
@@ -55,6 +55,7 @@ FAILURES=false
 CRIPPLE=false
 MULTI_CONTROLLER=false
 EXPLORE=true
+LEARN=true
 RESUME=true
 N_SEEDS=5
 EVAL_WINDOW=0
@@ -91,7 +92,7 @@ Modes:
   presets               Baseline + 3 ML priority presets (balanced/delay/energy)
   seeds                 Sweep N consecutive seeds for one config
   matrix                Full matrix: seeds × {central,random,grouped} × {failures} × {ml,baseline}
-  eval                  ML run with --mlExplore=false --mlResume=true
+  eval                  ML run with --mlExplore=false --mlLearn=false --mlResume=true
   train                 Federated training. --sections N --workers M --rounds R
                         launches N*M parallel ns-3 processes (M replicas per
                         section), federated via scratch/data/federated_weights/.
@@ -122,7 +123,8 @@ Options:
   --failures | --no-failures   Toggle scheduled link churn         (default: off)
   --cripple  | --no-cripple    Toggle Missoula crippling (USA)     (default: off)
   --multiController     Run M in-process controllers using trained weights
-  --no-explore          Disable OU noise & gradient updates
+  --no-explore          Disable Gaussian action noise
+  --no-learn            Disable gradient updates / train_step (frozen policy)
   --no-resume           Don't resume the ML agent from checkpoint
   --evalWindowS N       Delay FlowMonitor reset by N seconds past warmup
   --no-auto-ml          Don't auto-start the Python ML service
@@ -410,6 +412,7 @@ build_args() {
     add_bool_if_supported ml true
     add_if_supported mlPriority "$PRIORITY"
     if [[ "$EXPLORE" == "false" ]]; then add_if_supported mlExplore false; fi
+    if [[ "$LEARN"   == "false" ]]; then add_if_supported mlLearn   false; fi
     if [[ "$RESUME"  == "false" ]]; then add_if_supported mlResume  false; fi
     if (( EVAL_WINDOW > 0 )); then add_if_supported evalWindowOffsetS "$EVAL_WINDOW"; fi
   fi
@@ -663,6 +666,7 @@ cmd_matrix() {
 cmd_eval() {
   ML=true
   EXPLORE=false
+  LEARN=false
   RESUME=true
   start_ml_service
   run_one "${TOPOLOGY}-eval-${PRIORITY}-${TRAFFIC_MODE}-seed${SEED}"
@@ -685,6 +689,7 @@ cmd_train() {
 
   ML=true
   EXPLORE=true
+  LEARN=true
   RESUME=true
   MIXED_LOAD=true           # need traffic for the agent to learn from
   WORKERS=$total            # ml services + dispatch use the total
@@ -830,6 +835,7 @@ while [[ $# -gt 0 ]]; do
     --no-cripple)   CRIPPLE=false; shift ;;
     --multiController) MULTI_CONTROLLER=true; shift ;;
     --no-explore)   EXPLORE=false; shift ;;
+    --no-learn)     LEARN=false; shift ;;
     --no-resume)    RESUME=false; shift ;;
     --no-auto-ml)   AUTO_ML=false; shift ;;
     --verbose)      NS3_VERBOSE=true; shift ;;
