@@ -40,7 +40,7 @@ struct TrafficClass {
 struct TrafficOptions {
   std::string mode = "random";   // random | central | grouped
   bool ping = true;
-  bool tcp = false;
+  bool mixedLoad = false;
   uint32_t maxConcurrent = 60;
   double arrivalRateHz = 8.0;
   // centralHostIdx: 0 = use the topology's defaultCentralHost. Override on the

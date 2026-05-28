@@ -200,7 +200,7 @@ int RunScenario(ScenarioOptions& opts, TopoSpec topo,
       opts.traffic.classes.empty() ? TrafficOptions::DefaultClasses()
                                    : opts.traffic.classes;
   if (opts.traffic.ping) traffic.InstallPings(measureStart, opts.simTime);
-  if (opts.traffic.tcp)
+  if (opts.traffic.mixedLoad)
     traffic.InstallMixedLoad(measureStart, opts.simTime, trafficClasses,
                              opts.traffic.mode, opts.traffic.maxConcurrent,
                              opts.traffic.arrivalRateHz);

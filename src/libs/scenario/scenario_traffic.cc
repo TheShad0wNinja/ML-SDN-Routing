@@ -23,7 +23,9 @@ std::vector<TrafficClass> TrafficOptions::DefaultClasses() {
 void TrafficOptions::Register(CommandLine& cmd) {
   cmd.AddValue("trafficMode", "Traffic: random, central, grouped", mode);
   cmd.AddValue("ping", "Enable measurement pings", ping);
-  cmd.AddValue("tcp", "Enable OnOff TCP background load", tcp);
+  cmd.AddValue("mixedLoad",
+               "Enable OnOff mixed-protocol (TCP+UDP) background load",
+               mixedLoad);
   cmd.AddValue("maxConcurrent",
                "Hard cap on concurrent mixed-load flows", maxConcurrent);
   cmd.AddValue("arrivalRateHz",

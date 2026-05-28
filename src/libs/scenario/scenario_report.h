@@ -32,7 +32,7 @@ struct ScenarioReportInputs {
   std::vector<int> switchToSection;
 
   // Optional: per-class FlowMonitor table only prints when portToClass is
-  // non-empty (i.e. --tcp was enabled and the mixed-load classes ran).
+  // non-empty (i.e. --mixedLoad was enabled and the mixed-load classes ran).
   const std::map<uint16_t, std::string>* portToClass = nullptr;
 };
 

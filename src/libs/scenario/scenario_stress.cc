@@ -80,7 +80,7 @@ void StressEvents::Schedule(double measureStart, double window,
   // Flash crowd: 4 short bulk flows at 10 Mbps each = 40 Mbps to one host.
   // Pre-install up front (before Run) with future Start/Stop; dynamic install
   // from inside a scheduled callback raced with CSMA TX-queue and SIGSEGV'd
-  // around t=30s under --tcp --failures.
+  // around t=30s under --mixedLoad --failures.
   PreInstallFlashCrowd(dstHostFlash, 5.0, 10.0, 4,
                        measureStart + 0.25 * window);
 
@@ -130,7 +130,7 @@ void StressEvents::PreInstallFlashCrowd(uint32_t dstHost, double dur,
 // Approximate a node black hole by setting receive error = 1.0 on every CSMA
 // device of the chosen switch. Restore by installing a zero-rate model rather
 // than re-applying a saved pointer (the saved pointer was the SIGSEGV path
-// under --tcp --failures).
+// under --mixedLoad --failures).
 void StressEvents::BlackHoleOn(uint32_t switchIdx) {
   NS_LOG_INFO("Black hole ON switch=" << switchIdx << " at t="
                                       << Simulator::Now().GetSeconds() << "s");

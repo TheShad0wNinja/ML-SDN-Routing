@@ -50,7 +50,7 @@ TRAFFIC_MODE="central"
 SEED=12345
 PRIORITY="balanced"
 ML=false
-TCP=true
+MIXED_LOAD=true
 FAILURES=false
 CRIPPLE=false
 MULTI_CONTROLLER=false
@@ -116,7 +116,9 @@ Options:
                         scratch/data/agent/<priority>/ — train all three
                         independently and switch between them via this flag.
   --ml | --no-ml        Enable / disable the ML controller         (default: off)
-  --tcp | --no-tcp      Toggle TCP background load                 (default: on)
+  --mixedLoad | --no-mixedLoad
+                        Toggle mixed-protocol (TCP+UDP) background load
+                                                                   (default: on)
   --failures | --no-failures   Toggle scheduled link churn         (default: off)
   --cripple  | --no-cripple    Toggle Missoula crippling (USA)     (default: off)
   --multiController     Run M in-process controllers using trained weights
@@ -320,25 +322,25 @@ trap 'stop_ml_service; stop_aggregator' EXIT INT TERM
 #
 # Keys:
 #   sections      — int, # of sections defined in the C++ topology spec
-#   supports_tcp  — 1/0
-#   supports_fail — 1/0
-#   supports_crip — 1/0  (only USA has the Missoula cripple)
+#   supports_mixed_load — 1/0  (mixed-protocol TCP+UDP background traffic)
+#   supports_fail       — 1/0
+#   supports_crip       — 1/0  (only USA has the Missoula cripple)
 #   modes         — space-separated trafficMode values valid for this topo
 topology_cap() {
   local topo="$1" key="$2"
   case "$topo:$key" in
-    usa:sections)             echo 3 ;;
-    usa:supports_tcp)         echo 1 ;;
-    usa:supports_fail)        echo 1 ;;
-    usa:supports_crip)        echo 1 ;;
-    usa:modes)                echo "central random grouped" ;;
-    fat-tree-k4:sections)     echo 1 ;;
-    fat-tree-k4:supports_tcp) echo 1 ;;
-    fat-tree-k4:supports_fail) echo 1 ;;
-    fat-tree-k4:supports_crip) echo 0 ;;
-    fat-tree-k4:modes)        echo "central random" ;;
-    two-switch-ping:sections) echo 1 ;;
-    two-switch-ping:supports_tcp)  echo 0 ;;
+    usa:sections)                  echo 3 ;;
+    usa:supports_mixed_load)       echo 1 ;;
+    usa:supports_fail)             echo 1 ;;
+    usa:supports_crip)             echo 1 ;;
+    usa:modes)                     echo "central random grouped" ;;
+    fat-tree-k4:sections)          echo 1 ;;
+    fat-tree-k4:supports_mixed_load) echo 1 ;;
+    fat-tree-k4:supports_fail)     echo 1 ;;
+    fat-tree-k4:supports_crip)     echo 0 ;;
+    fat-tree-k4:modes)             echo "central random" ;;
+    two-switch-ping:sections)      echo 1 ;;
+    two-switch-ping:supports_mixed_load) echo 0 ;;
     two-switch-ping:supports_fail) echo 0 ;;
     two-switch-ping:supports_crip) echo 0 ;;
     two-switch-ping:modes)         echo "central" ;;
@@ -351,7 +353,7 @@ topology_supports_flag() {
   case "$flag" in
     cripple)  [[ "$(topology_cap "$topo" supports_crip)" == "1" ]] ;;
     failures) [[ "$(topology_cap "$topo" supports_fail)" == "1" ]] ;;
-    tcp)      [[ "$(topology_cap "$topo" supports_tcp)" == "1" ]] ;;
+    mixedLoad) [[ "$(topology_cap "$topo" supports_mixed_load)" == "1" ]] ;;
     simTime|warmupS|seed|trafficMode|backboneQueue|edgeQueue|evalWindowOffsetS)
       return 0 ;;
     ml|mlPriority|mlExplore|mlResume|mlEndpoint|mlPortBase|multiController|sections|sectionId)
@@ -400,7 +402,7 @@ build_args() {
   add_if_supported warmupS     "$WARMUP"
   add_if_supported trafficMode "$TRAFFIC_MODE"
   add_if_supported seed        "$SEED"
-  add_bool_if_supported tcp      "$TCP"
+  add_bool_if_supported mixedLoad "$MIXED_LOAD"
   add_bool_if_supported failures "$FAILURES"
   add_bool_if_supported cripple  "$CRIPPLE"
   add_bool_if_supported multiController "$MULTI_CONTROLLER"
@@ -481,7 +483,7 @@ summarize_log() {
   echo
 
   # CSV: rotate aside if header changed (old flat schema, partial archive).
-  local expected_header="timestamp,label,topology,sim_time_s,traffic_mode,seed,controller,priority,tcp,failures,cripple,ping_success_pct,rtt_avg_ms,rtt_jitter_ms,pdr_pct,e2e_delay_avg_ms,flows,tx_pkts,rx_pkts,hop_count_avg,energy_total_j,energy_residual_j,power_avg_w,per_sw_consumed_j,per_sw_residual_j,residual_pct,j_per_mb,ml_reward_final,ml_reward_mean_last25,ml_critic_loss_final,ml_actor_loss_final,ml_ticks"
+  local expected_header="timestamp,label,topology,sim_time_s,traffic_mode,seed,controller,priority,mixed_load,failures,cripple,ping_success_pct,rtt_avg_ms,rtt_jitter_ms,pdr_pct,e2e_delay_avg_ms,flows,tx_pkts,rx_pkts,hop_count_avg,energy_total_j,energy_residual_j,power_avg_w,per_sw_consumed_j,per_sw_residual_j,residual_pct,j_per_mb,ml_reward_final,ml_reward_mean_last25,ml_critic_loss_final,ml_actor_loss_final,ml_ticks"
   if [[ -f "$SUMMARY_CSV" ]] && [[ "$(head -n1 "$SUMMARY_CSV")" != "$expected_header" ]]; then
     local archived="${SUMMARY_CSV%.csv}.$(date +%Y%m%d-%H%M%S).csv"
     mv "$SUMMARY_CSV" "$archived"
@@ -493,7 +495,7 @@ summarize_log() {
   printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
     "$(date -Iseconds)" "$label" "$TOPOLOGY" "$SIM_TIME" "$TRAFFIC_MODE" "$SEED" \
     "$($ML && echo ml || echo baseline)" "$($ML && echo "$PRIORITY" || echo -)" \
-    "$($TCP && echo 1 || echo 0)" "$($FAILURES && echo 1 || echo 0)" "$($CRIPPLE && echo 1 || echo 0)" \
+    "$($MIXED_LOAD && echo 1 || echo 0)" "$($FAILURES && echo 1 || echo 0)" "$($CRIPPLE && echo 1 || echo 0)" \
     "${success:-}" "${rtt:-}" "${jitter:-}" "${delivery:-}" "${delay:-}" \
     "${flows:-}" "${tx:-}" "${rx:-}" "${hops:-}" \
     "${energy:-}" "${residual:-}" "${power:-}" \
@@ -682,7 +684,7 @@ cmd_train() {
   ML=true
   EXPLORE=true
   RESUME=true
-  TCP=true                  # need traffic for the agent to learn from
+  MIXED_LOAD=true           # need traffic for the agent to learn from
   WORKERS=$total            # ml services + dispatch use the total
   FEDAVG_DIR="$SCRIPT_DIR/data/federated_weights/$PRIORITY"
   FEDAVG_AGG_LOG_DIR="$SCRIPT_DIR/data/fedavg/$PRIORITY"
@@ -818,8 +820,8 @@ while [[ $# -gt 0 ]]; do
     --evalWindowS)  EVAL_WINDOW="$2"; shift 2 ;;
     --ml)           ML=true; shift ;;
     --no-ml)        ML=false; shift ;;
-    --tcp)          TCP=true; shift ;;
-    --no-tcp)       TCP=false; shift ;;
+    --mixedLoad)    MIXED_LOAD=true; shift ;;
+    --no-mixedLoad) MIXED_LOAD=false; shift ;;
     --failures)     FAILURES=true; shift ;;
     --no-failures)  FAILURES=false; shift ;;
     --cripple)      CRIPPLE=true; shift ;;
