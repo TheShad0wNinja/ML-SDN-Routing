@@ -4,8 +4,8 @@ string(REPLACE "${PROJECT_SOURCE_DIR}" "${CMAKE_OUTPUT_DIRECTORY}"
 )
 
 build_exec(
-  EXECNAME stats-test
-  SOURCE_FILES main.cc
+  EXECNAME fat-tree-k4
+  SOURCE_FILES main.cc topology.cc
   LIBRARIES_TO_LINK scratch_zmq_openflow
   EXECUTABLE_DIRECTORY_PATH ${_scenario_out_dir}/
 )

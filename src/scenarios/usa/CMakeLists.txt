@@ -5,7 +5,7 @@ string(REPLACE "${PROJECT_SOURCE_DIR}" "${CMAKE_OUTPUT_DIRECTORY}"
 
 build_exec(
   EXECNAME usa
-  SOURCE_FILES main.cc
+  SOURCE_FILES main.cc topologies.cc
   LIBRARIES_TO_LINK scratch_zmq_openflow
   EXECUTABLE_DIRECTORY_PATH ${_scenario_out_dir}/
 )

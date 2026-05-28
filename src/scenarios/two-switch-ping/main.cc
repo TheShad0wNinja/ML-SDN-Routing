@@ -1,4 +1,4 @@
-#include "zmq-openflow-controller.h"
+#include "controller/zmq-openflow-controller.h"
 #include <ns3/core-module.h>
 #include <ns3/csma-module.h>
 #include <ns3/internet-apps-module.h>

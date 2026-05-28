@@ -96,6 +96,10 @@ foreach(subdir ${scratch_subdirectories})
   if(NOT _sc_pos EQUAL -1)
     continue()
   endif()
+  string(FIND "${subdir}" "${CMAKE_CURRENT_SOURCE_DIR}/libs/" _lib_pos)
+  if(NOT _lib_pos EQUAL -1)
+    continue()
+  endif()
   if(EXISTS ${subdir}/CMakeLists.txt)
     # If the subdirectory contains a CMakeLists.txt file
     # we let the CMake file manage the source files

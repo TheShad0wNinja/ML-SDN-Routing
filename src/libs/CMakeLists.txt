@@ -1,8 +1,14 @@
 add_library(
   scratch_zmq_openflow STATIC
-  zmq-openflow-controller.cc
-  topology.cc
-  openflow_builders.cc
+  controller/zmq-openflow-controller.cc
+  controller/topology.cc
+  controller/openflow_builders.cc
+  scenario/scenario_topo.cc
+  scenario/scenario_builder.cc
+  scenario/scenario_traffic.cc
+  scenario/scenario_stress.cc
+  scenario/scenario_cli.cc
+  scenario/scenario_report.cc
 )
 
 target_include_directories(scratch_zmq_openflow PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

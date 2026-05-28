@@ -1,7 +1,27 @@
 #!/usr/bin/env bash
 # scratch/run_tests.sh — drive ns-3 SDN test variants.
 #
-# Modes:
+# Repo state (post-refactor):
+#   - scratch/scenarios/usa/        — full 34-node USA backbone scenario.
+#                                     Supports --multiController for the
+#                                     in-process 3-section (west/central/east)
+#                                     hierarchical-SDN config.
+#   - scratch/scenarios/fat-tree-k4/ — standalone k=4 fat-tree scenario
+#                                     (16 hosts, 20 switches). Single-
+#                                     controller only.
+#   - scratch/scenarios/two-switch-ping/ — 2-switch sanity check.
+#   - scratch/libs/controller/      — SDN controller + topology graph.
+#   - scratch/libs/scenario/        — reusable scenario helpers
+#                                     (ScenarioBuilder, TrafficManager,
+#                                     StressEvents, ScenarioReportInputs,
+#                                     ScenarioOptions/RegisterScenarioCli).
+#                                     Add a new scenario by writing topology
+#                                     data in its own folder and reusing
+#                                     these helpers — see fat-tree-k4 for a
+#                                     ~150-line template.
+#
+# Modes (every ns3 run is teed to scratch/data/results/logs/ and summarized
+# into scratch/data/results/summary.csv):
 #   single     one run with whatever flags you pass
 #   compare    baseline + one ML run, same seed/params
 #   presets    baseline + balanced + delay_first + energy_first ML runs
@@ -10,31 +30,62 @@
 #   train      curriculum-style training: cycle the agent through traffic
 #              modes × failures × cripple, persisting weights across runs
 #   eval       pretrained eval-only run (--mlExplore=false --mlResume=true)
-#   federated  Hierarchical SDN Phase 1 — M ns-3 processes (one per section
-#              of sections.json), each its own Local Controller + RL agent,
-#              FedAvg'd by root_aggregator.py via scratch/data/federated_weights/
-#   fullrun    Hierarchical SDN Phase 2 — ONE ns-3 process running the FULL
-#              topology with M Local Controllers (one per section). Inter-
-#              domain routing uses static border-switch flow-mods (Option A)
-#              precomputed from sections.json. FedAvg is opt-in via
-#              --fedAvgEverySteps; when on, reuses Phase 1's root_aggregator.
+#   federated  Phase-1 hierarchical SDN — M ns-3 processes (one per section
+#              defined in topologies.cc::BuildUsaSpec), each its own Local
+#              Controller + RL agent, FedAvg'd by root_aggregator.py via
+#              scratch/data/federated_weights/. --rounds N chains rounds in
+#              one invocation for ~N× training.
+#   fullrun    Phase-2 hierarchical SDN — ONE ns-3 process running the
+#              merged 'usa' binary with --multiController. M Local
+#              Controllers in the same process, static inter-domain routes
+#              compiled into the C++ topology spec. --fedAvgEverySteps K
+#              opt-in to FedAvg the in-process controllers via the same
+#              root_aggregator as Phase 1.
 #   summary    parse a saved log and print headline numbers
 #   clean      wipe checkpoints + replay buffer (forces fresh learning)
 #
-# Each ns3 run is teed to scratch/data/results/logs/ with a timestamped name,
-# then summarized to scratch/data/results/summary.csv.
+# ============================================================================
+# RECIPES — copy/paste end-to-end workflows
+# ============================================================================
 #
-# Examples:
-#   scratch/run_tests.sh compare --simTime 600 --trafficMode central --tcp --failures --cripple
-#   scratch/run_tests.sh presets --simTime 600 --tcp --failures --cripple
-#   scratch/run_tests.sh seeds --seeds 5 --ml --priority balanced --simTime 1200 --tcp --failures --cripple
-#   scratch/run_tests.sh matrix --seeds 3 --simTime 600 --priority balanced
-#   scratch/run_tests.sh eval --simTime 200 --priority balanced --tcp --failures --cripple
-#   scratch/run_tests.sh federated --simTime 30 --warmupS 3 \
-#       --fedAvgEverySteps 5 --fedAvgTimeoutS 60 -- --mlIntervalS=0.5
-#   scratch/run_tests.sh fullrun --simTime 120 --ml --priority balanced \
-#       --fedAvgEverySteps 200
-#   scratch/run_tests.sh summary scratch/data/results/logs/<name>.log
+# 1) FRESH BASELINE COMPARISON (no ML training history needed):
+#      scratch/run_tests.sh compare --simTime 600 --tcp --failures --cripple
+#
+# 2) TRAIN AN ML AGENT FROM SCRATCH, THEN EVALUATE:
+#      scratch/run_tests.sh clean                # wipe old checkpoints
+#      scratch/run_tests.sh train --simTime 600  # cycle 12-24 scenarios
+#      scratch/run_tests.sh eval  --simTime 600 --tcp --failures --cripple
+#
+# 3) STATISTICAL MATRIX (3 seeds × 3 traffic modes × 2 failure states ×
+#    {baseline, ML} = 36 runs; takes a long time):
+#      scratch/run_tests.sh matrix --seeds 3 --simTime 600 --priority balanced
+#
+# 4) PHASE-1 FEDERATED TRAINING — 3 ns-3 processes, FedAvg every 5 steps,
+#    once through:
+#      scratch/run_tests.sh federated --simTime 60 --warmupS 5 \
+#          --fedAvgEverySteps 5 --fedAvgTimeoutS 60
+#
+# 5) CHAINED FEDERATED TRAINING — 12 back-to-back rounds in one
+#    invocation. Each round resumes from the previous one's local
+#    checkpoint, and the aggregator state persists across rounds, so you
+#    get ~12× the training data of a single round. The FedAvg dir is only
+#    wiped at the start of round 1:
+#      scratch/run_tests.sh federated --simTime 60 --warmupS 5 \
+#          --fedAvgEverySteps 5 --fedAvgTimeoutS 60 --rounds 12
+#
+# 6) DEMO/DEFENSE CONFIG — Phase-2 fullrun, one process, three controllers,
+#    federated weight averaging during the run:
+#      scratch/run_tests.sh fullrun --simTime 120 --ml --priority balanced \
+#          --fedAvgEverySteps 200
+#
+# 7) RUN ON FAT-TREE INSTEAD OF USA:
+#      scratch/run_tests.sh single --topology fat-tree-k4 --simTime 300 \
+#          --tcp --ml --priority balanced
+#
+# 8) SUMMARIZE AN OLD LOG:
+#      scratch/run_tests.sh summary scratch/data/results/logs/<name>.log
+#
+# ============================================================================
 
 set -euo pipefail
 
@@ -77,7 +128,7 @@ FEDAVG_DIR=""
 FEDAVG_EVERY=0
 FEDAVG_TIMEOUT=300
 FEDAVG_AGG_LOG_DIR=""
-SECTIONS_JSON=""
+FED_ROUNDS=1
 AGG_PID=""
 WE_STARTED_AGG=false
 
@@ -114,29 +165,34 @@ Modes:
                         agent is well-trained.
   eval                  ML run with --mlExplore=false --mlResume=true (deterministic eval)
   federated             Phase-1 hierarchical SDN: launch one ns-3 process per
-                        topology section (read from sections.json), each with
-                        its own Local Controller and RL agent. A root
-                        aggregator FedAvgs all sections' weights every
-                        --fedAvgEverySteps training steps via a shared
-                        directory (scratch/data/federated_weights/).
+                        topology section (hardcoded to match
+                        topologies.cc::BuildUsaSpec), each with its own Local
+                        Controller and RL agent. A root aggregator FedAvgs all
+                        sections' weights every --fedAvgEverySteps training
+                        steps via a shared directory
+                        (scratch/data/federated_weights/).
+                        Use --rounds N to chain N rounds in one invocation;
+                        each round resumes from the previous local checkpoint
+                        and the aggregator state persists across rounds.
   fullrun               Phase-2 hierarchical SDN: ONE ns-3 process running the
-                        FULL topology with M Local Controllers (one per
-                        section of sections.json). Inter-domain routing is
-                        Option A — static border-switch flow-mods derived from
-                        sections.json's inter_domain_routes block, pre-installed
-                        after warmup. Each controller still runs its own
-                        ml_service.py on its own port; pass
-                        --fedAvgEverySteps to also FedAvg the M controllers'
-                        weights via the same root_aggregator.py as Phase 1.
+                        merged 'usa' binary with --multiController. M Local
+                        Controllers (one per section) live in the same
+                        process; inter-domain routing uses static border-
+                        switch flow-mods compiled into the C++ topology spec.
+                        Each controller still runs its own ml_service.py on
+                        its own port; pass --fedAvgEverySteps to also FedAvg
+                        the M controllers' weights via the same
+                        root_aggregator.py as Phase 1.
                         This is the defense/demo configuration — proves the
                         hierarchical architecture end-to-end on one box.
   summary FILE          Print headline stats from a saved log file
   clean                 Remove ML checkpoint + replay buffer
 
 Options:
-  --topology X          usa | usa-fullrun | abilene | mini-geant |
-                        two-switch-ping                                (default: usa)
-                        Note: 'fullrun' mode forces topology=usa-fullrun
+  --topology X          usa | fat-tree-k4 | two-switch-ping          (default: usa)
+                        Note: 'fullrun' mode forces topology=usa and
+                        adds --multiController. fat-tree-k4 does not support
+                        --multiController (no section partition).
   --simTime N           Simulation duration in seconds                 (default: 600)
   --warmupS N           Warmup window                                  (default: 10)
   --trafficMode X       random | central | grouped                     (default: central)
@@ -166,9 +222,8 @@ Train-mode curriculum (defaults give 12 scenarios × 2 rounds = 24 runs):
   --trainCripple "..."  Space-separated bool values  (default: "true")
 
 Federated / fullrun-mode flags:
-  --sectionsJson PATH       Topology partition file. Used by BOTH 'federated'
-                            (multi-process) and 'fullrun' (single-process)
-                            modes (default: scratch/scenarios/usa/sections.json)
+  (Both modes read the section partition from
+  scratch/scenarios/usa/topologies.cc::BuildUsaSpec — no JSON file required.)
   --fedAvgEverySteps K      Workers submit weights every K training steps,
                             and block on the global model (default: 0 = off).
                             In 'federated' this is the cross-process FedAvg
@@ -176,6 +231,12 @@ Federated / fullrun-mode flags:
                             controllers via the same shared directory.
   --fedAvgTimeoutS S        Per-round timeout: aggregator drops the round and
                             workers continue with local weights (default: 300)
+  --rounds N                'federated' mode only: re-dispatch the M-worker
+                            fleet N times back-to-back in one invocation
+                            (default: 1). Each round resumes from the
+                            previous local checkpoint and the aggregator
+                            keeps its round counter, so N rounds ≈ N× the
+                            training of a single round.
 
   -- arg1 arg2 ...      Forward extra args verbatim to ns3 (after --)
 
@@ -353,26 +414,20 @@ stop_aggregator() {
 trap 'stop_ml_service; stop_aggregator' EXIT INT TERM
 
 # ----- argument assembly -----------------------------------------------------
-# Which flags each topology accepts. USA has the full set; abilene has the old
-# ML flags + trafficMode; the rest are minimal.
+# Which flags each topology accepts. USA accepts everything (including the
+# fullrun-only --multiController + --mlPortBase); fat-tree-k4 accepts every
+# generic flag but rejects --multiController + the USA-specific --cripple;
+# two-switch-ping is the sanity-check scenario and only needs simTime.
 topology_supports_flag() {
   local topo="$1" flag="$2"
   case "$topo" in
     usa) return 0 ;;  # all flags
-    usa-fullrun)
-      # usa-fullrun handles ML directly per-controller (mlPortBase, not
-      # mlEndpoint) and exposes a subset of usa's knobs. It has no
-      # trafficMode/tcp/failures/cripple — pings are full-mesh by default.
+    fat-tree-k4)
       case "$flag" in
-        simTime|warmupS|seed|ml|mlPriority|mlIntervalS|mlActionScale|mlActionScaleStart|mlTaperTicks|mlExplore|mlResume|mlCheckpointEveryNTicks|backboneQueue|edgeQueue|sectionNodes|borderSwitches|interDomainRoutes|mlPortBase|pingIntervalS|pingCount) return 0 ;;
-        *) return 1 ;;
+        multiController|cripple) return 1 ;;
+        *) return 0 ;;
       esac ;;
-    abilene)
-      case "$flag" in
-        simTime|warmupS|trafficMode|seed|ml|mlIntervalS|mlActionScale|mlAlpha|mlBeta|mlGamma|mlResume|mlEndpoint) return 0 ;;
-        *) return 1 ;;
-      esac ;;
-    mini-geant|two-switch-ping|stats-test)
+    two-switch-ping)
       case "$flag" in simTime) return 0 ;; *) return 1 ;; esac ;;
     *) return 0 ;;
   esac
@@ -725,40 +780,32 @@ cmd_train() {
 
 ## Federated mode: each section runs as its own ns-3 process with its own
 ## Local Controller and RL agent; the root aggregator FedAvgs their weights
-## every $FEDAVG_EVERY training steps. The sections.json file partitions
-## the topology; M = len(sections.json["sections"]).
+## every $FEDAVG_EVERY training steps. The section partition is the same one
+## the C++ scenario uses in --multiController mode — see
+## scratch/scenarios/usa/topologies.cc::BuildUsaSpec for the authoritative
+## definition; if the partition changes there, update the arrays below.
+##
+## --rounds N re-dispatches the M-worker fleet N times back-to-back in one
+## invocation. Each round's workers resume from their previous local
+## checkpoint (--mlResume=true) AND the aggregator + FedAvg dir persist
+## across rounds, so chained rounds add up to ~N× the training data of a
+## single round without restarting the FedAvg counter. The FedAvg dir is
+## wiped only at the start of round 1.
 cmd_federated() {
-  : "${SECTIONS_JSON:=$SCRIPT_DIR/scenarios/$TOPOLOGY/sections.json}"
-  if [[ ! -f "$SECTIONS_JSON" ]]; then
-    echo "[run_tests] ERROR: sections.json not found at $SECTIONS_JSON" >&2
-    echo "[run_tests] Provide --sectionsJson <path> or add one for topology '$TOPOLOGY'." >&2
-    exit 1
-  fi
-
-  # Resolve M and the per-section node CSV via Python — avoids hand-rolling
-  # JSON parsing in shell. Output is one section per line, "<id>\t<csv>".
-  local sections_dump
-  sections_dump=$(python3 - "$SECTIONS_JSON" <<'PY'
-import json, sys
-with open(sys.argv[1]) as f:
-    spec = json.load(f)
-for sec in spec["sections"]:
-    nodes = ",".join(str(n) for n in sec["nodes"])
-    print(f"{sec['id']}\t{nodes}")
-PY
+  WORKER_SECTION_IDS=(0 1 2)
+  WORKER_SECTION_NODES=(
+    "0,1,2,3,4,5,6,7,8,9,10"
+    "11,12,13,14,15,16,17,18,19,20,21"
+    "22,23,24,25,26,27,28,29,30,31,32,33"
   )
-  local num_sections=0
-  WORKER_SECTION_IDS=()
-  WORKER_SECTION_NODES=()
-  while IFS=$'\t' read -r sid scsv; do
-    [[ -z "$sid" ]] && continue
-    WORKER_SECTION_IDS+=("$sid")
-    WORKER_SECTION_NODES+=("$scsv")
-    num_sections=$((num_sections + 1))
-  done <<<"$sections_dump"
+  local num_sections=${#WORKER_SECTION_IDS[@]}
 
   if (( num_sections < 2 )); then
     echo "[run_tests] ERROR: federated mode needs >=2 sections; got $num_sections." >&2
+    exit 1
+  fi
+  if (( FED_ROUNDS < 1 )); then
+    echo "[run_tests] ERROR: --rounds must be >= 1 (got $FED_ROUNDS)." >&2
     exit 1
   fi
 
@@ -770,8 +817,9 @@ PY
   FEDAVG_AGG_LOG_DIR="$SCRIPT_DIR/data/fedavg"
 
   echo "[run_tests] Federated training: topology=$TOPOLOGY, sections=$num_sections, "
-  echo "[run_tests]   fedavg_every=$FEDAVG_EVERY steps, timeout=$FEDAVG_TIMEOUT s,"
-  echo "[run_tests]   sections.json=$SECTIONS_JSON"
+  echo "[run_tests]   rounds=$FED_ROUNDS, fedavg_every=$FEDAVG_EVERY steps, "
+  echo "[run_tests]   timeout=$FEDAVG_TIMEOUT s,"
+  echo "[run_tests]   sections inlined from topologies.cc::BuildUsaSpec"
   echo "[run_tests]   weights_dir=$FEDAVG_DIR"
 
   # Fresh state — leftover worker_*.pt or global_*.pt from a previous run
@@ -782,78 +830,43 @@ PY
   start_aggregator
   start_ml_service
 
-  local jobs=()
-  local i
-  for ((i=0; i<num_sections; i++)); do
-    local sid="${WORKER_SECTION_IDS[$i]}"
-    local label="${TOPOLOGY}-fed-s${sid}-seed${SEED}"
-    # Section info lives in the WORKER_SECTION_* globals; run_one reads the
-    # entry that matches its dispatch slot. No fragile per-job arg quoting.
-    jobs+=("run_one \"$label\"")
+  local round
+  for ((round=1; round<=FED_ROUNDS; round++)); do
+    echo
+    echo "[run_tests] === Federated round $round / $FED_ROUNDS ==="
+    local jobs=()
+    local i
+    for ((i=0; i<num_sections; i++)); do
+      local sid="${WORKER_SECTION_IDS[$i]}"
+      local label="${TOPOLOGY}-fed-s${sid}-seed${SEED}-r${round}"
+      jobs+=("run_one \"$label\"")
+    done
+    dispatch_parallel "${jobs[@]}"
   done
-  dispatch_parallel "${jobs[@]}"
 
   echo
-  echo "[run_tests] Federated run complete. Aggregator round log:"
-  echo "[run_tests]   $FEDAVG_AGG_LOG_DIR/rounds.csv"
+  echo "[run_tests] Federated training complete ($FED_ROUNDS rounds)."
+  echo "[run_tests]   Aggregator round log: $FEDAVG_AGG_LOG_DIR/rounds.csv"
 }
 
-## Fullrun mode (Phase 2 of hierarchical SDN). One ns-3 process, the FULL
-## topology, M Local Controllers, each owning its section. Inter-domain
-## routing via static border-switch flow-mods (Option A) precomputed from
-## sections.json's inter_domain_routes block. M ML services run on
-## consecutive ports (mlPortBase + 0..M-1). FedAvg is opt-in via
-## --fedAvgEverySteps; when on, the same root_aggregator.py from Phase 1
-## FedAvgs the in-process controllers' weights via the shared dir.
+## Fullrun mode (Phase 2 of hierarchical SDN). One ns-3 process running the
+## merged 'usa' binary with --multiController — M Local Controllers, each
+## owning its section. Section + inter-domain-route definitions live in
+## scratch/scenarios/usa/topologies.cc::BuildUsaSpec(); the C++ binary infers
+## M from topo.sections. M ML services run on consecutive ports
+## (mlPortBase + 0..M-1). FedAvg is opt-in via --fedAvgEverySteps; when on,
+## the same root_aggregator.py from Phase 1 FedAvgs the in-process
+## controllers' weights via the shared dir.
 cmd_fullrun() {
-  : "${SECTIONS_JSON:=$SCRIPT_DIR/scenarios/usa/sections.json}"
-  if [[ ! -f "$SECTIONS_JSON" ]]; then
-    echo "[run_tests] ERROR: sections.json not found at $SECTIONS_JSON" >&2
-    echo "[run_tests] Provide --sectionsJson <path>." >&2
-    exit 1
-  fi
+  # Section count must agree with the C++ topology spec; the USA topology
+  # has three sections (west/central/east).
+  local num_sections=3
 
-  # Parse sections.json once. Output is three lines: section count, then
-  # ';'-separated nodes CSVs, then ';'-separated border-switch CSVs, then
-  # the inter_domain_routes "from:to:via:next,..." string.
-  local parsed
-  parsed=$(python3 - "$SECTIONS_JSON" <<'PY'
-import json, sys
-with open(sys.argv[1]) as f:
-    spec = json.load(f)
-sections = spec.get("sections", [])
-nodes   = ";".join(",".join(str(n) for n in s["nodes"]) for s in sections)
-borders = ";".join(",".join(str(n) for n in s.get("border_switches", [])) for s in sections)
-idr = spec.get("inter_domain_routes", [])
-idr_csv = ",".join(
-    f"{r['from_section']}:{r['to_section']}:{r['via_switch']}:{r['next_switch']}"
-    for r in idr
-)
-print(len(sections))
-print(nodes)
-print(borders)
-print(idr_csv)
-PY
-  )
-  local num_sections nodes_csv borders_csv idr_csv
-  num_sections=$(echo "$parsed" | sed -n 1p)
-  nodes_csv=$(echo   "$parsed" | sed -n 2p)
-  borders_csv=$(echo "$parsed" | sed -n 3p)
-  idr_csv=$(echo     "$parsed" | sed -n 4p)
-
-  if (( num_sections < 2 )); then
-    echo "[run_tests] ERROR: fullrun needs sections.json with >=2 sections; got $num_sections." >&2
-    exit 1
-  fi
-
-  # In fullrun, M = number of in-process controllers AND number of ML
-  # services. The scenario itself is single-process — WORKERS is reused
-  # to size start_ml_service's per-controller port allocation.
   ML=true
   EXPLORE=true
   RESUME=true
   WORKERS=$num_sections
-  TOPOLOGY="usa-fullrun"
+  TOPOLOGY="usa"
 
   if (( FEDAVG_EVERY > 0 )); then
     FEDAVG_DIR="$SCRIPT_DIR/data/federated_weights"
@@ -865,21 +878,17 @@ PY
   else
     echo "[run_tests] Fullrun: topology=$TOPOLOGY sections=$num_sections fedavg=off"
   fi
-  echo "[run_tests]   sections.json=$SECTIONS_JSON"
 
   ensure_built "$TOPOLOGY"
   start_ml_service
 
-  # Section config + ML port base are passed directly via EXTRA_ARGS.
-  # The scenario reads sectionNodes/borderSwitches/interDomainRoutes and
-  # builds the multi-controller wiring; mlPortBase tells each controller
-  # i to dial tcp://127.0.0.1:(mlPortBase+i).
-  EXTRA_ARGS+=("--sectionNodes=$nodes_csv")
-  EXTRA_ARGS+=("--borderSwitches=$borders_csv")
-  EXTRA_ARGS+=("--interDomainRoutes=$idr_csv")
+  # The scenario reads --multiController and partitions its switches per the
+  # C++ topology spec; --mlPortBase tells controller i to dial
+  # tcp://127.0.0.1:(mlPortBase+i).
+  EXTRA_ARGS+=("--multiController")
   EXTRA_ARGS+=("--mlPortBase=$ML_PORT_BASE")
 
-  run_one "${TOPOLOGY}-seed${SEED}"
+  run_one "${TOPOLOGY}-fullrun-seed${SEED}"
 
   if (( FEDAVG_EVERY > 0 )); then
     echo
@@ -943,9 +952,9 @@ while [[ $# -gt 0 ]]; do
     --trainModes)     TRAIN_MODES="$2"; shift 2 ;;
     --trainFailures)  TRAIN_FAILURES="$2"; shift 2 ;;
     --trainCripple)   TRAIN_CRIPPLE="$2"; shift 2 ;;
-    --sectionsJson)       SECTIONS_JSON="$2"; shift 2 ;;
     --fedAvgEverySteps)   FEDAVG_EVERY="$2"; shift 2 ;;
     --fedAvgTimeoutS)     FEDAVG_TIMEOUT="$2"; shift 2 ;;
+    --rounds)             FED_ROUNDS="$2"; shift 2 ;;
     -h|--help)      usage; exit 0 ;;
     --)             shift; EXTRA_ARGS=("$@"); break ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
