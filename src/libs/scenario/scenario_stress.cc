@@ -9,6 +9,18 @@ namespace ns3 {
 
 NS_LOG_COMPONENT_DEFINE("ScenarioStress");
 
+void StressOptions::Register(CommandLine& cmd) {
+  cmd.AddValue("failures", "Enable scheduled link churn", enabled);
+  cmd.AddValue("flashCrowdDst",
+               "Host index targeted by the flash crowd "
+               "(0 = use topology default)",
+               flashCrowdDst);
+  cmd.AddValue("blackHoleSwitch",
+               "Switch index that goes dark at 0.85 W "
+               "(0 = use topology default)",
+               blackHoleSwitchIdx);
+}
+
 void LinkController::BringDown(State* ls) {
   NS_LOG_DEBUG("[TRACE] LinkController::BringDown ENTER t="
                << Simulator::Now().GetSeconds() << "s ls=" << ls);

@@ -28,14 +28,18 @@ TopoSpec BuildFatTreeK4Spec(const std::string& backboneQueue) {
   for (uint32_t p = 0; p < 4; ++p) {
     uint32_t a0 = pod(p, 0), a1 = pod(p, 1);
     uint32_t e0 = pod(p, 2), e1 = pod(p, 3);
-    spec.links.push_back({a0, 0, dKm, 0.0, backboneQueue, false});
-    spec.links.push_back({a0, 1, dKm, 0.0, backboneQueue, false});
-    spec.links.push_back({a1, 2, dKm, 0.0, backboneQueue, false});
-    spec.links.push_back({a1, 3, dKm, 0.0, backboneQueue, false});
-    spec.links.push_back({a0, e0, dKm, 0.0, backboneQueue, false});
-    spec.links.push_back({a0, e1, dKm, 0.0, backboneQueue, false});
-    spec.links.push_back({a1, e0, dKm, 0.0, backboneQueue, false});
-    spec.links.push_back({a1, e1, dKm, 0.0, backboneQueue, false});
+    
+    // Agg to Core links - fairly high bandwidth
+    spec.links.push_back({a0, 0, dKm, 0.0, backboneQueue, false, "10Gbps"});
+    spec.links.push_back({a0, 1, dKm, 0.0, backboneQueue, false, "10Gbps"});
+    spec.links.push_back({a1, 2, dKm, 0.0, backboneQueue, false, "10Gbps"});
+    spec.links.push_back({a1, 3, dKm, 0.0, backboneQueue, false, "10Gbps"});
+    
+    // Edge to Agg links - medium bandwidth
+    spec.links.push_back({a0, e0, dKm, 0.0, backboneQueue, false, "1Gbps"});
+    spec.links.push_back({a0, e1, dKm, 0.0, backboneQueue, false, "1Gbps"});
+    spec.links.push_back({a1, e0, dKm, 0.0, backboneQueue, false, "1Gbps"});
+    spec.links.push_back({a1, e1, dKm, 0.0, backboneQueue, false, "1Gbps"});
   }
   spec.links[0].failureTarget = true;
   spec.links[8].failureTarget = true;
@@ -51,6 +55,9 @@ TopoSpec BuildFatTreeK4Spec(const std::string& backboneQueue) {
   for (uint32_t h = 0; h < 16; ++h) {
     spec.hostNames.push_back("h" + std::to_string(h));
   }
+  spec.defaultCentralHost = 0;
+  spec.defaultFlashCrowdDst = 0;
+  spec.defaultBlackHoleSwitch = 4;  // first aggregation switch
   return spec;
 }
 

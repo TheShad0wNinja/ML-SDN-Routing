@@ -7,7 +7,10 @@ add_library(
   scenario/scenario_builder.cc
   scenario/scenario_traffic.cc
   scenario/scenario_stress.cc
+  scenario/scenario_ml.cc
+  scenario/scenario_multictrl.cc
   scenario/scenario_cli.cc
+  scenario/scenario_runner.cc
   scenario/scenario_report.cc
 )
 

@@ -10,6 +10,30 @@
 
 namespace ns3 {
 
+std::vector<TrafficClass> TrafficOptions::DefaultClasses() {
+  return {
+      {"web",   0.50,  2.0,    3.0,   80,  true,  1448, false},
+      {"video", 0.20,  8.0,   20.0, 8080,  true,  1448, false},
+      {"voip",  0.15,  0.064, 15.0, 5060, false,   160,  true},
+      {"bulk",  0.10, 10.0,   25.0,   21,  true,  1448, false},
+      {"iot",   0.05,  0.064, 60.0, 1883, false,   512,  true},
+  };
+}
+
+void TrafficOptions::Register(CommandLine& cmd) {
+  cmd.AddValue("trafficMode", "Traffic: random, central, grouped", mode);
+  cmd.AddValue("ping", "Enable measurement pings", ping);
+  cmd.AddValue("tcp", "Enable OnOff TCP background load", tcp);
+  cmd.AddValue("maxConcurrent",
+               "Hard cap on concurrent mixed-load flows", maxConcurrent);
+  cmd.AddValue("arrivalRateHz",
+               "Mean Poisson arrival rate for new flows", arrivalRateHz);
+  cmd.AddValue("centralHostIdx",
+               "Destination host for trafficMode=central "
+               "(0 = use topology default)",
+               centralHostIdx);
+}
+
 uint64_t StatsCollector::g_pingTx = 0;
 uint64_t StatsCollector::g_pingRx = 0;
 double StatsCollector::g_rttSumMs = 0.0;
@@ -41,8 +65,20 @@ void StatsCollector::PrintPingReport() {
 
 TrafficManager::TrafficManager(NodeContainer& hosts,
                                Ipv4InterfaceContainer& ifaces,
-                               uint32_t centralHostIdx)
-    : m_hosts(hosts), m_ifaces(ifaces), m_centralHostIdx(centralHostIdx) {
+                               uint32_t centralHostIdx,
+                               std::vector<uint32_t> hostGroups)
+    : m_hosts(hosts),
+      m_ifaces(ifaces),
+      m_centralHostIdx(centralHostIdx),
+      m_hostGroups(std::move(hostGroups)) {
+  if (!m_hostGroups.empty()) {
+    uint32_t maxGroup = 0;
+    for (uint32_t g : m_hostGroups) maxGroup = std::max(maxGroup, g);
+    m_groupMembers.assign(maxGroup + 1, {});
+    for (uint32_t h = 0; h < m_hostGroups.size(); ++h) {
+      m_groupMembers[m_hostGroups[h]].push_back(h);
+    }
+  }
   m_uv = CreateObject<UniformRandomVariable>();
   m_durRv = CreateObject<LogNormalRandomVariable>();
   m_durRv->SetAttribute("Sigma", DoubleValue(0.6));
@@ -192,22 +228,37 @@ uint32_t TrafficManager::PickDestination(uint32_t src, uint32_t n,
       dst = m_uv->GetInteger(0, n - 1);
     } while (dst == src);
   } else if (mode == "grouped") {
-    bool isWest = (src <= 10);
-    bool isEast = (src >= 22);
+    // 80% of flows pick a destination in a different group when more than one
+    // group exists; the rest are random. Without group metadata (or after
+    // section filtering reduces the topology to a single group), this
+    // degrades to plain random — the previous implementation hard-coded USA
+    // node-index ranges, which broke under FilterTopoSpecBySection.
+    bool haveGroups = src < m_hostGroups.size() && m_groupMembers.size() > 1;
     double roll = m_uv->GetValue();
-    if (roll < 0.8) {
-      if (isWest)
-        dst = m_uv->GetInteger(22, n - 1);
-      else if (isEast)
-        dst = m_uv->GetInteger(0, 10);
-      else
-        do {
-          dst = m_uv->GetInteger(0, n - 1);
-        } while (dst == src);
-    } else {
+    if (haveGroups && roll < 0.8) {
+      uint32_t srcGroup = m_hostGroups[src];
+      uint32_t otherGroupCount = 0;
+      for (uint32_t g = 0; g < m_groupMembers.size(); ++g) {
+        if (g != srcGroup && !m_groupMembers[g].empty()) ++otherGroupCount;
+      }
+      if (otherGroupCount > 0) {
+        uint32_t pick = m_uv->GetInteger(0, otherGroupCount - 1);
+        uint32_t gChosen = 0;
+        for (uint32_t g = 0; g < m_groupMembers.size(); ++g) {
+          if (g == srcGroup || m_groupMembers[g].empty()) continue;
+          if (pick == 0) { gChosen = g; break; }
+          --pick;
+        }
+        const auto& members = m_groupMembers[gChosen];
+        dst = members[m_uv->GetInteger(0, members.size() - 1)];
+      }
+    }
+    if (dst == src) {
+      // Fallback: any non-self host (also covers the 20% random branch and
+      // the no-group / src-in-only-populated-group cases).
       do {
         dst = m_uv->GetInteger(0, n - 1);
-      } while (dst == src);
+      } while (dst == src && n > 1);
     }
   }
   return dst;

@@ -135,6 +135,7 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
       m_ml.reward_zeta = 0.5;
       m_ml.reward_eta = 1.5;
       m_ml.reward_theta = 1.0;
+      m_ml.reward_kappa = 1.0;
     }
     case MlConfig::MlPriority::THROUGHPUT: {
       m_ml.reward_alpha = 2.5;
@@ -144,6 +145,7 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
       m_ml.reward_zeta = 0.2;
       m_ml.reward_eta = 0.8;
       m_ml.reward_theta = 0.5;
+      m_ml.reward_kappa = 1.5;
     }
     case MlConfig::MlPriority::ENERGY: {
       m_ml.reward_alpha = 1.0;
@@ -152,7 +154,8 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
       m_ml.reward_delta = 0.5;
       m_ml.reward_zeta = 1.0;
       m_ml.reward_eta = 2.5;
-      m_ml.reward_theta = 1.5;  // neg bound = 7.5
+      m_ml.reward_theta = 1.5;
+      m_ml.reward_kappa = 0.8;  // neg bound = 8.3
     }
     default:
       break;
@@ -162,7 +165,8 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
               << m_ml.priority_preset << " α=" << m_ml.reward_alpha
               << " β=" << m_ml.reward_beta << " γ=" << m_ml.reward_gamma
               << " δ=" << m_ml.reward_delta << " ζ=" << m_ml.reward_zeta
-              << " η=" << m_ml.reward_eta << " θ=" << m_ml.reward_theta);
+              << " η=" << m_ml.reward_eta << " θ=" << m_ml.reward_theta
+              << " κ=" << m_ml.reward_kappa);
 
   // Make sure stats roll fast enough that the agent gets fresh observations
   // every tick. Without this, the default 60 s interval would starve MlTick.
@@ -1701,17 +1705,26 @@ double ZmqOpenFlowController::ComputeMlReward() {
   // multiply by 2 to push it into [0, 1] range for weight comparability.
   double balancePenalty = std::clamp(2.0 * stddevResidual, 0.0, 1.0);
 
+  // ---- 8. Route-churn penalty ----
+  // Antidote for the "TCP exploit" — rapid action swings cause out-of-order
+  // packets, TCP halves cwnd, and aggregate utilization/loss/power all drop,
+  // which the other terms would otherwise *reward*. m_lastChurnNorm was
+  // computed in ApplyDeltaCosts when action a_t was applied; we consume it
+  // here at the reward for s_{t+1}.
+  double churnPenalty = m_lastChurnNorm;
+
   // ---- Combine ----
   double R = m_ml.reward_alpha * delayQuality + m_ml.reward_beta * lossQuality -
              m_ml.reward_gamma * powerCost - m_ml.reward_delta * utilPenalty -
              m_ml.reward_zeta * footprintPenalty -
              m_ml.reward_eta * reserveAwarePenalty -
-             m_ml.reward_theta * balancePenalty;
+             m_ml.reward_theta * balancePenalty -
+             m_ml.reward_kappa * churnPenalty;
 
   // Affine min-max scale R into [-1, 1] using the analytic bounds. Every term
   // above is clamped to [0, 1] individually, so R is bounded by:
   //   R_max =  alpha + beta              (positive-weighted terms maxed out)
-  //   R_min = -(gamma + delta + zeta + eta + theta)
+  //   R_min = -(gamma + delta + zeta + eta + theta + kappa)
   // Linear rescale is a bijection over this range — distinct R values stay
   // distinct in R_norm, so the Critic still sees gradient between "mildly
   // bad" and "catastrophic" rewards (vs. a hard clamp which would flatten
@@ -1719,7 +1732,7 @@ double ZmqOpenFlowController::ComputeMlReward() {
   const double posBound = m_ml.reward_alpha + m_ml.reward_beta;
   const double negBound = m_ml.reward_gamma + m_ml.reward_delta +
                           m_ml.reward_zeta + m_ml.reward_eta +
-                          m_ml.reward_theta;
+                          m_ml.reward_theta + m_ml.reward_kappa;
   const double span = posBound + negBound;
   double R_norm;
   if (span > 0.0) {
@@ -1738,7 +1751,8 @@ double ZmqOpenFlowController::ComputeMlReward() {
                << delayQuality << " l=" << lossQuality << " p=" << powerCost
                << " u=" << utilPenalty << " f=" << footprintPenalty
                << " e=" << reserveAwarePenalty << " b=" << balancePenalty
-               << " | P_W=" << currPowerW << " stddev=" << stddevResidual);
+               << " c=" << churnPenalty << " | P_W=" << currPowerW
+               << " stddev=" << stddevResidual);
   return R_norm;
 }
 
@@ -1779,6 +1793,7 @@ void ZmqOpenFlowController::ApplyDeltaCosts(const std::vector<double>& deltas) {
   size_t n = std::min(deltas.size(), m_mlLinkOrder.size());
   double scale = CurrentActionScale();
   bool anyChanged = false;
+  double churnL1 = 0.0;
   for (size_t i = 0; i < n; ++i) {
     double d = deltas[i];
     if (d > scale)
@@ -1788,11 +1803,21 @@ void ZmqOpenFlowController::ApplyDeltaCosts(const std::vector<double>& deltas) {
 
     auto [a, b] = m_mlLinkOrder[i];
     double prev = m_topology.GetLinkMlDelta(a, b);
+    churnL1 += std::abs(d - prev);
     if (std::abs(d - prev) > 1e-9) {
       m_topology.SetLinkMlDelta(a, b, d);
       anyChanged = true;
     }
   }
+  // Normalize against the analytic max swing: each delta is clamped to
+  // [-scale, +scale], so per-link swing maxes at 2·scale and L1 over all
+  // links at n·2·scale. Dividing puts churn in [0, 1], comparable to every
+  // other normalized term in ComputeMlReward. Stashed for the *next* tick:
+  // consequences of action a_t show up in observation s_{t+1}.
+  const double maxSwing = static_cast<double>(n) * 2.0 * scale;
+  m_lastChurnNorm = (maxSwing > 0.0)
+                        ? std::clamp(churnL1 / maxSwing, 0.0, 1.0)
+                        : 0.0;
   // Critical: existing flow entries are keyed only on eth_dst and never
   // expire, so continuous flows never re-PacketIn and never see the new
   // costs. Walk the routing table now and rewrite next-hop ports where

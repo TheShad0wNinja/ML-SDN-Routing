@@ -23,6 +23,7 @@ struct LinkSpec {
   double lossRate = 0.0;
   std::string bufferSize;
   bool failureTarget = false;
+  std::string dataRate = "1Gbps";
 };
 
 struct SectionDef {
@@ -44,15 +45,33 @@ struct TopoSpec {
   std::vector<LinkSpec> links;
   std::vector<uint32_t> hostToSwitch;
   std::vector<std::string> hostNames;
+  // Optional per-host group id used by trafficMode="grouped" to bias flows
+  // across groups (e.g. west/central/east). Parallel to hostToSwitch. Leave
+  // empty for topologies without a natural grouping — grouped mode then
+  // degrades to random. Survives FilterTopoSpecBySection so federated
+  // workers see the correct group of each surviving host.
+  std::vector<uint32_t> hostGroups;
   std::string label;
 
-  // Populated by topology factories that support multi-controller mode.
-  // Empty = topology is unsupported in multi-controller mode.
+  // Populated by topology factories that natively partition; left empty for
+  // flat topologies. NormalizeTopoSpec() backfills a single all-switch
+  // section so every TopoSpec has at least one.
   std::vector<SectionDef> sections;
   std::vector<InterDomainRoute> interDomainRoutes;
+
+  // Topology-specific defaults that scenarios used to hard-code in their
+  // main.cc. Set by the topology factory; the runner reads them when the
+  // corresponding CLI flag wasn't explicitly set.
+  uint32_t defaultCentralHost = 0;
+  uint32_t defaultFlashCrowdDst = 0;
+  uint32_t defaultBlackHoleSwitch = 0;
 };
 
 std::vector<uint32_t> ParseIndexCsv(const std::string& csv);
+
+// Ensure topo.sections is non-empty: if a factory didn't define one, add a
+// single section covering all switches. Idempotent.
+void NormalizeTopoSpec(TopoSpec& topo);
 
 // Restrict a TopoSpec to a subset of switch indices. Used by the Phase-1
 // federated path: each ns-3 process simulates one section as an isolated

@@ -4,6 +4,16 @@
 
 namespace ns3 {
 
+void NormalizeTopoSpec(TopoSpec& topo) {
+  if (!topo.sections.empty()) return;
+  SectionDef whole;
+  whole.id = 0;
+  whole.name = "all";
+  whole.nodes.resize(topo.nodes.size());
+  for (uint32_t i = 0; i < topo.nodes.size(); ++i) whole.nodes[i] = i;
+  topo.sections.push_back(std::move(whole));
+}
+
 std::vector<uint32_t> ParseIndexCsv(const std::string& csv) {
   std::vector<uint32_t> out;
   std::string tok;
@@ -58,6 +68,9 @@ TopoSpec FilterTopoSpecBySection(const TopoSpec& full,
     out.hostNames.push_back(h < full.hostNames.size()
                                 ? full.hostNames[h]
                                 : full.nodes[sw].name);
+    if (h < full.hostGroups.size()) {
+      out.hostGroups.push_back(full.hostGroups[h]);
+    }
   }
 
   std::cout << "[SECTION] kept " << out.nodes.size() << "/"

@@ -4,10 +4,19 @@
 #include <vector>
 
 #include "ns3/applications-module.h"
+#include "ns3/command-line.h"
 #include "ns3/internet-module.h"
 #include "ns3/network-module.h"
 
 namespace ns3 {
+
+// CLI options owned by StressEvents. 0 sentinels mean "use topology default".
+struct StressOptions {
+  bool enabled = false;
+  uint32_t flashCrowdDst = 0;
+  uint32_t blackHoleSwitchIdx = 0;
+  void Register(CommandLine& cmd);
+};
 
 class LinkController {
  public:

@@ -52,6 +52,7 @@ std::pair<uint32_t, uint32_t> ScenarioBuilder::AddBackboneLink(
   std::ostringstream oss;
   oss << std::fixed << std::setprecision(6) << (spec.distanceKm * 5e-6) << "s";
   m_backboneHelper.SetChannelAttribute("Delay", StringValue(oss.str()));
+  m_backboneHelper.SetChannelAttribute("DataRate", StringValue(spec.dataRate));
 
   NetDeviceContainer dev = m_backboneHelper.Install(
       NodeContainer(m_switches.Get(spec.src), m_switches.Get(spec.dst)));

@@ -88,6 +88,8 @@ struct MlConfig {
   double reward_eta = 1.5;  // Reserve-aware penalty (ignore nearly dead nodes)
   double reward_theta =
       1.0;  // residual-energy variance penalty (encourage round-robin routing)
+  double reward_kappa =
+      1.0;  // route-churn penalty (L1 of action-vector delta between ticks)
 
   // Normalization references
   double delay_ref_ms = 200.0;   // ms; baseline target
@@ -313,6 +315,9 @@ class ZmqOpenFlowController : public OFSwitch13Controller {
   std::unordered_map<uint64_t, SwitchObservation> m_mlPrevObs;
   bool m_mlHavePrevObs = false;
   double m_mlPrevReward = 0.0;
+  // L1(a_t - a_{t-1}) / max_swing in [0, 1]. Updated in ApplyDeltaCosts;
+  // consumed one tick later by ComputeMlReward as the churn penalty.
+  double m_lastChurnNorm = 0.0;
 };
 
 }  // namespace ns3
