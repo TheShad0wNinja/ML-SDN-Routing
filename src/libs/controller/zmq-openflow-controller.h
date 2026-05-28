@@ -245,7 +245,7 @@ class ZmqOpenFlowController : public OFSwitch13Controller {
   static constexpr uint32_t kFloodGroupId = 1;  // Openflow Group ID for floodss
 
   // Control Flags
-  double m_statsIntervalS = 60.0; // Interval for statss
+  double m_statsIntervalS = 30.0; // Interval for statss
   bool m_congestionDirty =
       false;  // Used to recompute routes after factor threshold exceeded
 

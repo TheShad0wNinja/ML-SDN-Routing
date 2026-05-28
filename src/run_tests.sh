@@ -67,7 +67,7 @@ ML_PORT_BASE=5555
 FED_ROUNDS=1              # back-to-back rounds in one invocation
 FED_RESET=false           # --reset: wipe priority's training state before training
 FEDAVG_DIR=""
-FEDAVG_EVERY=0
+FEDAVG_EVERY=50
 FEDAVG_TIMEOUT=300
 FEDAVG_AGG_LOG_DIR=""
 AGG_PID=""
@@ -455,11 +455,13 @@ summarize_log() {
   local ml_ticks ml_reward_final ml_reward_mean ml_critic_loss ml_actor_loss
   ml_ticks=""; ml_reward_final=""; ml_reward_mean=""
   ml_critic_loss=""; ml_actor_loss=""
-  local metrics_csv; metrics_csv="$(ckpt_dir_for_priority "$PRIORITY")/metrics.csv"
-  if $ML && [[ -f "$metrics_csv" ]]; then
+  # Hand the priority dir to the aggregator; it auto-discovers w*/metrics.csv
+  # (train mode) or falls back to a top-level metrics.csv (single-worker / eval).
+  local metrics_src; metrics_src="$(ckpt_dir_for_priority "$PRIORITY")"
+  if $ML && [[ -d "$metrics_src" ]]; then
     local agg
     agg=$(python3 "$SCRIPT_DIR/python/aggregate_metrics.py" \
-            "$metrics_csv" 2>/dev/null || true)
+            "$metrics_src" 2>/dev/null || true)
     ml_ticks=$(echo       "$agg" | awk -F= '/^ML_TICKS=/{print $2}')
     ml_reward_final=$(echo "$agg" | awk -F= '/^ML_REWARD_FINAL=/{print $2}')
     ml_reward_mean=$(echo  "$agg" | awk -F= '/^ML_REWARD_MEAN_LAST25=/{print $2}')

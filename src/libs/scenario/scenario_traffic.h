@@ -41,8 +41,8 @@ struct TrafficOptions {
   std::string mode = "random";   // random | central | grouped
   bool ping = true;
   bool mixedLoad = false;
-  uint32_t maxConcurrent = 60;
-  double arrivalRateHz = 8.0;
+  uint32_t maxConcurrent = 30;
+  double arrivalRateHz = 4.0;
   // centralHostIdx: 0 = use the topology's defaultCentralHost. Override on the
   // CLI to force a specific host index.
   uint32_t centralHostIdx = 0;

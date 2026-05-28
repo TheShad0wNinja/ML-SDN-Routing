@@ -84,6 +84,7 @@ int RunScenario(ScenarioOptions& opts, TopoSpec topo,
   GlobalValue::Bind("SchedulerType", StringValue("ns3::MapScheduler"));
   Config::SetDefault("ns3::TcpL4Protocol::SocketType",
                      TypeIdValue(TcpCubic::GetTypeId()));
+  Config::SetDefault("ns3::TcpSocket::SegmentSize", UintegerValue(8940));
 
   if (opts.warmupS < 0.0) opts.warmupS = 0.0;
   if (opts.warmupS > opts.simTime - 5.0)

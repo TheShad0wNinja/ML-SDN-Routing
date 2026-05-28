@@ -127,7 +127,7 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
 
   // Apply priority preset unless it' custom
   switch (cfg.priority_preset) {
-    case MlConfig::MlPriority::BALANCED: {
+    case MlConfig::MlPriority::BALANCED: 
       m_ml.reward_alpha = 1.0;
       m_ml.reward_beta = 2.0;
       m_ml.reward_gamma = 1.5;
@@ -136,8 +136,8 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
       m_ml.reward_eta = 1.5;
       m_ml.reward_theta = 1.0;
       m_ml.reward_kappa = 1.0;
-    }
-    case MlConfig::MlPriority::THROUGHPUT: {
+      break;
+    case MlConfig::MlPriority::THROUGHPUT: 
       m_ml.reward_alpha = 2.5;
       m_ml.reward_beta = 3.0;
       m_ml.reward_gamma = 0.5;
@@ -146,8 +146,8 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
       m_ml.reward_eta = 0.8;
       m_ml.reward_theta = 0.5;
       m_ml.reward_kappa = 1.5;
-    }
-    case MlConfig::MlPriority::ENERGY: {
+      break;
+    case MlConfig::MlPriority::ENERGY: 
       m_ml.reward_alpha = 1.0;
       m_ml.reward_beta = 2.0;  // pos bound = 3.0
       m_ml.reward_gamma = 2.0;
@@ -156,7 +156,7 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
       m_ml.reward_eta = 2.5;
       m_ml.reward_theta = 1.5;
       m_ml.reward_kappa = 0.8;  // neg bound = 8.3
-    }
+      break;
     default:
       break;
   }

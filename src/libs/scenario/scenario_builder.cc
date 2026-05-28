@@ -15,9 +15,11 @@ NS_LOG_COMPONENT_DEFINE("ScenarioBuilder");
 ScenarioBuilder::ScenarioBuilder() {
   m_edgeHelper.SetChannelAttribute("DataRate", StringValue("100Mbps"));
   m_edgeHelper.SetChannelAttribute("Delay", StringValue("1ms"));
-  m_edgeHelper.SetDeviceAttribute("Mtu", UintegerValue(1500));
+  m_edgeHelper.SetChannelAttribute("FullDuplex", BooleanValue(true));
+  m_edgeHelper.SetDeviceAttribute("Mtu", UintegerValue(9000));
   m_backboneHelper.SetChannelAttribute("DataRate", StringValue("1Gbps"));
-  m_backboneHelper.SetDeviceAttribute("Mtu", UintegerValue(1500));
+  m_backboneHelper.SetChannelAttribute("FullDuplex", BooleanValue(true));
+  m_backboneHelper.SetDeviceAttribute("Mtu", UintegerValue(9000));
 }
 
 void ScenarioBuilder::CreateNodes(uint32_t numHosts, uint32_t numSwitches,
@@ -122,6 +124,7 @@ void ScenarioBuilder::InstallOpenFlow(
   m_helpers.resize(ctrls.size());
   for (uint32_t c = 0; c < ctrls.size(); ++c) {
     m_helpers[c] = CreateObject<OFSwitch13InternalHelper>();
+    m_helpers[c]->SetChannelType(OFSwitch13Helper::DEDICATED_P2P);
     m_controllers.Get(c)->AddApplication(ctrls[c]);
     ctrls[c]->SetStartTime(Seconds(0));
     m_helpers[c]->InstallController(m_controllers.Get(c), ctrls[c]);
