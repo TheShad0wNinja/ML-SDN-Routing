@@ -255,6 +255,13 @@ start_ml_service() {
       continue
     fi
 
+    # Rotate any stale metrics.csv from a previous run so summarize_log
+    # only sees this run's rows. Skip when reusing a live service above —
+    # that process still owns its file handle.
+    if [[ -f "$dir/metrics.csv" ]]; then
+      mv -f "$dir/metrics.csv" "$dir/metrics.prev.csv"
+    fi
+
     echo "[run_tests] Starting ML service slot=$s port=$port dir=$dir…"
     (
       cd "$NS3_ROOT"

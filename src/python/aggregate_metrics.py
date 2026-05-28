@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Aggregate per-tick training metrics into one summary row.
 
-Reads either:
-  - a single metrics.csv file (single-worker / eval mode), or
-  - a priority directory like scratch/data/agent/<priority>/ in which case
-    all w*/metrics.csv files are merged across workers.
+Reads either a single metrics.csv file or a priority directory like
+scratch/data/agent/<priority>/, in which case all per-worker
+metrics.csv files are merged across workers. Three directory layouts
+are supported (matching ML_LAYOUT in run_tests.sh):
 
-In train mode each worker has its own scratch/data/agent/<priority>/w<N>/
-checkpoint dir with its own metrics.csv. This script discovers them
-automatically and reports cross-worker means for the headline numbers.
+  - flat   (single / eval / compare): <priority>/metrics.csv
+  - train  (federated):                <priority>/train/w<id>/metrics.csv
+  - deploy (--multiController):        <priority>/deploy/s<id>/metrics.csv
+
+Legacy <priority>/w<id>/metrics.csv (pre-train/deploy split) is also
+discovered for archive compatibility.
 
 Output format is `KEY=value` lines so the shell grep stays trivial:
 
@@ -49,20 +52,35 @@ def _to_float(s: str):
 
 
 def find_metrics_csvs(path: Path) -> list[Path]:
-    """If path is a file, return [path]. If a directory, find metrics.csv
-    in the dir itself (single-worker layout) and in immediate w*/ subdirs
-    (multi-worker / train layout). Keeps depth shallow so accidental sweeps
-    of archived data don't get picked up."""
+    """If path is a file, return [path]. If a directory, discover
+    metrics.csv files across the known parallel-worker layouts:
+
+      - <path>/metrics.csv                  (flat, single-worker)
+      - <path>/w<id>/metrics.csv            (legacy multi-worker)
+      - <path>/train/w<id>/metrics.csv      (federated training)
+      - <path>/deploy/s<id>/metrics.csv     (multi-controller deploy)
+
+    Depth is kept shallow on purpose — no recursive ** — so archived
+    runs under sibling directories don't get accidentally pulled in."""
     if path.is_file():
         return [path]
     if not path.is_dir():
         return []
+    patterns = [
+        "metrics.csv",
+        "w*/metrics.csv",
+        "train/w*/metrics.csv",
+        "deploy/s*/metrics.csv",
+    ]
+    seen: set[Path] = set()
     found: list[Path] = []
-    direct = path / "metrics.csv"
-    if direct.exists():
-        found.append(direct)
-    for sub in sorted(path.glob("w*/metrics.csv")):
-        found.append(sub)
+    for pat in patterns:
+        for p in sorted(path.glob(pat)):
+            rp = p.resolve()
+            if rp in seen:
+                continue
+            seen.add(rp)
+            found.append(p)
     return found
 
 

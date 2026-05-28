@@ -743,11 +743,13 @@ class MLService:
             self._metrics_fh = open(_METRICS_PATH, "a", newline="")
             self._metrics_writer = csv.DictWriter(
                 self._metrics_fh,
-                fieldnames=["tick", "reward", "critic_loss", "actor_loss",
-                            "mean_abs_action", "replay_size", "wall_clock_ms"],
+                fieldnames=["worker_id", "tick", "reward", "critic_loss",
+                            "actor_loss", "mean_abs_action", "replay_size",
+                            "wall_clock_ms"],
             )
             if new_file:
                 self._metrics_writer.writeheader()
+        row.setdefault("worker_id", _WORKER_ID)
         # Replace None with "" so CSV stays parseable.
         clean = {k: ("" if v is None else v) for k, v in row.items()}
         if self._metrics_writer is not None:
