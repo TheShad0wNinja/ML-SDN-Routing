@@ -11,17 +11,17 @@ TopoSpec BuildFatTreeK4Spec(const std::string& backboneQueue) {
 
   for (uint32_t c = 0; c < 4; ++c) {
     spec.nodes.push_back(
-        {"core" + std::to_string(c), "tier1", "1Gbps", 2, 0.05, 5e7});
+        {"core" + std::to_string(c), "tier1", "1Gbps", 2, 5e-7, 1e4});
   }
   for (uint32_t p = 0; p < 4; ++p) {
     spec.nodes.push_back({"agg" + std::to_string(p) + "_0", "tier2", "500Mbps",
-                          5, 0.08, 2e7});
+                          5, 8e-7, 4e3});
     spec.nodes.push_back({"agg" + std::to_string(p) + "_1", "tier2", "500Mbps",
-                          5, 0.08, 2e7});
+                          5, 8e-7, 4e3});
     spec.nodes.push_back(
-        {"edge" + std::to_string(p) + "_0", "edge", "100Mbps", 10, 0.10, 1e7});
+        {"edge" + std::to_string(p) + "_0", "edge", "100Mbps", 10, 1e-6, 2e3});
     spec.nodes.push_back(
-        {"edge" + std::to_string(p) + "_1", "edge", "100Mbps", 10, 0.10, 1e7});
+        {"edge" + std::to_string(p) + "_1", "edge", "100Mbps", 10, 1e-6, 2e3});
   }
 
   const double dKm = 200.0;

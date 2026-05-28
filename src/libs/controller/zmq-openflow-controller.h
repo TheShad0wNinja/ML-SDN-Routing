@@ -94,7 +94,7 @@ struct MlConfig {
   // Normalization references
   double delay_ref_ms = 200.0;   // ms; baseline target
   double loss_ref_bps = 1.0e6;   // bits/s; tolerable drop budget
-  double power_ref_w = 90000.0;  // watts; baseline aggregate power
+  double power_ref_w = 100.0;    // watts; baseline aggregate power
 
   // ML Priority preset for reward weights
   enum MlPriority { BALANCED, THROUGHPUT, ENERGY, CUSTOM };
