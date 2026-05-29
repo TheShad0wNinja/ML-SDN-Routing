@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -62,6 +63,16 @@ public:
   // Returns: dpid -> set of ports that are on the BFS spanning tree
   std::unordered_map<uint64_t, std::unordered_set<uint32_t>> ComputeSpanningTree() const;
 
+  // Articulation points (cut vertices) of the switch graph, via Tarjan's DFS
+  // in O(V+E). A switch in this set cannot be removed without disconnecting
+  // the backbone, so the node-sleep action must never put one to sleep.
+  // Computed once after topology discovery is frozen.
+  std::set<uint64_t> ComputeArticulationPoints() const;
+
+  // Nodes the ML node-sleep action has powered off. ShortestPath routes around
+  // them (never transits a blocked node). Setting this clears the path cache.
+  void SetBlockedNodes(const std::set<uint64_t>& blocked);
+
   std::optional<uint64_t> GetPeerDpid(uint64_t dpid, uint32_t port) const;
   std::optional<uint32_t> GetPeerPort(uint64_t dpid, uint32_t port) const;
 
@@ -84,6 +95,10 @@ private:
 
   // Weighted adjacency list for Dijkstra
   std::unordered_map<uint64_t, std::unordered_set<uint64_t>> m_graph;
+
+  // Nodes powered off by the ML node-sleep action; Dijkstra never transits
+  // them. Empty unless the node-sleep action is in use.
+  std::set<uint64_t> m_blockedNodes;
 
   // Link costs and delays
   std::unordered_map<uint64_t, std::unordered_map<uint64_t, double>> m_linkDelay;

@@ -132,6 +132,10 @@ int RunScenario(ScenarioOptions& opts, TopoSpec topo,
     ann.node_type = "host";
     ctrls[switchToSection[sw]]->SetHostAnnotation(
         builder.GetHostInfos()[h].mac, ann);
+    // dpid convention is switchIndex + 1 (see ScenarioBuilder::ConfigureSwitch).
+    // Protect this switch from the node-sleep action — sleeping a host's access
+    // switch would strand the host.
+    ctrls[switchToSection[sw]]->MarkHostSwitch(sw + 1);
   }
   for (const auto& spec : topo.links) {
     builder.AddBackboneLink(spec, spec.bufferSize);

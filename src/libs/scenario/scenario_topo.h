@@ -14,6 +14,9 @@ struct NodeProfile {
   uint32_t tcamDelayUs = 5;
   double energyPerByteJ = 0.0;
   double initialEnergyJ = 0.0;
+  // Idle draw of a powered-on switch (W), independent of forwarded traffic.
+  // 0 = legacy traffic-only energy accounting.
+  double idlePowerW = 0.0;
 };
 
 struct LinkSpec {

@@ -44,6 +44,17 @@ TopoSpec BuildUsaSpec(const std::string& backboneQueue, bool crippleEnabled) {
   if (!crippleEnabled) {
     spec.nodes[5] = {"Missoula", "tier2", "500Mbps", 5, 8e-7, 4e3};
   }
+  // Powered-on idle draw the node-sleep action can eliminate, by tier. Modest
+  // starting points — tune as needed. A slept switch contributes neither idle
+  // nor forwarding power and is routed around.
+  for (auto& n : spec.nodes) {
+    if (n.nodeType == "tier1")
+      n.idlePowerW = 2.0;
+    else if (n.nodeType == "tier2")
+      n.idlePowerW = 1.0;
+    else
+      n.idlePowerW = 0.5;  // edge
+  }
   spec.links = {
       { 4,  7,  575.0, 0.000, backboneQueue, false, "2Gbps"}, // tier2-edge
       { 7, 10,  557.0, 0.000, backboneQueue, false, "500Mbps"}, // edge-tier2

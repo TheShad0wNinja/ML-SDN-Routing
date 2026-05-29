@@ -30,6 +30,33 @@ void MlOptions::Register(CommandLine& cmd) {
                lossRefBps);
   cmd.AddValue("mlPowerRef", "Power reference for normalization (W)",
                powerRefW);
+  cmd.AddValue("mlFootprintFloorBps",
+               "Min bps for a switch to count as 'active' (footprint penalty)",
+               footprintFloorBps);
+  cmd.AddValue("mlFootprintFrac",
+               "Load-proportional active threshold: totalTxBps * frac",
+               footprintFrac);
+  cmd.AddValue("mlEnPower", "ENERGY reward sub-weight: power cost", enPower);
+  cmd.AddValue("mlEnUtil", "ENERGY reward sub-weight: utilization", enUtil);
+  cmd.AddValue("mlEnFootprint", "ENERGY reward sub-weight: footprint",
+               enFootprint);
+  cmd.AddValue("mlEnReserve", "ENERGY reward sub-weight: reserve-aware",
+               enReserve);
+  cmd.AddValue("mlEnBalance", "ENERGY reward sub-weight: energy balance",
+               enBalance);
+  cmd.AddValue("mlEnChurn", "ENERGY reward sub-weight: route churn", enChurn);
+  cmd.AddValue("mlSlaPdr",
+               "ENERGY QoS hinge: lossQuality floor below which loss is penalised",
+               slaPdr);
+  cmd.AddValue("mlSlaDelay",
+               "ENERGY QoS hinge: delayQuality floor below which delay is penalised",
+               slaDelay);
+  cmd.AddValue("mlPdrHingeW", "ENERGY QoS hinge slope for loss", pdrHingeW);
+  cmd.AddValue("mlDelayHingeW", "ENERGY QoS hinge slope for delay", delayHingeW);
+  cmd.AddValue("mlSleepThreshold",
+               "Node-sleep action threshold: node value above this powers a "
+               "switch off (routed around, zero idle+forwarding power)",
+               sleepThreshold);
   cmd.AddValue("mlExplore",
                "Enable Gaussian action noise", explore);
   cmd.AddValue("mlLearn",
@@ -79,6 +106,19 @@ MlConfig MlOptions::BuildMlConfig(uint32_t seedIn) const {
   cfg.delay_ref_ms = delayRefMs;
   cfg.loss_ref_bps = lossRefBps;
   cfg.power_ref_w = powerRefW;
+  cfg.footprint_floor_bps = footprintFloorBps;
+  cfg.footprint_frac = footprintFrac;
+  cfg.en_w_power = enPower;
+  cfg.en_w_util = enUtil;
+  cfg.en_w_footprint = enFootprint;
+  cfg.en_w_reserve = enReserve;
+  cfg.en_w_balance = enBalance;
+  cfg.en_w_churn = enChurn;
+  cfg.sla_pdr = slaPdr;
+  cfg.sla_delay = slaDelay;
+  cfg.pdr_hinge_w = pdrHingeW;
+  cfg.delay_hinge_w = delayHingeW;
+  cfg.sleep_threshold = sleepThreshold;
   cfg.explore = explore;
   cfg.learn = learn;
   cfg.checkpoint_every_n_ticks = checkpointEveryNTicks;

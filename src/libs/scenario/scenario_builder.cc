@@ -149,7 +149,7 @@ void ScenarioBuilder::ConfigureSwitch(uint32_t idx, const NodeProfile& profile,
 
   uint64_t dpid = idx + 1;
   ctrl->SetSwitchEnergyModel(dpid, profile.initialEnergyJ,
-                             profile.energyPerByteJ);
+                             profile.energyPerByteJ, profile.idlePowerW);
 }
 
 void ScenarioBuilder::EnableTraces(const std::string& prefix) {

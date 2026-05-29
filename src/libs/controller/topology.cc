@@ -353,8 +353,16 @@ std::optional<std::vector<uint64_t>> Topology::ShortestPath(uint64_t src, uint64
         if (graphIt == m_graph.end())
             continue;
 
+        // Never transit a powered-off (slept) switch. It may still be the
+        // destination (so the miss is cached correctly), but it can never sit
+        // in the middle of a path.
+        if (u != src && m_blockedNodes.count(u))
+            continue;
+
         for (uint64_t v : graphIt->second)
         {
+            if (v != dst && m_blockedNodes.count(v))
+                continue;
             double edgeCost = GetLinkCost(u, v);
             double newDist = cost + edgeCost;
             if (dist.find(v) == dist.end() || newDist < dist[v])
@@ -509,6 +517,68 @@ std::optional<uint32_t> Topology::GetPeerPort(uint64_t dpid, uint32_t port) cons
     auto pit = it->second.find(port);
     if (pit == it->second.end()) return std::nullopt;
     return pit->second.peerPort;
+}
+
+void Topology::SetBlockedNodes(const std::set<uint64_t>& blocked)
+{
+    if (blocked == m_blockedNodes) return;
+    m_blockedNodes = blocked;
+    m_pathCache.clear();  // routes change when the blocked set changes
+}
+
+std::set<uint64_t> Topology::ComputeArticulationPoints() const
+{
+    // Tarjan's articulation-point DFS over the undirected switch graph, O(V+E).
+    // disc[u] = DFS discovery time, low[u] = lowest disc reachable from u's
+    // subtree via at most one back edge. A non-root u is an articulation point
+    // if it has a child v with low[v] >= disc[u]; the root is one iff it has
+    // >1 DFS children. Iterative to avoid blowing the stack on large graphs.
+    std::set<uint64_t> aps;
+    if (m_graph.empty()) return aps;
+
+    std::unordered_map<uint64_t, int> disc, low;
+    std::unordered_map<uint64_t, uint64_t> parent;
+    int timer = 0;
+
+    for (const auto& kv : m_graph) {
+        uint64_t start = kv.first;
+        if (disc.count(start)) continue;
+
+        // Explicit DFS stack of (node, neighbour-iteration-index).
+        std::vector<std::pair<uint64_t, std::unordered_set<uint64_t>::const_iterator>>
+            stk;
+        disc[start] = low[start] = ++timer;
+        parent[start] = start;  // sentinel: root is its own parent
+        int rootChildren = 0;
+        stk.push_back({start, m_graph.at(start).begin()});
+
+        while (!stk.empty()) {
+            uint64_t u = stk.back().first;
+            auto& it = stk.back().second;
+            const auto& adj = m_graph.at(u);
+            if (it != adj.end()) {
+                uint64_t v = *it++;
+                if (!disc.count(v)) {
+                    parent[v] = u;
+                    if (u == start) ++rootChildren;
+                    disc[v] = low[v] = ++timer;
+                    stk.push_back({v, m_graph.at(v).begin()});
+                } else if (v != parent[u]) {
+                    low[u] = std::min(low[u], disc[v]);
+                }
+            } else {
+                // Done with u: propagate low to parent and test the AP condition.
+                stk.pop_back();
+                if (!stk.empty()) {
+                    uint64_t p = stk.back().first;
+                    low[p] = std::min(low[p], low[u]);
+                    if (p != start && low[u] >= disc[p]) aps.insert(p);
+                }
+            }
+        }
+        if (rootChildren > 1) aps.insert(start);
+    }
+    return aps;
 }
 
 } // namespace ns3

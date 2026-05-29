@@ -20,6 +20,14 @@ struct MlOptions {
   double alpha = 1.0, beta = 2.0, gamma = 1.5, delta = 1.0;
   double zeta = 0.5, eta = 1.5, theta = 1.0, kappa = 1.0;
   double delayRefMs = 200.0, lossRefBps = 1.0e6, powerRefW = 100.0;
+  // Active-switch footprint threshold: max(floor, totalTxBps * frac).
+  double footprintFloorBps = 50000.0, footprintFrac = 0.005;
+  // ENERGY gated-reward shaping: convex energy sub-weights + QoS hinge.
+  double enPower = 0.30, enUtil = 0.25, enFootprint = 0.20;
+  double enReserve = 0.15, enBalance = 0.05, enChurn = 0.05;
+  double slaPdr = 0.99, slaDelay = 0.90, pdrHingeW = 15.0, delayHingeW = 5.0;
+  // Per-node sleep action: node-action value above this powers a switch off.
+  double sleepThreshold = 0.5;
   bool explore = true;
   bool learn = true;
   uint32_t checkpointEveryNTicks = 60;

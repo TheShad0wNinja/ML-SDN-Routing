@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -64,6 +65,10 @@ struct HostAnnotation {
 struct SwitchEnergyModel {
   double initial_energy_j = -1;     // -1 = not tracked
   double energy_per_byte_j = 1e-9;  // joules consumed per byte forwarded
+  // Idle draw of a powered-on switch, independent of forwarded traffic. 0 keeps
+  // the legacy traffic-only behaviour. A non-zero value makes an empty-but-on
+  // switch cost energy, so powering it off (sleep action) is a real win.
+  double idle_power_w = 0.0;
 };
 
 struct MlConfig {
@@ -95,6 +100,37 @@ struct MlConfig {
   double delay_ref_ms = 200.0;   // ms; baseline target
   double loss_ref_bps = 1.0e6;   // bits/s; tolerable drop budget
   double power_ref_w = 100.0;    // watts; baseline aggregate power
+
+  // Active-switch footprint threshold. A switch counts as "active" if it
+  // forwards more than max(footprint_floor_bps, totalTxBps * footprint_frac).
+  // The dynamic fraction lets switches register as idle even under heavy global
+  // load, restoring a live consolidation gradient (the old fixed 1 kbps floor
+  // was background LLDP/ARP level, so every switch always read "active").
+  double footprint_floor_bps = 50000.0;
+  double footprint_frac = 0.005;
+
+  // --- ENERGY-priority gated reward shaping ---
+  // For the ENERGY preset the reward is NOT the legacy additive sum. Delivery
+  // quality (loss/delay) is treated as a constraint via a hinge, not an additive
+  // offset, so the controllable energy terms below get the full [-1, 1] range.
+  // The six sub-weights form a convex combination (should sum to ~1.0); they are
+  // renormalised at config time if they don't.
+  double en_w_power = 0.30;      // powerCost
+  double en_w_util = 0.25;       // utilPenalty
+  double en_w_footprint = 0.20;  // footprintPenalty
+  double en_w_reserve = 0.15;    // reserveAwarePenalty
+  double en_w_balance = 0.05;    // balancePenalty
+  double en_w_churn = 0.05;      // churnPenalty
+  // QoS hinge: penalise only when quality drops below the SLA floor.
+  double sla_pdr = 0.99;         // lossQuality floor (delivery)
+  double sla_delay = 0.90;       // delayQuality floor
+  double pdr_hinge_w = 15.0;     // slope of the loss hinge below SLA
+  double delay_hinge_w = 5.0;    // slope of the delay hinge below SLA
+
+  // Per-node sleep action: a node-action value above this threshold powers the
+  // switch off (routed around, zero idle + forwarding power). The actor emits
+  // tanh outputs in [-1, 1], so 0.5 means "clearly wants it off".
+  double sleep_threshold = 0.5;
 
   // ML Priority preset for reward weights
   enum MlPriority { BALANCED, THROUGHPUT, ENERGY, CUSTOM };
@@ -160,7 +196,13 @@ class ZmqOpenFlowController : public OFSwitch13Controller {
   void InstallExternalHostRoutes(const std::vector<ExternalHostRoute>& routes);
 
   // Configure forwarding-energy model for a switch (by DPID)
-  void SetSwitchEnergyModel(uint64_t dpid, double initial_j, double per_byte_j);
+  void SetSwitchEnergyModel(uint64_t dpid, double initial_j, double per_byte_j,
+                            double idle_power_w = 0.0);
+
+  // Mark a switch as host-bearing so the node-sleep action never powers it off
+  // (sleeping a host's access switch would disconnect that host). Called by the
+  // scenario builder/runner for every switch with an attached host.
+  void MarkHostSwitch(uint64_t dpid);
 
   // Read back energy state for reporting. Returns -1 if dpid not configured.
   double GetSwitchInitialEnergyJ(uint64_t dpid) const;
@@ -252,6 +294,11 @@ class ZmqOpenFlowController : public OFSwitch13Controller {
   double CurrentActionScale() const;
   // Applies the model new link weight deltas
   void ApplyDeltaCosts(const std::vector<double>& deltas);
+  // Applies the per-node sleep action (one value per m_mlNodeOrder entry). A
+  // value above m_ml.sleep_threshold powers the switch off, unless it is in
+  // m_nonSleepable (articulation point or host-bearing). Updates m_sleepSwitches
+  // and the topology's blocked set, then recomputes routes.
+  void ApplySleepActions(const std::vector<double>& nodeVals);
 
   // Constants
   static constexpr uint32_t kMaxLldpProbe =
@@ -312,6 +359,19 @@ class ZmqOpenFlowController : public OFSwitch13Controller {
   // Energy Model
   std::unordered_map<uint64_t, SwitchEnergyModel> m_switchEnergyModel; // Dpid -> energy model
   std::unordered_map<uint64_t, double> m_switchResidualEnergy; // Dpid -> Remaining energy
+  // Switches the ML agent has powered off (node-sleep action). A slept switch
+  // draws no idle power, forwards no traffic, and is routed around. Never
+  // contains a non-sleepable switch. Empty unless the action is in use.
+  std::set<uint64_t> m_sleepSwitches;
+  // Switches the node-sleep action must never power off: articulation points of
+  // the switch graph (computed once at first MlTick) plus host-bearing switches
+  // (marked at setup). Sleeping any of these would partition the network or
+  // strand a host.
+  std::set<uint64_t> m_nonSleepable;
+  // Host-bearing switches, accumulated via MarkHostSwitch before MlTick freezes
+  // m_nonSleepable. Kept separately so the articulation set can be recomputed
+  // without losing host marks.
+  std::set<uint64_t> m_hostSwitches;
 
   // Scenario Metadata
   std::unordered_map<uint64_t, HostAnnotation> m_hostAnnotations;

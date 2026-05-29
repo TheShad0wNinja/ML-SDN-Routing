@@ -98,9 +98,14 @@ void ZmqOpenFlowController::SetHostAnnotation(uint64_t mac,
 
 void ZmqOpenFlowController::SetSwitchEnergyModel(uint64_t dpid,
                                                  double initial_j,
-                                                 double per_byte_j) {
-  m_switchEnergyModel[dpid] = {initial_j, per_byte_j};
+                                                 double per_byte_j,
+                                                 double idle_power_w) {
+  m_switchEnergyModel[dpid] = {initial_j, per_byte_j, idle_power_w};
   if (initial_j >= 0) m_switchResidualEnergy[dpid] = initial_j;
+}
+
+void ZmqOpenFlowController::MarkHostSwitch(uint64_t dpid) {
+  m_hostSwitches.insert(dpid);
 }
 
 double ZmqOpenFlowController::GetSwitchInitialEnergyJ(uint64_t dpid) const {
@@ -147,18 +152,38 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
       m_ml.reward_theta = 0.5;
       m_ml.reward_kappa = 1.5;
       break;
-    case MlConfig::MlPriority::ENERGY: 
-      m_ml.reward_alpha = 1.0;
-      m_ml.reward_beta = 2.0;  // pos bound = 3.0
-      m_ml.reward_gamma = 2.0;
-      m_ml.reward_delta = 0.5;
-      m_ml.reward_zeta = 1.0;
-      m_ml.reward_eta = 2.5;
-      m_ml.reward_theta = 1.5;
-      m_ml.reward_kappa = 0.8;  // neg bound = 8.3
+    case MlConfig::MlPriority::ENERGY:
+      // ENERGY no longer uses the legacy additive α–κ weights; ComputeMlReward
+      // takes a dedicated gated/hinged branch. Renormalise the six controllable
+      // energy sub-weights into a convex combination so base_reward stays in
+      // [-1, 1] regardless of how the user set them on the CLI.
+      {
+        double s = m_ml.en_w_power + m_ml.en_w_util + m_ml.en_w_footprint +
+                   m_ml.en_w_reserve + m_ml.en_w_balance + m_ml.en_w_churn;
+        if (s > 1e-9) {
+          m_ml.en_w_power /= s;
+          m_ml.en_w_util /= s;
+          m_ml.en_w_footprint /= s;
+          m_ml.en_w_reserve /= s;
+          m_ml.en_w_balance /= s;
+          m_ml.en_w_churn /= s;
+        }
+      }
       break;
     default:
       break;
+  }
+
+  if (m_ml.priority_preset == MlConfig::MlPriority::ENERGY) {
+    NS_LOG_INFO("[ML] ENERGY gated reward: en_w(power="
+                << m_ml.en_w_power << " util=" << m_ml.en_w_util
+                << " footprint=" << m_ml.en_w_footprint
+                << " reserve=" << m_ml.en_w_reserve
+                << " balance=" << m_ml.en_w_balance
+                << " churn=" << m_ml.en_w_churn << ") sla_pdr=" << m_ml.sla_pdr
+                << " sla_delay=" << m_ml.sla_delay
+                << " pdr_hinge_w=" << m_ml.pdr_hinge_w
+                << " delay_hinge_w=" << m_ml.delay_hinge_w);
   }
 
   NS_LOG_INFO("[ML] preset="
@@ -1000,8 +1025,12 @@ void ZmqOpenFlowController::ComputeSwitchObservations(uint64_t dpid) {
     double bytesForwarded = (totalTxBps / 8.0) * m_statsIntervalS;
     auto reIt = m_switchResidualEnergy.find(dpid);
     if (reIt != m_switchResidualEnergy.end()) {
-      reIt->second = std::max(
-          0.0, reIt->second - bytesForwarded * emIt->second.energy_per_byte_j);
+      double drainJ = bytesForwarded * emIt->second.energy_per_byte_j;
+      // A powered-on switch also drains idle energy regardless of traffic; a
+      // slept switch (powered off via the node-sleep action) drains neither.
+      if (!m_sleepSwitches.count(dpid))
+        drainJ += emIt->second.idle_power_w * m_statsIntervalS;
+      reIt->second = std::max(0.0, reIt->second - drainJ);
       obs.residual_energy_j = reIt->second;
     }
   }
@@ -1449,15 +1478,22 @@ void ZmqOpenFlowController::MlSendHello() {
   // payload shape at runtime. action_dim still maps 1:1 to m_mlLinkOrder.
   size_t numSwitches = m_mlNodeOrder.size();
   size_t numLinks = m_mlLinkOrder.size();
-  size_t actionDim = numLinks;
+  // Action vector is [link_deltas (L) ‖ node_sleep (N)]. The first L entries are
+  // per-link cost deltas (consumed by ApplyDeltaCosts); the last N are per-node
+  // sleep values (consumed by ApplySleepActions). Python splits on these dims.
+  size_t linkActionDim = numLinks;
+  size_t nodeActionDim = numSwitches;
+  size_t actionDim = linkActionDim + nodeActionDim;
 
   std::ostringstream hello;
   hello << "{\"cmd\":\"hello\","
-        << "\"arch\":\"gnn-v3\","
+        << "\"arch\":\"gnn-v4\","
         << "\"num_switches\":" << numSwitches << ","
         << "\"num_links\":" << numLinks << ","
         << "\"node_feat_dim\":2,"
         << "\"edge_feat_dim\":3,"
+        << "\"link_action_dim\":" << linkActionDim << ","
+        << "\"node_action_dim\":" << nodeActionDim << ","
         << "\"action_dim\":" << actionDim << ","
         << "\"seed\":" << m_ml.seed << ","
         << "\"resume\":" << (m_ml.resume ? "true" : "false") << ","
@@ -1484,9 +1520,11 @@ void ZmqOpenFlowController::MlSendHello() {
       NS_LOG_WARN("[ML] hello reply timed out");
       return;
     }
-    NS_LOG_INFO("[ML] hello ack: num_switches=" << numSwitches
-                                                << " num_links=" << numLinks
-                                                << " action_dim=" << actionDim);
+    NS_LOG_INFO("[ML] hello ack: num_switches="
+                << numSwitches << " num_links=" << numLinks
+                << " link_action_dim=" << linkActionDim
+                << " node_action_dim=" << nodeActionDim
+                << " action_dim=" << actionDim);
   } catch (const std::exception& e) {
     NS_LOG_WARN("[ML] hello failed: " << e.what());
   }
@@ -1622,12 +1660,15 @@ double ZmqOpenFlowController::ComputeMlReward() {
   double lossQuality = 1.0 - std::clamp(currLoss / lossRef, 0.0, 1.0);
 
   // ---- 3. Power-consumption penalty ----
-  // currPower_W approximates instantaneous aggregate draw from per-switch
-  // tx rates × per-byte energy cost. Sum across all switches with energy
-  // models; switches without a configured model contribute 0.
+  // currPower_W approximates instantaneous aggregate draw: per-switch forwarding
+  // power (tx rate × per-byte cost) plus the idle draw of every powered-on
+  // switch. A slept switch (node-sleep action) contributes neither, so powering
+  // it off is a real reward win. Switches without an energy model contribute 0.
   double currPowerW = 0.0;
   for (const auto& [dpid, em] : m_switchEnergyModel) {
     if (em.initial_energy_j <= 0) continue;
+    if (m_sleepSwitches.count(dpid)) continue;  // powered off → 0 W
+    currPowerW += em.idle_power_w;
     auto psIt = m_portStats.find(dpid);
     if (psIt == m_portStats.end()) continue;
     double txBps = 0.0;
@@ -1691,13 +1732,17 @@ double ZmqOpenFlowController::ComputeMlReward() {
   }
 
   // ---- 5. Active-switch footprint penalty ----
-  // A switch counts as "active" if it forwarded ≥ ~1 kbps this interval.
-  // Tiny bookkeeping traffic (echo, LLDP) is below this threshold.
-  constexpr double kActiveThresholdBps = 1024.0;
+  // A switch counts as "active" if it forwards more than a dynamic threshold:
+  // max(footprint_floor_bps, totalTxBps * footprint_frac). The old fixed 1 kbps
+  // floor was at background LLDP/ARP level, so nearly every switch always read
+  // "active" and the consolidation signal was dead. The load-proportional term
+  // lets switches register as idle even under heavy global load.
+  double activeThresholdBps =
+      std::max(m_ml.footprint_floor_bps, totalTxBps * m_ml.footprint_frac);
   uint32_t activeCount = 0;
   for (const auto& [dpid, sw] : m_switchMap) {
     auto it = switchTxBps.find(dpid);
-    if (it != switchTxBps.end() && it->second >= kActiveThresholdBps)
+    if (it != switchTxBps.end() && it->second >= activeThresholdBps)
       ++activeCount;
   }
   double totalSw = std::max<size_t>(1, m_switchMap.size());
@@ -1743,6 +1788,46 @@ double ZmqOpenFlowController::ComputeMlReward() {
   double churnPenalty = m_lastChurnNorm;
 
   // ---- Combine ----
+  double R_norm;
+
+  if (m_ml.priority_preset == MlConfig::MlPriority::ENERGY) {
+    // Gated/hinged energy reward. The controllable energy terms form a convex
+    // combination (en_w_* renormalised to sum 1.0 in SetMlConfig), so the
+    // energy penalty is in [0, 1] and base_reward spans the full [-1, +1].
+    // Delivery quality is NOT an additive offset here — it is a one-sided hinge
+    // that only bites when loss/delay fall below their SLA floor, so a network
+    // that is "fine" (the common case) contributes nothing and leaves the whole
+    // gradient to the energy lever the agent actually controls.
+    double energyPenalty = m_ml.en_w_power * powerCost +
+                           m_ml.en_w_util * utilPenalty +
+                           m_ml.en_w_footprint * footprintPenalty +
+                           m_ml.en_w_reserve * reserveAwarePenalty +
+                           m_ml.en_w_balance * balancePenalty +
+                           m_ml.en_w_churn * churnPenalty;
+    double baseReward = 1.0 - 2.0 * energyPenalty;  // [-1, +1]
+
+    double lossHinge = (lossQuality >= m_ml.sla_pdr)
+                           ? 0.0
+                           : (m_ml.sla_pdr - lossQuality) * m_ml.pdr_hinge_w;
+    double delayHinge = (delayQuality >= m_ml.sla_delay)
+                            ? 0.0
+                            : (m_ml.sla_delay - delayQuality) * m_ml.delay_hinge_w;
+
+    R_norm = std::clamp(baseReward - lossHinge - delayHinge, -1.0, 1.0);
+
+    NS_LOG_DEBUG("[ML] ENERGY reward tick="
+                 << m_mlTick << " R_norm=" << R_norm
+                 << " base=" << baseReward << " enPen=" << energyPenalty
+                 << " lossHinge=" << lossHinge << " delayHinge=" << delayHinge
+                 << " | p=" << powerCost << " u=" << utilPenalty
+                 << " f=" << footprintPenalty << " e=" << reserveAwarePenalty
+                 << " b=" << balancePenalty << " c=" << churnPenalty
+                 << " d=" << delayQuality << " l=" << lossQuality
+                 << " | P_W=" << currPowerW << " stddev=" << stddevResidual);
+    return R_norm;
+  }
+
+  // Legacy additive reward for BALANCED / THROUGHPUT / CUSTOM.
   double R = m_ml.reward_alpha * delayQuality + m_ml.reward_beta * lossQuality -
              m_ml.reward_gamma * powerCost - m_ml.reward_delta * utilPenalty -
              m_ml.reward_zeta * footprintPenalty -
@@ -1763,7 +1848,6 @@ double ZmqOpenFlowController::ComputeMlReward() {
                           m_ml.reward_zeta + m_ml.reward_eta +
                           m_ml.reward_theta + m_ml.reward_kappa;
   const double span = posBound + negBound;
-  double R_norm;
   if (span > 0.0) {
     R_norm = 2.0 * (R + negBound) / span - 1.0;
   } else {
@@ -1877,6 +1961,38 @@ void ZmqOpenFlowController::ApplyDeltaCosts(const std::vector<double>& deltas) {
   if (anyChanged) RecomputeAllRoutes();
 }
 
+void ZmqOpenFlowController::ApplySleepActions(
+    const std::vector<double>& nodeVals) {
+  if (nodeVals.empty()) return;
+  size_t n = std::min(nodeVals.size(), m_mlNodeOrder.size());
+
+  std::set<uint64_t> newSleep;
+  uint32_t masked = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (nodeVals[i] <= m_ml.sleep_threshold) continue;
+    uint64_t dpid = m_mlNodeOrder[i];
+    // Hard mask: an articulation point or host-bearing switch can never sleep,
+    // regardless of what the policy requests — sleeping it would partition the
+    // network or strand a host.
+    if (m_nonSleepable.count(dpid)) {
+      ++masked;
+      continue;
+    }
+    newSleep.insert(dpid);
+  }
+
+  if (newSleep == m_sleepSwitches) return;  // nothing changed this tick
+
+  NS_LOG_INFO("[ML-SLEEP] tick=" << m_mlTick << " asleep=" << newSleep.size()
+                                 << " (was " << m_sleepSwitches.size()
+                                 << ", masked=" << masked << ")");
+  m_sleepSwitches = std::move(newSleep);
+  // Route around the powered-off switches; SetBlockedNodes clears the path
+  // cache so the next ShortestPath reflects the new topology.
+  m_topology.SetBlockedNodes(m_sleepSwitches);
+  RecomputeAllRoutes();
+}
+
 void ZmqOpenFlowController::MlTick() {
   if (!m_ml.enabled) return;
 
@@ -1900,9 +2016,17 @@ void ZmqOpenFlowController::MlTick() {
       if (a > b) std::swap(a, b);
       m_mlLinkOrder.push_back({a, b});
     }
+    // Freeze the set of switches the node-sleep action may never power off:
+    // articulation points of the switch graph (computed once here, O(V+E)) plus
+    // host-bearing switches marked at setup. Sleeping either would partition the
+    // network or strand a host, so they are hard-masked in ApplySleepActions.
+    m_nonSleepable = m_topology.ComputeArticulationPoints();
+    m_nonSleepable.insert(m_hostSwitches.begin(), m_hostSwitches.end());
     NS_LOG_INFO("[ML] Frozen node order: "
                 << m_mlNodeOrder.size() << " switches"
-                << ", link order: " << m_mlLinkOrder.size() << " links");
+                << ", link order: " << m_mlLinkOrder.size() << " links"
+                << ", non-sleepable: " << m_nonSleepable.size() << " ("
+                << "articulation+host)");
     MlSendHello();
   }
 
@@ -1947,7 +2071,17 @@ void ZmqOpenFlowController::MlTick() {
             }
           }
           if (!action.empty()) {
-            ApplyDeltaCosts(action);
+            // Split [link_deltas (L) ‖ node_sleep (N)]. Older agents that only
+            // return L link deltas leave the node part empty (no sleep).
+            size_t L = m_mlLinkOrder.size();
+            std::vector<double> linkDeltas(
+                action.begin(),
+                action.begin() + std::min(L, action.size()));
+            std::vector<double> nodeVals;
+            if (action.size() > L)
+              nodeVals.assign(action.begin() + L, action.end());
+            ApplyDeltaCosts(linkDeltas);
+            ApplySleepActions(nodeVals);
           }
         }  // end inner else (recv ok)
       }  // end outer else (send ok)
