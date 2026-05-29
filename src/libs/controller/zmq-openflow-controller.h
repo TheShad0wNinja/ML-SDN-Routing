@@ -107,6 +107,12 @@ struct MlConfig {
   bool resume = true;                      // Python loads checkpoint if present
   uint32_t seed = 12345;                   // shared seed for Python RNG
   std::string endpoint = "tcp://127.0.0.1:5555";
+  // Pin the Python agent's exploration noise sigma to a fixed value on
+  // construction (skips both the default 0.3 init and the checkpoint's
+  // saved sigma). Negative = use the agent's default decay schedule.
+  // Lets a cooldown / fine-tune phase run with low noise on top of an
+  // already-trained model without touching agent code.
+  double noise_sigma_init = -1.0;
 
   // Controller id for federated learning controller artifacts
   uint32_t controller_id = 0;

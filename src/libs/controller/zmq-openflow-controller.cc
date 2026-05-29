@@ -1462,6 +1462,7 @@ void ZmqOpenFlowController::MlSendHello() {
         << "\"seed\":" << m_ml.seed << ","
         << "\"resume\":" << (m_ml.resume ? "true" : "false") << ","
         << "\"checkpoint_every_n_ticks\":" << m_ml.checkpoint_every_n_ticks
+        << ",\"noise_sigma_init\":" << m_ml.noise_sigma_init
         << "}";
 
   std::string req = hello.str();

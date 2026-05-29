@@ -39,6 +39,11 @@ void MlOptions::Register(CommandLine& cmd) {
   cmd.AddValue("mlResume", "Resume from checkpoint", resume);
   cmd.AddValue("mlEndpoint", "ZMQ endpoint (single-controller mode)",
                endpoint);
+  cmd.AddValue("mlNoiseSigma",
+               "Pin Python agent's exploration noise sigma to this value "
+               "(overrides default 0.3 init and checkpoint's saved sigma). "
+               "Negative = use the default decay schedule.",
+               noiseSigmaInit);
 }
 
 MlConfig MlOptions::BuildMlConfig(uint32_t seedIn) const {
@@ -65,6 +70,7 @@ MlConfig MlOptions::BuildMlConfig(uint32_t seedIn) const {
   cfg.resume = resume;
   cfg.seed = seedIn;
   cfg.endpoint = endpoint;
+  cfg.noise_sigma_init = noiseSigmaInit;
 
   if (priority == "throughput")
     cfg.priority_preset = MlConfig::MlPriority::THROUGHPUT;

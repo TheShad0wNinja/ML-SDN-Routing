@@ -57,6 +57,7 @@ MULTI_CONTROLLER=false
 EXPLORE=true
 LEARN=true
 RESUME=true
+NOISE_SIGMA=""            # --noiseSigma: pin Python agent's exploration sigma
 N_SEEDS=5
 EVAL_WINDOW=0
 EXTRA_ARGS=()
@@ -135,9 +136,15 @@ Options:
   --failures | --no-failures   Toggle scheduled link churn         (default: off)
   --cripple  | --no-cripple    Toggle Missoula crippling (USA)     (default: off)
   --multiController     Run M in-process controllers using trained weights
-  --no-explore          Disable Gaussian action noise
+  --no-explore          Disable Gaussian action noise (hard off; sigma ignored)
   --no-learn            Disable gradient updates / train_step (frozen policy)
   --no-resume           Don't resume the ML agent from checkpoint
+  --noiseSigma X        Pin the Python agent's exploration noise sigma to X,
+                        overriding both the default 0.3 init and the value
+                        saved in the checkpoint. Use for a low-noise cooldown
+                        / robust-exploit fine-tune phase on top of already-
+                        trained weights (e.g. --noiseSigma 0.05 for 3 rounds).
+                        Unset / negative = use the default decay schedule.
   --evalWindowS N       Delay FlowMonitor reset by N seconds past warmup
   --no-auto-ml          Don't auto-start the Python ML service
   --verbose             Pass NS_LOG to surface controller info
@@ -401,7 +408,7 @@ topology_supports_flag() {
     mixedLoad) [[ "$(topology_cap "$topo" supports_mixed_load)" == "1" ]] ;;
     simTime|warmupS|seed|trafficMode|backboneQueue|edgeQueue|evalWindowOffsetS)
       return 0 ;;
-    ml|mlPriority|mlExplore|mlResume|mlEndpoint|mlPortBase|multiController|sections|sectionId)
+    ml|mlPriority|mlExplore|mlResume|mlEndpoint|mlPortBase|mlNoiseSigma|multiController|sections|sectionId)
       # ML/multi-ctrl knobs are defined by the runner and accepted everywhere
       # except the bare-bones two-switch-ping sanity binary.
       [[ "$topo" != "two-switch-ping" ]] ;;
@@ -457,6 +464,7 @@ build_args() {
     if [[ "$EXPLORE" == "false" ]]; then add_if_supported mlExplore false; fi
     if [[ "$LEARN"   == "false" ]]; then add_if_supported mlLearn   false; fi
     if [[ "$RESUME"  == "false" ]]; then add_if_supported mlResume  false; fi
+    if [[ -n "$NOISE_SIGMA" ]]; then add_if_supported mlNoiseSigma "$NOISE_SIGMA"; fi
     if (( EVAL_WINDOW > 0 )); then add_if_supported evalWindowOffsetS "$EVAL_WINDOW"; fi
   fi
   NS3_ARGS+=("${EXTRA_ARGS[@]}")
@@ -895,6 +903,7 @@ while [[ $# -gt 0 ]]; do
     --no-explore)   EXPLORE=false; shift ;;
     --no-learn)     LEARN=false; shift ;;
     --no-resume)    RESUME=false; shift ;;
+    --noiseSigma)   NOISE_SIGMA="$2"; shift 2 ;;
     --no-auto-ml)   AUTO_ML=false; shift ;;
     --verbose)      NS3_VERBOSE=true; shift ;;
     --workers)      WORKERS="$2"; shift 2 ;;

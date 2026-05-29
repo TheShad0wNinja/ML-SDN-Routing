@@ -25,6 +25,8 @@ struct MlOptions {
   uint32_t checkpointEveryNTicks = 60;
   bool resume = true;
   std::string endpoint = "tcp://127.0.0.1:5555";
+  // Pin Python agent's exploration sigma; negative = use default decay.
+  double noiseSigmaInit = -1.0;
 
   void Register(CommandLine& cmd);
 

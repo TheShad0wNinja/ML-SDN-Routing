@@ -218,6 +218,9 @@ class LocalDDPGAgent:
         replay_capacity: int = 200_000,
         batch_size: int = 64,
         warmup: int = 100,
+        noise_sigma_init: float = 0.3,
+        noise_sigma_min: float = 0.05,
+        force_noise_sigma: bool = False,
     ):
         if not _HAS_TORCH:
             raise RuntimeError(
@@ -250,9 +253,15 @@ class LocalDDPGAgent:
 
         # Decaying Gaussian exploration noise. Sigma starts wide and decays
         # per gradient step (so slow scenarios still get the full schedule).
-        self._noise_sigma = 0.3
-        self._noise_sigma_min = 0.05
+        # `noise_sigma_init` / `noise_sigma_min` (constructor kwargs, wired
+        # from the C++ MlOptions flag chain via the hello payload) let a
+        # cooldown / fine-tune phase pin sigma low without editing code.
+        self._noise_sigma = float(noise_sigma_init)
+        self._noise_sigma_min = float(noise_sigma_min)
         self._noise_sigma_decay = 0.99995
+        # When the controller passed an explicit sigma (via --mlNoiseSigma),
+        # the checkpoint's saved sigma must not override it on resume.
+        self._force_noise_sigma = bool(force_noise_sigma)
 
     # ------------------------------------------------------------------
     # Replay + training
@@ -390,7 +399,7 @@ class LocalDDPGAgent:
             self.critic_target.load_state_dict(blob["critic_target"])
             self.actor_opt.load_state_dict(blob["actor_opt"])
             self.critic_opt.load_state_dict(blob["critic_opt"])
-            if "noise_sigma" in blob:
+            if "noise_sigma" in blob and not self._force_noise_sigma:
                 self._noise_sigma = float(blob["noise_sigma"])
         except Exception as exc:
             print(f"[ML] checkpoint load failed: {exc}")
@@ -821,6 +830,10 @@ class MLService:
         self.checkpoint_every = int(msg.get("checkpoint_every_n_ticks", 60))
         self.seed = int(msg.get("seed", 0))
         resume = bool(msg.get("resume", True))
+        # Sentinel: controller sends -1 when the user didn't pass --mlNoiseSigma,
+        # in which case we fall back to the agent's default schedule.
+        noise_init = float(msg.get("noise_sigma_init", -1.0))
+        force_sigma = noise_init >= 0.0
 
         if not _HAS_TORCH:
             print(f"[ML] hello received but torch/torch_geometric missing — "
@@ -832,12 +845,18 @@ class MLService:
                   f"service arch={_ARCH_TAG!r} — proceeding anyway.")
 
         try:
-            self.agent = LocalDDPGAgent(
+            agent_kwargs = dict(
                 action_dim=self.action_dim,
                 node_dim=self.node_feat_dim,
                 edge_dim=self.edge_feat_dim,
                 seed=self.seed,
             )
+            if force_sigma:
+                agent_kwargs["noise_sigma_init"] = noise_init
+                agent_kwargs["force_noise_sigma"] = True
+                print(f"[ML] noise sigma pinned via --mlNoiseSigma: "
+                      f"init={noise_init} (checkpoint sigma will be ignored)")
+            self.agent = LocalDDPGAgent(**agent_kwargs)
         except Exception as exc:
             print(f"[ML] agent init failed: {exc}")
             self.agent = None
