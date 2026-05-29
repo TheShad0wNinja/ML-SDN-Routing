@@ -40,6 +40,7 @@ import os
 import pickle
 import queue
 import random
+import re
 import signal
 import threading
 import time
@@ -561,7 +562,16 @@ class MLService:
         # regardless of outcome — the aggregator is the source of truth for
         # round numbering, but workers need to track which round they're on
         # so a re-derived (train_steps // K) formula doesn't skip round 0.
-        self._fedavg_round = 0
+        #
+        # On resume, start from max(global_round_*) + 1 so we don't replay
+        # historical averages (which would load progressively older weights
+        # into the live agent and corrupt training). Matches the aggregator's
+        # _detect_next_round in root_aggregator.py.
+        self._fedavg_round = self._detect_resume_round()
+        if self._fedavg_round > 0:
+            print(f"[ML] fedavg resume: starting at round "
+                  f"{self._fedavg_round} (latest global="
+                  f"{self._fedavg_round - 1})")
 
     # ------------------------------------------------------------------
     def run(self) -> None:
@@ -671,6 +681,29 @@ class MLService:
                 except Exception as exc:
                     print(f"[ML] fedavg round failed: {exc}")
                 self._fedavg_round += 1
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _detect_resume_round() -> int:
+        """Return the next fedavg round to participate in.
+
+        Scans _FEDAVG_DIR for global_round_<N>.pt and returns max(N)+1, or
+        0 when nothing exists yet. Without this, a resumed worker would start
+        at round 0 and silently overwrite its weights with every old global
+        average on disk on its way back up to the current round."""
+        if not _FEDAVG_DIR:
+            return 0
+        try:
+            entries = os.listdir(_FEDAVG_DIR)
+        except FileNotFoundError:
+            return 0
+        rounds: list[int] = []
+        pat = re.compile(r"^global_round_(\d+)\.pt$")
+        for name in entries:
+            m = pat.match(name)
+            if m:
+                rounds.append(int(m.group(1)))
+        return max(rounds) + 1 if rounds else 0
 
     # ------------------------------------------------------------------
     def _do_fedavg_round(self) -> None:
