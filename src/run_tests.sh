@@ -480,7 +480,7 @@ fmt_J()  { awk -v v="${1:-0}" 'BEGIN{printf (v>=1e6)?"%.2f MJ":"%.0f J", (v>=1e6
 fmt_W()  { awk -v v="${1:-0}" 'BEGIN{printf (v>=1000)?"%.2f kW":"%.0f W", (v>=1000)?v/1000:v}'; }
 
 summarize_log() {
-  local f="$1" label="$2"
+  local f="$1" label="$2" metrics_override="${3:-}"
   local success rtt jitter delivery delay flows tx rx hops
   success=$(extract  '^[[:space:]]+Success[[:space:]]+:' "$f")
   rtt=$(extract      '^[[:space:]]+Avg RTT[[:space:]]+:' "$f")
@@ -509,9 +509,19 @@ summarize_log() {
   local ml_ticks ml_reward_final ml_reward_mean ml_critic_loss ml_actor_loss
   ml_ticks=""; ml_reward_final=""; ml_reward_mean=""
   ml_critic_loss=""; ml_actor_loss=""
-  # Hand the priority dir to the aggregator; it auto-discovers w*/metrics.csv
-  # (train mode) or falls back to a top-level metrics.csv (single-worker / eval).
-  local metrics_src; metrics_src="$(ckpt_dir_for_priority "$PRIORITY")"
+  # Where the aggregator reads metrics from. A caller (run_one in train mode)
+  # may pass this worker's own agent dir so the row reflects ONLY that worker —
+  # otherwise every per-worker summarize call would pool all workers' metrics.csv
+  # under the priority dir and write the same blurred aggregate into every row.
+  # With no override we hand over the whole priority dir, which auto-discovers a
+  # top-level metrics.csv (single-worker / eval) or pools deploy/s* sections of a
+  # single --multiController run (where pooling is the intended whole-deployment view).
+  local metrics_src
+  if [[ -n "$metrics_override" ]]; then
+    metrics_src="$metrics_override"
+  else
+    metrics_src="$(ckpt_dir_for_priority "$PRIORITY")"
+  fi
   if $ML && [[ -d "$metrics_src" ]]; then
     local agg
     agg=$(python3 "$SCRIPT_DIR/python/aggregate_metrics.py" \
@@ -616,7 +626,15 @@ run_one() {
     fi
   ) 2>&1 | tee "$logfile"
 
-  summarize_log "$logfile" "$label"
+  # In train mode each run_one IS a single worker (slot == workerId), so scope
+  # the metrics summary to this worker's own dir ($base/train/w<slot>). Other
+  # layouts (flat single/eval, deploy multi-controller) keep the default
+  # priority-dir behaviour inside summarize_log.
+  local metrics_override=""
+  if $ML && [[ "$ML_LAYOUT" == "train" ]]; then
+    metrics_override="$(ml_agent_dir_for_slot "$slot")"
+  fi
+  summarize_log "$logfile" "$label" "$metrics_override"
 }
 
 # Run jobs in parallel batches of $WORKERS. Each job is an eval'd bash string;
