@@ -112,6 +112,13 @@ if _HAS_TORCH:
         Output is shape [E_total]: one action per canonical edge in the (possibly
         batched) graph. For a single-graph forward this matches the action_dim
         the C++ side expects.
+
+        forward() returns (action, logits): action = tanh(logits) is the
+        clamped policy output the controller consumes; logits are the raw
+        pre-tanh values exposed so the saturation-prevention regulariser in
+        train_step can penalise their squared magnitude. Without this split
+        there is no way to keep the actor inside the linear region of tanh
+        once it has saturated to +/-1.
         """
 
         def __init__(self, node_dim: int = _NODE_FEAT_DIM,
@@ -125,19 +132,21 @@ if _HAS_TORCH:
                                   edge_dim=edge_dim)
             self.ln1 = nn.LayerNorm(hidden)
             self.ln2 = nn.LayerNorm(hidden)
+            # NB: no nn.Tanh() here — applied explicitly in forward() so the
+            # pre-tanh logits are recoverable.
             self.head = nn.Sequential(
                 nn.Linear(2 * hidden + edge_dim, hidden),
                 nn.ReLU(),
                 nn.Linear(hidden, 1),
-                nn.Tanh(),
             )
 
-        def forward(self, data) -> torch.Tensor:
+        def forward(self, data):
             h = F.relu(self.ln1(self.gat1(data.x, data.edge_index, data.edge_attr)))
             h = F.relu(self.ln2(self.gat2(h,      data.edge_index, data.edge_attr)))
             src, dst = data.canonical_edge_index  # each [E_total]
             feats = torch.cat([h[src], h[dst], data.canonical_edge_attr], dim=-1)
-            return self.head(feats).squeeze(-1)
+            logits = self.head(feats).squeeze(-1)
+            return torch.tanh(logits), logits
 
     class _Critic(nn.Module):
         """Two-layer GATv2 encoder + per-edge MLP + mean-edge pooling.
@@ -219,8 +228,10 @@ class LocalDDPGAgent:
         batch_size: int = 64,
         warmup: int = 100,
         noise_sigma_init: float = 0.3,
-        noise_sigma_min: float = 0.05,
+        noise_sigma_min: float = 0.10,
         force_noise_sigma: bool = False,
+        action_var_weight: float = 0.05,
+        saturation_weight: float = 0.001,
     ):
         if not _HAS_TORCH:
             raise RuntimeError(
@@ -235,6 +246,12 @@ class LocalDDPGAgent:
         self.tau = tau
         self.batch_size = batch_size
         self.warmup = warmup
+        # Anti-collapse regulariser weights. Default to the values C++
+        # passes through HELLO; both can be 0 to disable.
+        self._var_weight = float(action_var_weight)
+        self._sat_weight = float(saturation_weight)
+        # Counter for periodic action-stats logging. Not persisted.
+        self._train_steps = 0
 
         torch.manual_seed(seed)
         np.random.seed(seed)
@@ -256,6 +273,9 @@ class LocalDDPGAgent:
         # `noise_sigma_init` / `noise_sigma_min` (constructor kwargs, wired
         # from the C++ MlOptions flag chain via the hello payload) let a
         # cooldown / fine-tune phase pin sigma low without editing code.
+        # _noise_sigma_init is stashed so reset_actor() can restart noise
+        # from the configured value, not whatever the schedule had decayed to.
+        self._noise_sigma_init = float(noise_sigma_init)
         self._noise_sigma = float(noise_sigma_init)
         self._noise_sigma_min = float(noise_sigma_min)
         self._noise_sigma_decay = 0.99995
@@ -293,7 +313,7 @@ class LocalDDPGAgent:
 
         s, a, r, s2 = self._sample()
         with torch.no_grad():
-            a2 = self.actor_target(s2)
+            a2, _ = self.actor_target(s2)
             q_target = r + self.gamma * self.critic_target(s2, a2).unsqueeze(-1)
         q = self.critic(s, a).unsqueeze(-1)
         critic_loss = F.mse_loss(q, q_target)
@@ -302,7 +322,19 @@ class LocalDDPGAgent:
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
         self.critic_opt.step()
 
-        actor_loss = -self.critic(s, self.actor(s)).mean()
+        # Actor loss = -E[Q(s, mu(s))] + anti-collapse regularisers:
+        #   var_term:  reward spread across per-link outputs so a uniform
+        #              constant policy strictly loses to a differentiated one.
+        #   sat_term:  squared L2 on pre-tanh logits — pulls them toward 0
+        #              (linear region of tanh) so gradient stays alive even
+        #              after long training runs. Without this term, once the
+        #              actor saturates to +/-1 the tanh derivative is ~0 and
+        #              no further signal can pull it back.
+        action, logits = self.actor(s)
+        q_loss = -self.critic(s, action).mean()
+        var_term = -self._var_weight * action.var(dim=0).mean()
+        sat_term = self._sat_weight * (logits ** 2).mean()
+        actor_loss = q_loss + var_term + sat_term
         self.actor_opt.zero_grad()
         actor_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
@@ -318,6 +350,23 @@ class LocalDDPGAgent:
         self._noise_sigma = max(self._noise_sigma_min,
                                 self._noise_sigma * self._noise_sigma_decay)
 
+        # Periodic action-stats log: the abs_max of pre-tanh logits is the
+        # smoking-gun signal for saturation — if it stays below ~2.5 the
+        # actor is healthy; above ~4 it has collapsed again.
+        self._train_steps += 1
+        if self._train_steps % 50 == 0:
+            with torch.no_grad():
+                a_np = action.detach().cpu().numpy()
+                l_np = logits.detach().cpu().numpy()
+            print(f"[ML-PY] step={self._train_steps} "
+                  f"action(mean={a_np.mean():+.3f} std={a_np.std():.3f} "
+                  f"min={a_np.min():+.3f} max={a_np.max():+.3f}) "
+                  f"logits(abs_max={abs(l_np).max():.2f}) "
+                  f"q_loss={float(q_loss.item()):+.3f} "
+                  f"var_term={float(var_term.item()):+.4f} "
+                  f"sat_term={float(sat_term.item()):+.4f} "
+                  f"sigma={self._noise_sigma:.3f}", flush=True)
+
         return float(critic_loss.item()), float(actor_loss.item())
 
     # ------------------------------------------------------------------
@@ -328,7 +377,8 @@ class LocalDDPGAgent:
         with torch.no_grad():
             # Wrap into a batch-of-one so downstream code can stay uniform.
             batch = Batch.from_data_list([data])
-            a = self.actor(batch).cpu().numpy().astype(np.float32)
+            action, _ = self.actor(batch)
+            a = action.cpu().numpy().astype(np.float32)
 
         if explore:
             noise = np.random.normal(0.0, self._noise_sigma,
@@ -356,6 +406,33 @@ class LocalDDPGAgent:
             self.critic.load_state_dict(
                 {k: torch.tensor(v) for k, v in payload["critic"].items()})
             self.critic_target.load_state_dict(self.critic.state_dict())
+
+    def reset_actor(self, actor_lr: float = 1e-4) -> None:
+        """Fresh-init the actor (+ actor_target + actor_opt) without touching
+        the critic, critic_target, critic_opt, or replay buffer. Used to
+        salvage a policy that has collapsed to a constant: the value function
+        learned by the critic and the experience in replay both stay valid;
+        only the actor's broken parameter manifold gets thrown away.
+
+        Adam state is bound to specific parameter tensors, so the optimiser
+        MUST be re-created against the new actor.parameters() — calling
+        load_state_dict on the old one would point at freed memory.
+        """
+        seed = int(np.random.randint(0, 2**31 - 1))
+        torch.manual_seed(seed)
+        self.actor = _Actor(node_dim=self.node_dim, edge_dim=self.edge_dim)
+        self.actor_target = _Actor(node_dim=self.node_dim, edge_dim=self.edge_dim)
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+        # Restart noise from the configured init so the fresh actor gets full
+        # exploration. force_noise_sigma is intentionally NOT touched — if
+        # the user pinned sigma via --mlNoiseSigma they want it to remain
+        # pinned through the recovery run too.
+        self._noise_sigma = float(self._noise_sigma_init)
+        self._train_steps = 0
+        print(f"[ML] actor reset: fresh weights, critic + replay preserved "
+              f"(replay size={len(self.replay)}, sigma={self._noise_sigma:.3f})",
+              flush=True)
 
     def save_checkpoint(self, path: str = _CKPT_PATH,
                         replay_path: str = _REPLAY_PATH) -> None:
@@ -834,6 +911,13 @@ class MLService:
         # in which case we fall back to the agent's default schedule.
         noise_init = float(msg.get("noise_sigma_init", -1.0))
         force_sigma = noise_init >= 0.0
+        # Anti-collapse knobs. Defaults match LocalDDPGAgent's __init__ so an
+        # older controller that doesn't send these fields gets the same
+        # behaviour as a new one with default flags.
+        noise_min = float(msg.get("noise_sigma_min", 0.10))
+        var_weight = float(msg.get("action_var_weight", 0.05))
+        sat_weight = float(msg.get("saturation_weight", 0.001))
+        reset_actor_req = bool(msg.get("reset_actor", False))
 
         if not _HAS_TORCH:
             print(f"[ML] hello received but torch/torch_geometric missing — "
@@ -850,6 +934,9 @@ class MLService:
                 node_dim=self.node_feat_dim,
                 edge_dim=self.edge_feat_dim,
                 seed=self.seed,
+                noise_sigma_min=noise_min,
+                action_var_weight=var_weight,
+                saturation_weight=sat_weight,
             )
             if force_sigma:
                 agent_kwargs["noise_sigma_init"] = noise_init
@@ -868,6 +955,20 @@ class MLService:
                 resumed = self.agent.maybe_load_checkpoint()
             except Exception as exc:
                 print(f"[ML] resume failed: {exc}")
+
+        # Partial-reset request (--mlResetActor=true): fresh-init the actor
+        # AFTER the checkpoint is loaded. Critic + replay survive. Use to
+        # recover a collapsed policy without burning the 4-hour value
+        # function. The flag is one-shot — the next save_checkpoint writes
+        # a normal blob, so subsequent resumes get the fresh actor as-is.
+        if reset_actor_req and resumed:
+            try:
+                self.agent.reset_actor()
+            except Exception as exc:
+                print(f"[ML] reset_actor failed: {exc}")
+        elif reset_actor_req and not resumed:
+            print("[ML] reset_actor requested but no checkpoint to resume "
+                  "from — agent already has fresh weights, no-op.")
 
         # Seed the action cache so the very first observe gets a real reply.
         with self._action_lock:

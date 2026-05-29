@@ -44,6 +44,21 @@ void MlOptions::Register(CommandLine& cmd) {
                "(overrides default 0.3 init and checkpoint's saved sigma). "
                "Negative = use the default decay schedule.",
                noiseSigmaInit);
+  cmd.AddValue("mlNoiseSigmaMin",
+               "Floor on the decaying Gaussian action noise (default 0.10).",
+               noiseSigmaMin);
+  cmd.AddValue("mlActionVarWeight",
+               "Actor-loss weight on the per-link action variance "
+               "(higher = stronger anti-collapse pressure).",
+               actionVarWeight);
+  cmd.AddValue("mlSaturationWeight",
+               "Actor-loss weight on squared pre-tanh logits "
+               "(higher = harder pull back into tanh's linear region).",
+               saturationWeight);
+  cmd.AddValue("mlResetActor",
+               "One-shot: on next checkpoint resume, fresh-init the actor "
+               "(keep critic + replay). Use to recover a collapsed policy.",
+               resetActor);
 }
 
 MlConfig MlOptions::BuildMlConfig(uint32_t seedIn) const {
@@ -71,6 +86,10 @@ MlConfig MlOptions::BuildMlConfig(uint32_t seedIn) const {
   cfg.seed = seedIn;
   cfg.endpoint = endpoint;
   cfg.noise_sigma_init = noiseSigmaInit;
+  cfg.noise_sigma_min = noiseSigmaMin;
+  cfg.action_var_weight = actionVarWeight;
+  cfg.saturation_weight = saturationWeight;
+  cfg.reset_actor = resetActor;
 
   if (priority == "throughput")
     cfg.priority_preset = MlConfig::MlPriority::THROUGHPUT;

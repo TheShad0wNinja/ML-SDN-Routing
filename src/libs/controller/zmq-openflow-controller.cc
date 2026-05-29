@@ -1463,6 +1463,10 @@ void ZmqOpenFlowController::MlSendHello() {
         << "\"resume\":" << (m_ml.resume ? "true" : "false") << ","
         << "\"checkpoint_every_n_ticks\":" << m_ml.checkpoint_every_n_ticks
         << ",\"noise_sigma_init\":" << m_ml.noise_sigma_init
+        << ",\"noise_sigma_min\":" << m_ml.noise_sigma_min
+        << ",\"action_var_weight\":" << m_ml.action_var_weight
+        << ",\"saturation_weight\":" << m_ml.saturation_weight
+        << ",\"reset_actor\":" << (m_ml.reset_actor ? "true" : "false")
         << "}";
 
   std::string req = hello.str();
@@ -1661,7 +1665,30 @@ double ZmqOpenFlowController::ComputeMlReward() {
     }
   }
   double meanUtil = (utilN > 0) ? (utilSum / utilN) : 0.0;
-  double utilPenalty = 0.5 * meanUtil + 0.5 * utilPeak;
+  // utilPenalty in [0,1]. Per-priority math: the analytic bounds in the
+  // affine rescale below stay valid because every branch produces a value
+  // in [0,1] (utilPeak^2 <= utilPeak <= 1, weighted convex sums).
+  double utilPenalty;
+  switch (m_ml.priority_preset) {
+    case MlConfig::MlPriority::THROUGHPUT:
+      // Bottleneck only — meanUtil pressure would discourage the high-mean
+      // routing that maximises aggregate throughput.
+      utilPenalty = utilPeak;
+      break;
+    case MlConfig::MlPriority::ENERGY:
+      // Heavy on meanUtil (long detours waste joules) plus a quadratic
+      // peak term: near-zero penalty below ~50% peak (free consolidation)
+      // but spikes sharply as peak approaches 1.0, creating a soft ceiling
+      // that forces the agent to wake a secondary link before the primary
+      // collapses.
+      utilPenalty = 0.8 * meanUtil + 0.2 * (utilPeak * utilPeak);
+      break;
+    case MlConfig::MlPriority::BALANCED:
+    case MlConfig::MlPriority::CUSTOM:
+    default:
+      utilPenalty = 0.5 * meanUtil + 0.5 * utilPeak;
+      break;
+  }
 
   // ---- 5. Active-switch footprint penalty ----
   // A switch counts as "active" if it forwarded ≥ ~1 kbps this interval.
@@ -1794,6 +1821,29 @@ double ZmqOpenFlowController::CurrentActionScale() const {
 void ZmqOpenFlowController::ApplyDeltaCosts(const std::vector<double>& deltas) {
   size_t n = std::min(deltas.size(), m_mlLinkOrder.size());
   double scale = CurrentActionScale();
+  // [ML-ACTION] anti-collapse diagnostic: mean/std/min/max over the raw
+  // pre-clamp action vector. Grep this line to confirm the actor is no
+  // longer outputting a constant: post-fix you should see std > 0.05.
+  if (n > 0) {
+    double aSum = 0.0, aSumSq = 0.0;
+    double aMin = deltas[0], aMax = deltas[0];
+    for (size_t i = 0; i < n; ++i) {
+      double d = deltas[i];
+      aSum += d;
+      aSumSq += d * d;
+      if (d < aMin) aMin = d;
+      if (d > aMax) aMax = d;
+    }
+    double aMean = aSum / static_cast<double>(n);
+    double aVar = std::max(0.0, aSumSq / static_cast<double>(n) - aMean * aMean);
+    double aStd = std::sqrt(aVar);
+    NS_LOG_INFO("[ML-ACTION] tick=" << m_mlTick << " n=" << n
+                                    << " mean=" << aMean
+                                    << " std=" << aStd
+                                    << " min=" << aMin
+                                    << " max=" << aMax
+                                    << " scale=" << scale);
+  }
   bool anyChanged = false;
   double churnL1 = 0.0;
   for (size_t i = 0; i < n; ++i) {

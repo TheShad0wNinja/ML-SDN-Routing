@@ -113,6 +113,17 @@ struct MlConfig {
   // Lets a cooldown / fine-tune phase run with low noise on top of an
   // already-trained model without touching agent code.
   double noise_sigma_init = -1.0;
+  double noise_sigma_min = 0.10;  // floor on noise sigma after decay
+
+  // Actor anti-collapse regularisers (applied on Python side in train_step).
+  // var_weight rewards spread across per-link outputs; saturation_weight
+  // pulls pre-tanh logits back toward 0 so gradient stays alive.
+  double action_var_weight = 0.05;
+  double saturation_weight = 0.001;
+  // One-shot partial reset: on next checkpoint resume, fresh-init the actor
+  // (and actor_target + actor_opt) but keep critic + replay. Salvages a
+  // collapsed policy without throwing away the value function.
+  bool reset_actor = false;
 
   // Controller id for federated learning controller artifacts
   uint32_t controller_id = 0;
