@@ -3,7 +3,8 @@
 
 Phase 1 of the architecture: workers each run an ns-3 simulation of one
 network section with their own RL agent. Every K training steps they
-torch-save their (actor, critic) state dicts as
+torch-save their actor state dict (the critic is LOCAL and never federated —
+its Q-scale is topology-specific) as
     {dir}/worker_{worker_id}_round_{r}.pt
 and block on the appearance of
     {dir}/global_round_{r}.pt
@@ -40,7 +41,7 @@ import torch
 
 _WORKER_RE = re.compile(r"^worker_(\d+)_round_(\d+)\.pt$")
 _GLOBAL_RE = re.compile(r"^global_round_(\d+)\.pt$")
-_ARCH_TAG_DEFAULT = "gnn-v3"
+_ARCH_TAG_DEFAULT = "gnn-v4"
 
 
 def _find_workers_for_round(d: str, r: int) -> dict[int, str]:
@@ -196,8 +197,11 @@ def main() -> int:
                           f"dropping round.")
                     bad = True
                     break
-                if "actor" not in blob or "critic" not in blob:
-                    print(f"[AGG] worker {wid} missing actor/critic — "
+                # Only the actor is federated (localized critic): a worker
+                # blob carries the actor alone. A legacy blob may still have a
+                # critic key — harmless, it is ignored.
+                if "actor" not in blob:
+                    print(f"[AGG] worker {wid} missing actor — "
                           f"dropping round.")
                     bad = True
                     break
@@ -210,9 +214,9 @@ def main() -> int:
                 next_round += 1
                 continue
 
-            # Shape check — the architectural invariant we rely on.
-            if not (_shapes_match([b["actor"] for b in blobs])
-                    and _shapes_match([b["critic"] for b in blobs])):
+            # Shape check — the architectural invariant we rely on. Only the
+            # actor is federated, so only the actor needs matching shapes.
+            if not _shapes_match([b["actor"] for b in blobs]):
                 print(f"[AGG] round {next_round}: worker tensor shapes "
                       f"disagree — federation cannot proceed. Dropping round.")
                 rw.writerow([next_round, len(workers), 0.0, 0.0,
@@ -221,14 +225,13 @@ def main() -> int:
                 next_round += 1
                 continue
 
-            # Average.
+            # Average the actor only (localized critic).
             actor_avg = _average_state_dicts([b["actor"] for b in blobs])
-            critic_avg = _average_state_dicts([b["critic"] for b in blobs])
             actor_l2 = _l2(actor_avg)
-            critic_l2 = _l2(critic_avg)
 
             # Publish — atomic write so a worker mid-poll can't read a
-            # half-written file.
+            # half-written file. The global model is actor-only; workers load
+            # just the actor and keep their own critic.
             out_path = os.path.join(args.dir, f"global_round_{next_round}.pt")
             tmp = out_path + ".tmp"
             torch.save({
@@ -236,7 +239,6 @@ def main() -> int:
                 "round": next_round,
                 "n_submits": len(workers),
                 "actor": actor_avg,
-                "critic": critic_avg,
             }, tmp)
             os.replace(tmp, out_path)
 
@@ -253,10 +255,11 @@ def main() -> int:
 
             print(f"[AGG] round {next_round} ok "
                   f"(submits={len(workers)} wait={wait_s:.1f}s "
-                  f"wall={wall_ms:.0f}ms actor_l2={actor_l2:.4f} "
-                  f"critic_l2={critic_l2:.4f})")
+                  f"wall={wall_ms:.0f}ms actor_l2={actor_l2:.4f})")
+            # critic_l2 column kept for header stability but is empty: the
+            # critic is no longer federated, so there is no global critic.
             rw.writerow([next_round, len(workers),
-                         f"{actor_l2:.6f}", f"{critic_l2:.6f}",
+                         f"{actor_l2:.6f}", "",
                          f"{wait_s:.3f}", f"{wall_ms:.3f}", 0])
             rfh.flush()
             next_round += 1

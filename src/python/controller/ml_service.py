@@ -526,12 +526,27 @@ class LocalDDPGAgent:
                 print(f"[ML] checkpoint arch={arch!r} != expected={_ARCH_TAG!r} — "
                       f"refusing to load (likely a pre-GNN checkpoint). Starting fresh.")
                 return False
+            # The actor is always present. A full per-worker checkpoint also
+            # carries actor_target / critic* / optimizers; an actor-only
+            # "global-format" blob (the canonical model published by FedAvg)
+            # does not. Load each key only when present so a published global
+            # model loads cleanly: actor restored, actor_target mirrored from
+            # it, and the freshly-constructed critic + optimizers left in
+            # place. The local critic is never federated, and at eval
+            # (learn=false) it is unused, so a fresh critic is fine.
             self.actor.load_state_dict(blob["actor"])
-            self.critic.load_state_dict(blob["critic"])
-            self.actor_target.load_state_dict(blob["actor_target"])
-            self.critic_target.load_state_dict(blob["critic_target"])
-            self.actor_opt.load_state_dict(blob["actor_opt"])
-            self.critic_opt.load_state_dict(blob["critic_opt"])
+            if "actor_target" in blob:
+                self.actor_target.load_state_dict(blob["actor_target"])
+            else:
+                self.actor_target.load_state_dict(self.actor.state_dict())
+            if "critic" in blob:
+                self.critic.load_state_dict(blob["critic"])
+            if "critic_target" in blob:
+                self.critic_target.load_state_dict(blob["critic_target"])
+            if "actor_opt" in blob:
+                self.actor_opt.load_state_dict(blob["actor_opt"])
+            if "critic_opt" in blob:
+                self.critic_opt.load_state_dict(blob["critic_opt"])
             if "noise_sigma" in blob and not self._force_noise_sigma:
                 self._noise_sigma = float(blob["noise_sigma"])
         except Exception as exc:
@@ -875,12 +890,16 @@ class MLService:
         # 1. Snapshot — atomic write (.tmp then rename) so the aggregator
         #    never sees a partial file.
         t0 = time.perf_counter()
+        # Federate the ACTOR ONLY. The critic is deliberately not submitted:
+        # it predicts an absolute Q-value whose scale is topology-specific
+        # (e.g. USA WAN vs fat-tree baselines differ), so averaging critics
+        # across heterogeneous workers would corrupt both. Each worker keeps,
+        # trains, and persists its own local critic instead.
         blob = {
             "arch": _ARCH_TAG,
             "worker_id": _WORKER_ID,
             "round": r,
             "actor": self.agent.actor.state_dict(),
-            "critic": self.agent.critic.state_dict(),
         }
         tmp = worker_path + ".tmp"
         torch.save(blob, tmp)
@@ -899,8 +918,11 @@ class MLService:
                 return
             time.sleep(0.5)
 
-        # 3. Load. Replace actor+critic and re-sync the target nets so the
-        #    polyak update doesn't immediately undo the average.
+        # 3. Load. Replace the ACTOR ONLY and re-sync the actor target so the
+        #    polyak update doesn't immediately undo the average. The local
+        #    critic + critic_target are intentionally left untouched — they
+        #    keep their own continuously trained, topology-calibrated value
+        #    function (Federated Actor / Localized Critic).
         try:
             global_blob = torch.load(global_path, map_location="cpu")
         except Exception as exc:
@@ -912,9 +934,6 @@ class MLService:
             return
         self.agent.actor.load_state_dict(global_blob["actor"])
         self.agent.actor_target.load_state_dict(self.agent.actor.state_dict())
-        self.agent.critic.load_state_dict(global_blob["critic"])
-        self.agent.critic_target.load_state_dict(
-            self.agent.critic.state_dict())
         wait_ms = (time.perf_counter() - t0) * 1000.0
         print(f"[ML] fedavg round {r}: loaded global "
               f"(wait={wait_ms:.0f}ms, worker={_WORKER_ID})")

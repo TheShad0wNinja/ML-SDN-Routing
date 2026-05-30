@@ -43,6 +43,7 @@ mkdir -p "$LOG_DIR"
 TOPOLOGY=""
 SECTIONS=""
 WORKERS=""
+MIX=""                    # train mode: "topoA:N,topoB,topoC:N" heterogeneous pool
 
 SIM_TIME=600
 WARMUP=10
@@ -342,6 +343,7 @@ start_aggregator() {
     exec python3 -u "$SCRIPT_DIR/python/controller/root_aggregator.py" \
       --dir "$FEDAVG_DIR" \
       --num-workers "$WORKERS" \
+      --arch-tag gnn-v4 \
       --round-timeout-s "$FEDAVG_TIMEOUT" \
       --log-dir "$FEDAVG_AGG_LOG_DIR"
   ) >"$LOG_DIR/root-aggregator.log" 2>&1 &
@@ -748,6 +750,51 @@ cmd_eval() {
   run_one "${TOPOLOGY}-eval-${PRIORITY}-${TRAFFIC_MODE}-seed${SEED}"
 }
 
+# Expand a --mix spec "topoA:countA,topoB,topoC:countC" into the global array
+# MIX_TOPOS (one entry per worker, in spec order). A bare entry (no :count)
+# gets an equal share of the leftover --workers budget (remainder handed to the
+# earliest bare entries). Every topology is validated against the registry.
+parse_mix() {
+  local spec="$1" total_budget="${2:-0}"
+  MIX_TOPOS=()
+  local -a entries; IFS=',' read -ra entries <<< "$spec"
+  # Pass 1 — tally explicit worker counts and bare entries.
+  local explicit_sum=0 nbare=0 e topo cnt
+  for e in "${entries[@]}"; do
+    e="${e// /}"; [[ -z "$e" ]] && continue
+    topo="${e%%:*}"
+    [[ -n "$(topology_cap "$topo" sections)" ]] || {
+      echo "[run_tests] ERROR: --mix unknown topology '$topo'" >&2; exit 1; }
+    if [[ "$e" == *:* ]]; then
+      cnt="${e##*:}"
+      [[ "$cnt" =~ ^[0-9]+$ ]] || { echo "[run_tests] ERROR: --mix bad count in '$e'" >&2; exit 1; }
+      explicit_sum=$(( explicit_sum + cnt ))
+    else
+      nbare=$(( nbare + 1 ))
+    fi
+  done
+  local remaining=$(( total_budget - explicit_sum )); (( remaining < 0 )) && remaining=0
+  local base=0 extra=0
+  if (( nbare > 0 )); then
+    (( remaining >= nbare )) || {
+      echo "[run_tests] ERROR: --mix has $nbare bare entries but only $remaining leftover workers (raise --workers)" >&2
+      exit 1; }
+    base=$(( remaining / nbare )); extra=$(( remaining % nbare ))
+  fi
+  # Pass 2 — emit one entry per worker, preserving spec order.
+  local bare_i=0 c share
+  for e in "${entries[@]}"; do
+    e="${e// /}"; [[ -z "$e" ]] && continue
+    topo="${e%%:*}"
+    if [[ "$e" == *:* ]]; then
+      share="${e##*:}"
+    else
+      share=$base; (( bare_i < extra )) && share=$(( share + 1 )); bare_i=$(( bare_i + 1 ))
+    fi
+    for ((c=0; c<share; c++)); do MIX_TOPOS+=("$topo"); done
+  done
+}
+
 # Unified federated training. --sections N --workers M --rounds R spawns
 # N*M workers in parallel (M replicas per section), federated via shared dir.
 # sections=1 = all workers run the full topology with seed+workerId for diversity.
@@ -758,10 +805,37 @@ cmd_eval() {
 # (round, worker) so if total_workers < num_variants the next round picks up
 # where the previous one left off, guaranteeing every variant is covered.
 cmd_train() {
-  (( SECTIONS >= 1 )) || { echo "[run_tests] ERROR: --sections must be >= 1" >&2; exit 1; }
-  local workers_per_section=$WORKERS
-  (( workers_per_section >= 1 )) || { echo "[run_tests] ERROR: --workers must be >= 1" >&2; exit 1; }
-  local total=$((SECTIONS * workers_per_section))
+  # --mix → heterogeneous pool (localized critic makes this safe): one worker
+  # per MIX_TOPOS entry, each running its own full topology (sections=1) but
+  # federating its actor into one shared pool. Otherwise the classic single-
+  # topology path (SECTIONS × WORKERS).
+  local MIXED=false
+  declare -A VAR_BY_TOPO=() TOPO_VAR_IDX=()
+  local workers_per_section total
+  if [[ -n "$MIX" ]]; then
+    MIXED=true
+    SECTIONS=1
+    parse_mix "$MIX" "$WORKERS"
+    total=${#MIX_TOPOS[@]}
+    (( total >= 1 )) || { echo "[run_tests] ERROR: --mix produced no workers" >&2; exit 1; }
+    # Per-topology variant cache (round-robined within each topology's workers)
+    # and a pre-build of every distinct binary (avoids the parallel cmake race).
+    local _t _v _vs
+    for _t in "${MIX_TOPOS[@]}"; do
+      if [[ -z "${VAR_BY_TOPO[$_t]:-}" ]]; then
+        _vs=""
+        while IFS= read -r _v; do [[ -n "$_v" ]] && _vs+="$_v "; done < <(topology_variants "$_t")
+        VAR_BY_TOPO[$_t]="$_vs"
+        TOPO_VAR_IDX[$_t]=0
+        ensure_built "$_t"
+      fi
+    done
+  else
+    (( SECTIONS >= 1 )) || { echo "[run_tests] ERROR: --sections must be >= 1" >&2; exit 1; }
+    workers_per_section=$WORKERS
+    (( workers_per_section >= 1 )) || { echo "[run_tests] ERROR: --workers must be >= 1" >&2; exit 1; }
+    total=$((SECTIONS * workers_per_section))
+  fi
 
   ML=true
   EXPLORE=true
@@ -774,25 +848,37 @@ cmd_train() {
   FEDAVG_AGG_LOG_DIR="$SCRIPT_DIR/data/fedavg/$PRIORITY"
 
   # Build curriculum variant list from the topology capability registry.
-  local variants=()
-  while IFS= read -r v; do
-    [[ -n "$v" ]] && variants+=("$v")
-  done < <(topology_variants "$TOPOLOGY")
-  local num_variants=${#variants[@]}
-  (( num_variants > 0 )) || {
-    echo "[run_tests] ERROR: $TOPOLOGY has no train variants (check topology_cap)" >&2
-    exit 1
-  }
+  # (mixed mode already built a per-topology cache above.)
+  local variants=() num_variants=0
+  if ! $MIXED; then
+    while IFS= read -r v; do
+      [[ -n "$v" ]] && variants+=("$v")
+    done < <(topology_variants "$TOPOLOGY")
+    num_variants=${#variants[@]}
+    (( num_variants > 0 )) || {
+      echo "[run_tests] ERROR: $TOPOLOGY has no train variants (check topology_cap)" >&2
+      exit 1
+    }
+  fi
 
-  echo "[run_tests] Federated training: topology=$TOPOLOGY priority=$PRIORITY"
-  echo "[run_tests]   sections=$SECTIONS, workers/section=$workers_per_section, total=$total"
-  echo "[run_tests]   rounds=$FED_ROUNDS, fedavg_every=$FEDAVG_EVERY steps, timeout=${FEDAVG_TIMEOUT}s"
-  echo "[run_tests]   weights_dir=$FEDAVG_DIR  (mode=$( $FED_RESET && echo reset || echo resume ))"
-  echo "[run_tests]   curriculum variants ($num_variants), round-robined across all (round, worker) slots:"
-  for v in "${variants[@]}"; do
-    IFS='|' read -r vm vf vc <<< "$v"
-    echo "[run_tests]     mode=$vm failures=$vf cripple=$vc"
-  done
+  if $MIXED; then
+    echo "[run_tests] Federated MIXED-topology training: priority=$PRIORITY"
+    echo "[run_tests]   pool=$total workers → ${MIX_TOPOS[*]}"
+    echo "[run_tests]   rounds=$FED_ROUNDS, fedavg_every=$FEDAVG_EVERY steps, timeout=${FEDAVG_TIMEOUT}s"
+    echo "[run_tests]   weights_dir=$FEDAVG_DIR  (mode=$( $FED_RESET && echo reset || echo resume ))"
+    echo "[run_tests]   actor federated across the pool; each worker keeps its own local critic"
+    echo "[run_tests]   per-topology curriculum round-robined within each topology's workers"
+  else
+    echo "[run_tests] Federated training: topology=$TOPOLOGY priority=$PRIORITY"
+    echo "[run_tests]   sections=$SECTIONS, workers/section=$workers_per_section, total=$total"
+    echo "[run_tests]   rounds=$FED_ROUNDS, fedavg_every=$FEDAVG_EVERY steps, timeout=${FEDAVG_TIMEOUT}s"
+    echo "[run_tests]   weights_dir=$FEDAVG_DIR  (mode=$( $FED_RESET && echo reset || echo resume ))"
+    echo "[run_tests]   curriculum variants ($num_variants), round-robined across all (round, worker) slots:"
+    for v in "${variants[@]}"; do
+      IFS='|' read -r vm vf vc <<< "$v"
+      echo "[run_tests]     mode=$vm failures=$vf cripple=$vc"
+    done
+  fi
 
   mkdir -p "$FEDAVG_DIR" "$FEDAVG_AGG_LOG_DIR"
 
@@ -845,17 +931,36 @@ cmd_train() {
     echo "[run_tests] === Training round $round / $FED_ROUNDS ==="
     local jobs=()
     for ((w=0; w<total; w++)); do
-      local sid=$((w / workers_per_section))
-      local rep=$((w % workers_per_section))
       local seed=$((base_seed + (round - 1) * total + w))
-      # Round-robin curriculum across all (round, worker) slots.
-      local global_idx=$(( (round - 1) * total + w ))
-      local var="${variants[$((global_idx % num_variants))]}"
-      IFS='|' read -r vm vf vc <<< "$var"
-      local fail_str=false; [[ "$vf" == "1" ]] && fail_str=true
-      local crip_str=false; [[ "$vc" == "1" ]] && crip_str=true
-      local label="${TOPOLOGY}-train-s${sid}r${rep}-${vm}-f${vf}c${vc}-seed${seed}-r${round}"
-      jobs+=("_SECTION_ID=$sid TRAFFIC_MODE=$vm FAILURES=$fail_str CRIPPLE=$crip_str SEED=$seed run_one \"$label\"")
+      local var vm vf vc fail_str crip_str label
+      if $MIXED; then
+        # Worker w is permanently bound to MIX_TOPOS[w] (stable across rounds),
+        # so its local critic stays calibrated to one topology. Variant is
+        # round-robined within that topology's own workers.
+        local wtopo="${MIX_TOPOS[$w]}"
+        local -a _tv=(${VAR_BY_TOPO[$wtopo]})
+        local _n=${#_tv[@]} _vi=${TOPO_VAR_IDX[$wtopo]}
+        var="${_tv[$(( _vi % _n ))]}"
+        TOPO_VAR_IDX[$wtopo]=$(( _vi + 1 ))
+        IFS='|' read -r vm vf vc <<< "$var"
+        fail_str=false; [[ "$vf" == "1" ]] && fail_str=true
+        crip_str=false; [[ "$vc" == "1" ]] && crip_str=true
+        label="${wtopo}-mixtrain-w${w}-${vm}-f${vf}c${vc}-seed${seed}-r${round}"
+        # Override TOPOLOGY per job (run_one uses $TOPOLOGY as the ns-3 binary);
+        # each worker runs its full topology (sections=1, sectionId=0).
+        jobs+=("TOPOLOGY=$wtopo _SECTION_ID=0 TRAFFIC_MODE=$vm FAILURES=$fail_str CRIPPLE=$crip_str SEED=$seed run_one \"$label\"")
+      else
+        local sid=$((w / workers_per_section))
+        local rep=$((w % workers_per_section))
+        # Round-robin curriculum across all (round, worker) slots.
+        local global_idx=$(( (round - 1) * total + w ))
+        var="${variants[$((global_idx % num_variants))]}"
+        IFS='|' read -r vm vf vc <<< "$var"
+        fail_str=false; [[ "$vf" == "1" ]] && fail_str=true
+        crip_str=false; [[ "$vc" == "1" ]] && crip_str=true
+        label="${TOPOLOGY}-train-s${sid}r${rep}-${vm}-f${vf}c${vc}-seed${seed}-r${round}"
+        jobs+=("_SECTION_ID=$sid TRAFFIC_MODE=$vm FAILURES=$fail_str CRIPPLE=$crip_str SEED=$seed run_one \"$label\"")
+      fi
     done
     dispatch_parallel "${jobs[@]}"
   done
@@ -931,6 +1036,7 @@ while [[ $# -gt 0 ]]; do
     --verbose)      NS3_VERBOSE=true; shift ;;
     --workers)      WORKERS="$2"; shift 2 ;;
     --sections)     SECTIONS="$2"; shift 2 ;;
+    --mix)          MIX="$2"; shift 2 ;;
     --rounds)       FED_ROUNDS="$2"; shift 2 ;;
     --reset)        FED_RESET=true; shift ;;
     --fedAvgEverySteps) FEDAVG_EVERY="$2"; shift 2 ;;
@@ -943,23 +1049,29 @@ done
 
 # --topology is required for every mode except clean (which is priority-scoped,
 # not topology-scoped).
-if [[ "$MODE" != "clean" && -z "$TOPOLOGY" ]]; then
-  echo "[run_tests] ERROR: --topology is required (usa | fat-tree-k4 | two-switch-ping)" >&2
+if [[ "$MODE" != "clean" && -z "$TOPOLOGY" && -z "$MIX" ]]; then
+  echo "[run_tests] ERROR: --topology is required (usa | fat-tree-k4 | sensor-cluster | two-switch-ping)" >&2
   exit 1
 fi
 
 # train requires explicit --sections and --workers — defaulting them silently
-# would hide intent and risk training the wrong fleet size.
+# would hide intent and risk training the wrong fleet size. With --mix (a
+# heterogeneous pool) --sections is irrelevant; --workers is the total pool /
+# even-split budget.
 if [[ "$MODE" == "train" ]]; then
-  [[ -z "$SECTIONS" ]] && { echo "[run_tests] ERROR: train mode requires --sections N" >&2; exit 1; }
-  [[ -z "$WORKERS"  ]] && { echo "[run_tests] ERROR: train mode requires --workers M" >&2; exit 1; }
+  if [[ -n "$MIX" ]]; then
+    [[ -z "$WORKERS" ]] && { echo "[run_tests] ERROR: --mix requires --workers M (total pool / split budget)" >&2; exit 1; }
+  else
+    [[ -z "$SECTIONS" ]] && { echo "[run_tests] ERROR: train mode requires --sections N" >&2; exit 1; }
+    [[ -z "$WORKERS"  ]] && { echo "[run_tests] ERROR: train mode requires --workers M" >&2; exit 1; }
+  fi
 fi
 
 # For all other modes, fall back to single-process / single-section defaults.
 SECTIONS="${SECTIONS:-1}"
 WORKERS="${WORKERS:-1}"
 
-if [[ "$MODE" != "clean" ]]; then
+if [[ "$MODE" != "clean" && -z "$MIX" ]]; then
   ensure_built "$TOPOLOGY"
 fi
 
