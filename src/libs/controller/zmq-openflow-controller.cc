@@ -46,7 +46,7 @@ ZmqOpenFlowController::ZmqOpenFlowController() {}
 ZmqOpenFlowController::~ZmqOpenFlowController() {}
 
 void ZmqOpenFlowController::DoDispose() {
-  // WriteStateToJson();
+  WriteStateToJson();
   m_switchMap.clear();
   m_macToLoc.clear();
   m_switchPorts.clear();
@@ -118,6 +118,13 @@ double ZmqOpenFlowController::GetSwitchResidualEnergyJ(uint64_t dpid) const {
   auto it = m_switchResidualEnergy.find(dpid);
   if (it == m_switchResidualEnergy.end()) return -1.0;
   return it->second;
+}
+
+void ZmqOpenFlowController::ForceDeplete(uint64_t dpid) {
+  auto it = m_switchResidualEnergy.find(dpid);
+  if (it == m_switchResidualEnergy.end()) return;  // not energy-tracked
+  it->second = 0.0;  // next ComputeSwitchObservations promotes it to m_deadNodes
+  NS_LOG_INFO("[CRISIS] ForceDeplete dpid=" << dpid << " — residual set to 0");
 }
 
 void ZmqOpenFlowController::SetStatsInterval(double seconds) {
@@ -393,6 +400,10 @@ void ZmqOpenFlowController::InstallOrUpdateFloodGroup(uint64_t dpid) {
   if (stIt != m_spanningTree.end()) {
     for (uint32_t p : stIt->second) {
       if (p == 0 || p >= OFPP_MAX) continue;
+      // Never flood toward a blocked (slept/dead) peer, even if a stale
+      // spanning tree still lists the port.
+      auto peer = m_topology.GetPeerDpid(dpid, p);
+      if (peer && m_topology.IsNodeBlocked(*peer)) continue;
       ports.insert(p);
     }
   }
@@ -1028,10 +1039,21 @@ void ZmqOpenFlowController::ComputeSwitchObservations(uint64_t dpid) {
       double drainJ = bytesForwarded * emIt->second.energy_per_byte_j;
       // A powered-on switch also drains idle energy regardless of traffic; a
       // slept switch (powered off via the node-sleep action) drains neither.
-      if (!m_sleepSwitches.count(dpid))
+      // A dead switch (depleted) drains nothing either.
+      if (!m_sleepSwitches.count(dpid) && !m_deadNodes.count(dpid))
         drainJ += emIt->second.idle_power_w * m_statsIntervalS;
       reIt->second = std::max(0.0, reIt->second - drainJ);
       obs.residual_energy_j = reIt->second;
+      // IoT "battery drain" death: a switch whose energy hits zero powers off
+      // for good. It is blocked from both routing and flooding; the agent must
+      // have already steered traffic onto survivors (or, if it's a cut vertex /
+      // host switch, accept the partition — an intentional routing limit test).
+      if (reIt->second <= 0.0 && !m_deadNodes.count(dpid)) {
+        m_deadNodes.insert(dpid);
+        NS_LOG_INFO("[ML-DEATH] dpid=" << dpid << " tick=" << m_mlTick
+                                       << " depleted — powered off");
+        UpdateBlockedNodes();
+      }
     }
   }
 
@@ -1182,9 +1204,12 @@ void ZmqOpenFlowController::FloodViaST(Ptr<const RemoteSwitch> inSwtch,
     if (stIt != m_spanningTree.end()) {
       for (uint32_t p : stIt->second) {
         if (p == skipPort) continue;
-        outPorts.push_back(p);
 
         auto peerDpid = m_topology.GetPeerDpid(dpid, p);
+        // Skip ports leading to a blocked (slept/dead) peer.
+        if (peerDpid && m_topology.IsNodeBlocked(*peerDpid)) continue;
+        outPorts.push_back(p);
+
         if (peerDpid && !visited.count(*peerDpid)) {
           auto peerPort = m_topology.GetPeerPort(dpid, p);
           if (peerPort) parentPort[*peerDpid] = *peerPort;
@@ -1928,10 +1953,19 @@ void ZmqOpenFlowController::ApplyDeltaCosts(const std::vector<double>& deltas) {
                                     << " max=" << aMax
                                     << " scale=" << scale);
   }
+  // Zero-center the action across links each tick: subtract the mean delta so a
+  // uniform actor output collapses to all-zero (no route change). Combined with
+  // the additive cost composition (Topology::SetMlAbsCostScale) this removes the
+  // scale-invariant no-op that let the actor park at a constant.
+  double centerMean = 0.0;
+  if (n > 0) {
+    for (size_t i = 0; i < n; ++i) centerMean += deltas[i];
+    centerMean /= static_cast<double>(n);
+  }
   bool anyChanged = false;
   double churnL1 = 0.0;
   for (size_t i = 0; i < n; ++i) {
-    double d = deltas[i];
+    double d = deltas[i] - centerMean;
     if (d > scale)
       d = scale;
     else if (d < -scale)
@@ -1987,9 +2021,20 @@ void ZmqOpenFlowController::ApplySleepActions(
                                  << " (was " << m_sleepSwitches.size()
                                  << ", masked=" << masked << ")");
   m_sleepSwitches = std::move(newSleep);
-  // Route around the powered-off switches; SetBlockedNodes clears the path
-  // cache so the next ShortestPath reflects the new topology.
-  m_topology.SetBlockedNodes(m_sleepSwitches);
+  // Route AND flood around the powered-off switches: this rebuilds the
+  // blocked-node set, the spanning tree, the flood groups, and the routing
+  // table together so broadcast/ARP never reaches a slept node.
+  UpdateBlockedNodes();
+}
+
+// Single owner of the topology's blocked set = slept ∪ dead. Recomputes every
+// derived structure (spanning tree, flood groups, unicast routes) so a blocked
+// switch is fully inert: it neither transits unicast nor receives broadcast.
+void ZmqOpenFlowController::UpdateBlockedNodes() {
+  std::set<uint64_t> blocked = m_sleepSwitches;
+  blocked.insert(m_deadNodes.begin(), m_deadNodes.end());
+  m_topology.SetBlockedNodes(blocked);
+  RebuildSpanningTree();  // also re-pushes flood groups for every switch
   RecomputeAllRoutes();
 }
 
@@ -2015,6 +2060,26 @@ void ZmqOpenFlowController::MlTick() {
       uint64_t a = link.src_dpid, b = link.dst_dpid;
       if (a > b) std::swap(a, b);
       m_mlLinkOrder.push_back({a, b});
+    }
+    // Freeze the absolute cost scale for the additive ml_delta lever: the median
+    // base link cost over the (heterogeneous) link set. This makes a ±scale
+    // action a meaningful, non-uniform offset on every link regardless of its
+    // base cost, killing the multiplicative scale-invariant no-op.
+    {
+      std::vector<double> baseCosts;
+      baseCosts.reserve(m_mlLinkOrder.size());
+      for (const auto& [a, b] : m_mlLinkOrder) {
+        double bc = m_topology.GetBaseLinkCost(a, b);
+        if (bc > 0.0) baseCosts.push_back(bc);
+      }
+      double medianBase = 1.0;
+      if (!baseCosts.empty()) {
+        std::sort(baseCosts.begin(), baseCosts.end());
+        medianBase = baseCosts[baseCosts.size() / 2];
+      }
+      m_topology.SetMlAbsCostScale(medianBase);
+      NS_LOG_INFO("[ML] Frozen additive cost scale (median base) = "
+                  << medianBase);
     }
     // Freeze the set of switches the node-sleep action may never power off:
     // articulation points of the switch graph (computed once here, O(V+E)) plus

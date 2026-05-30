@@ -208,6 +208,11 @@ class ZmqOpenFlowController : public OFSwitch13Controller {
   double GetSwitchInitialEnergyJ(uint64_t dpid) const;
   double GetSwitchResidualEnergyJ(uint64_t dpid) const;
 
+  // Crisis hook: force a switch's residual energy to zero so it dies on the
+  // next stats tick (drives the IoT "battery drain" death deterministically,
+  // independent of offered load). No-op if the dpid isn't energy-tracked.
+  void ForceDeplete(uint64_t dpid);
+
   // Retrieve the mean hop-count for all routes in the topology for routing
   // summary
   double GetAverageHopCount() const { return m_topology.AverageHopCount(); }
@@ -271,6 +276,9 @@ class ZmqOpenFlowController : public OFSwitch13Controller {
 
   void RecomputeAllRoutes();
   void RebuildSpanningTree();
+  // Recompute the topology's blocked set (slept ∪ dead) and every structure
+  // derived from it: spanning tree, flood groups, and unicast routes.
+  void UpdateBlockedNodes();
 
   // Formats an integer ip into dotted notation
   static std::string FormatIp(uint32_t ip);
@@ -363,6 +371,10 @@ class ZmqOpenFlowController : public OFSwitch13Controller {
   // draws no idle power, forwards no traffic, and is routed around. Never
   // contains a non-sleepable switch. Empty unless the action is in use.
   std::set<uint64_t> m_sleepSwitches;
+  // Switches that have died (residual energy depleted to zero). Like slept
+  // switches they are blocked from routing and flooding, but involuntarily and
+  // permanently — they never wake. Drives the IoT battery-drain crisis.
+  std::set<uint64_t> m_deadNodes;
   // Switches the node-sleep action must never power off: articulation points of
   // the switch graph (computed once at first MlTick) plus host-bearing switches
   // (marked at setup). Sleeping any of these would partition the network or

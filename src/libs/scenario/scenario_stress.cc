@@ -1,5 +1,7 @@
 #include "scenario/scenario_stress.h"
 
+#include <algorithm>
+
 #include "ns3/core-module.h"
 #include "ns3/csma-module.h"
 #include "ns3/error-model.h"
@@ -19,6 +21,10 @@ void StressOptions::Register(CommandLine& cmd) {
                "Switch index that goes dark at 0.85 W "
                "(0 = use topology default)",
                blackHoleSwitchIdx);
+  cmd.AddValue("killSwitch",
+               "Switch index drained to death (IoT battery-drain crisis) "
+               "(0 = use topology default)",
+               killSwitchIdx);
 }
 
 void LinkController::BringDown(State* ls) {
@@ -62,43 +68,102 @@ StressEvents::StressEvents(NodeContainer& hosts, NodeContainer& switches,
     : m_hosts(hosts),
       m_switches(switches),
       m_ifaces(ifaces),
-      m_failureLinks(failureLinks) {}
+      m_failureLinks(failureLinks) {
+  // Inherits the stream set by RngSeedManager::SetSeed(opts.seed), so crisis
+  // timings/targets vary per seed but stay reproducible for a given seed.
+  m_rng = CreateObject<UniformRandomVariable>();
+}
+
+double StressEvents::Frac(double base, double jitter, double lo, double hi) {
+  double f = base + m_rng->GetValue(-jitter, jitter);
+  return std::clamp(f, lo, hi);
+}
 
 void StressEvents::Schedule(double measureStart, double window,
                             uint32_t dstHostFlash,
-                            uint32_t blackHoleSwitchIdx) {
+                            uint32_t blackHoleSwitchIdx,
+                            uint32_t killSwitchIdx,
+                            std::function<void(uint32_t)> killFn) {
   auto at = [&](double frac) {
     return Seconds(measureStart + frac * window);
   };
+  const size_t nLinks = m_failureLinks.size();
 
-  if (m_failureLinks.size() >= 1) {
-    Simulator::Schedule(at(0.10), &LinkController::Degrade, m_failureLinks[0],
+  // --- Gray-fail (excavator nick): one random failure link at 30% loss. ------
+  if (nLinks >= 1) {
+    size_t gi = m_rng->GetInteger(0, nLinks - 1);
+    double down = Frac(0.10, 0.05, 0.03, 0.30);
+    double up = std::min(down + 0.25, 0.45);
+    Simulator::Schedule(at(down), &LinkController::Degrade, m_failureLinks[gi],
                         0.30);
-    Simulator::Schedule(at(0.40), &LinkController::BringUp, m_failureLinks[0]);
+    Simulator::Schedule(at(up), &LinkController::BringUp, m_failureLinks[gi]);
+    NS_LOG_INFO("StressEvents: gray-fail link[" << gi << "] @frac " << down);
   }
 
-  // Flash crowd: 4 short bulk flows at 10 Mbps each = 40 Mbps to one host.
-  // Pre-install up front (before Run) with future Start/Stop; dynamic install
-  // from inside a scheduled callback raced with CSMA TX-queue and SIGSEGV'd
-  // around t=30s under --mixedLoad --failures.
-  PreInstallFlashCrowd(dstHostFlash, 5.0, 10.0, 4,
-                       measureStart + 0.25 * window);
-
-  if (m_failureLinks.size() >= 3) {
-    Simulator::Schedule(at(0.55), &LinkController::BringDown,
-                        m_failureLinks[1]);
-    Simulator::Schedule(at(0.55), &LinkController::BringDown,
-                        m_failureLinks[2]);
-    Simulator::Schedule(at(0.75), &LinkController::BringUp, m_failureLinks[1]);
-    Simulator::Schedule(at(0.75), &LinkController::BringUp, m_failureLinks[2]);
-    NS_LOG_INFO("StressEvents: correlated outage links[1,2] scheduled");
+  // --- Flash crowd: jittered magnitude/duration/timing to one host. ----------
+  {
+    double rateMbps = m_rng->GetValue(8.0, 14.0);
+    double dur = m_rng->GetValue(4.0, 8.0);
+    uint32_t flows = static_cast<uint32_t>(m_rng->GetInteger(3, 6));
+    double startFrac = Frac(0.25, 0.06, 0.10, 0.55);
+    PreInstallFlashCrowd(dstHostFlash, dur, rateMbps, flows,
+                         measureStart + startFrac * window);
   }
 
+  // --- Correlated outage: two distinct random failure links go fully down. ---
+  if (nLinks >= 3) {
+    size_t a = m_rng->GetInteger(0, nLinks - 1);
+    size_t b = m_rng->GetInteger(0, nLinks - 1);
+    while (b == a) b = m_rng->GetInteger(0, nLinks - 1);
+    double down = Frac(0.55, 0.08, 0.45, 0.70);
+    double up = std::min(down + 0.20, 0.85);
+    Simulator::Schedule(at(down), &LinkController::BringDown, m_failureLinks[a]);
+    Simulator::Schedule(at(down), &LinkController::BringDown, m_failureLinks[b]);
+    Simulator::Schedule(at(up), &LinkController::BringUp, m_failureLinks[a]);
+    Simulator::Schedule(at(up), &LinkController::BringUp, m_failureLinks[b]);
+    NS_LOG_INFO("StressEvents: correlated outage links[" << a << "," << b
+                                                         << "] @frac " << down);
+  }
+
+  // --- IoT battery-drain death: drain the kill target to zero. ---------------
+  if (killFn && killSwitchIdx < m_switches.GetN()) {
+    double when = Frac(0.65, 0.07, 0.50, 0.80);
+    Simulator::Schedule(at(when), [killFn, killSwitchIdx]() {
+      killFn(killSwitchIdx);
+    });
+    NS_LOG_INFO("StressEvents: battery-drain kill switch=" << killSwitchIdx
+                                                           << " @frac " << when);
+  }
+
+  // --- Black-hole: chosen switch goes dark for ~5 s. -------------------------
   if (blackHoleSwitchIdx < m_switches.GetN()) {
-    Simulator::Schedule(at(0.85), &StressEvents::BlackHoleOn, this,
+    double when = Frac(0.85, 0.05, 0.75, 0.92);
+    double dur = m_rng->GetValue(4.0, 7.0);
+    Simulator::Schedule(at(when), &StressEvents::BlackHoleOn, this,
                         blackHoleSwitchIdx);
-    Simulator::Schedule(at(0.85) + Seconds(5.0), &StressEvents::BlackHoleOff,
+    Simulator::Schedule(at(when) + Seconds(dur), &StressEvents::BlackHoleOff,
                         this, blackHoleSwitchIdx);
+  }
+
+  // --- Mobility emulation: flap one random failure link in/out of range. -----
+  if (nLinks >= 2) {
+    size_t fi = m_rng->GetInteger(0, nLinks - 1);
+    double downSecs = m_rng->GetValue(2.0, 4.0);
+    double periodSecs = m_rng->GetValue(8.0, 14.0);
+    ScheduleFlap(m_failureLinks[fi], measureStart, window,
+                 Frac(0.30, 0.05, 0.20, 0.40), 0.70, downSecs, periodSecs);
+    NS_LOG_INFO("StressEvents: mobility link-flap link[" << fi << "]");
+  }
+}
+
+void StressEvents::ScheduleFlap(LinkController::State* link, double measureStart,
+                                double window, double startFrac, double endFrac,
+                                double downSecs, double periodSecs) {
+  double t = measureStart + startFrac * window;
+  double end = measureStart + endFrac * window;
+  for (; t + downSecs < end; t += periodSecs) {
+    Simulator::Schedule(Seconds(t), &LinkController::BringDown, link);
+    Simulator::Schedule(Seconds(t + downSecs), &LinkController::BringUp, link);
   }
 }
 

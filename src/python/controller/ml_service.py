@@ -256,7 +256,11 @@ class LocalDDPGAgent:
         seed: int = 0,
         actor_lr: float = 1e-4,
         critic_lr: float = 1e-3,
-        gamma: float = 0.99,
+        # Quasi-static control: a short horizon keeps Q ≈ reward/(1-γ) small and
+        # readable (actor_loss = -E[Q] settles near ~-7, not ~-50) without
+        # losing the little foresight this task needs. γ=0.99 only inflated the
+        # bootstrap target; it never changed the (flat) reward.
+        gamma: float = 0.9,
         tau: float = 0.005,
         replay_capacity: int = 200_000,
         batch_size: int = 64,
@@ -598,8 +602,15 @@ def _build_graph_data(state: dict) -> "Data":
 
     per_link = state.get("per_link", []) or []
     L = len(per_link)
-    # Normalize cost by the max in this tick so the agent sees a unit-scale signal.
-    max_cost = max((float(l.get("cost", 1.0)) for l in per_link), default=1.0)
+    # Freeze the cost normalizer at the first tick that has links. A per-tick max
+    # is non-stationary — the same physical link reads differently as congestion
+    # shifts which link is the current max — so the agent can't learn a stable
+    # cost signal. The first-tick max (topology base costs, pre-congestion) is a
+    # fixed denominator that keeps each link's reading comparable over time.
+    tick_max = max((float(l.get("cost", 1.0)) for l in per_link), default=1.0)
+    if L > 0 and getattr(_build_graph_data, "_cost_ref", None) is None:
+        _build_graph_data._cost_ref = max(tick_max, 1e-9)
+    max_cost = getattr(_build_graph_data, "_cost_ref", None) or max(tick_max, 1e-9)
     max_cost = max(max_cost, 1e-9)
 
     def edge_features(l: dict, drop_bps: float, util: float) -> np.ndarray:
@@ -646,8 +657,10 @@ def _build_graph_data(state: dict) -> "Data":
     bidir_edge_attr = np.concatenate([canon_attr[:L_eff], reverse_attr[:L_eff]],
                                      axis=0)
 
-    u = np.array([float(state.get("residual_energy_stddev", 0.0))],
-                 dtype=np.float32)
+    # residual_energy_stddev is naturally ~[0, 0.5]; squash to [0, 1] so the
+    # global feature shares the unit scale of the node/edge features.
+    u_raw = float(state.get("residual_energy_stddev", 0.0))
+    u = np.array([min(1.0, max(0.0, 2.0 * u_raw))], dtype=np.float32)
 
     data = Data(
         x=torch.from_numpy(x),
@@ -682,8 +695,8 @@ class MLService:
         self.seed = 0
 
         # Worker thread coordination.
-        # Tuple is (tick, graph_data, prev_reward, explore).
-        self._req_q: "queue.Queue[tuple[int, Any, float, bool]]" = queue.Queue()
+        # Tuple is (tick, graph_data, prev_reward, explore, learn).
+        self._req_q: "queue.Queue[tuple[int, Any, float, bool, bool]]" = queue.Queue()
         self._stop = threading.Event()
         self._action_lock = threading.Lock()
         # Cached "best action so far". Producer = worker, consumer = main.
@@ -981,7 +994,7 @@ class MLService:
                   f"service arch={_ARCH_TAG!r} — proceeding anyway.")
 
         try:
-            agent_kwargs = dict(
+            agent_kwargs: dict[str, Any] = dict(
                 action_dim=self.action_dim,
                 node_dim=self.node_feat_dim,
                 edge_dim=self.edge_feat_dim,

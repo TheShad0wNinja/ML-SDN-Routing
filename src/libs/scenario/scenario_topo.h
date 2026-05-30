@@ -68,6 +68,9 @@ struct TopoSpec {
   uint32_t defaultCentralHost = 0;
   uint32_t defaultFlashCrowdDst = 0;
   uint32_t defaultBlackHoleSwitch = 0;
+  // Switch index drained to death by the IoT battery-drain crisis. Pick a
+  // non-articulation switch on a redundant path so the agent can reroute.
+  uint32_t defaultKillSwitch = 0;
 };
 
 std::vector<uint32_t> ParseIndexCsv(const std::string& csv);

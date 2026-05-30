@@ -45,9 +45,14 @@ TopoSpec BuildFatTreeK4Spec(const std::string& backboneQueue) {
     spec.links.push_back({a1, e0, dKm, 0.0, backboneQueue, false, "1Gbps"});
     spec.links.push_back({a1, e1, dKm, 0.0, backboneQueue, false, "1Gbps"});
   }
+  // Agg↔core uplinks are redundant (each agg has two cores), so they are safe
+  // crisis material: cutting/flapping one always has a backup. Mark several so
+  // the seed-varied suite has links to pick from for outage + mobility flaps.
   spec.links[0].failureTarget = true;
+  spec.links[1].failureTarget = true;
   spec.links[8].failureTarget = true;
   spec.links[16].failureTarget = true;
+  spec.links[17].failureTarget = true;
 
   for (uint32_t p = 0; p < 4; ++p) {
     uint32_t e0 = pod(p, 2), e1 = pod(p, 3);
@@ -61,7 +66,8 @@ TopoSpec BuildFatTreeK4Spec(const std::string& backboneQueue) {
   }
   spec.defaultCentralHost = 0;
   spec.defaultFlashCrowdDst = 0;
-  spec.defaultBlackHoleSwitch = 4;  // first aggregation switch
+  spec.defaultBlackHoleSwitch = 4;  // pod-0 aggregation switch (host-free)
+  spec.defaultKillSwitch = 8;       // pod-1 agg (host-free, reroutable via its twin)
   return spec;
 }
 

@@ -262,6 +262,22 @@ void Topology::SetLinkMlDelta(uint64_t dpid1, uint64_t dpid2, double delta)
     RecomputeCost(dpid1, dpid2);
 }
 
+void Topology::SetMlAbsCostScale(double scale)
+{
+    if (!(scale >= 0.0)) scale = 0.0;
+    if (scale == m_mlAbsCostScale) return;
+    m_mlAbsCostScale = scale;
+    // Effective costs depend on the scale; recompute every known link so the
+    // change takes effect immediately. RecomputeCost touches both directions,
+    // so iterating a snapshot of the canonical pairs is enough.
+    std::vector<std::pair<uint64_t, uint64_t>> pairs;
+    for (const auto& [a, row] : m_linkCost)
+        for (const auto& [b, cost] : row)
+            if (a < b) pairs.push_back({a, b});
+    for (const auto& [a, b] : pairs) RecomputeCost(a, b);
+    m_pathCache.clear();
+}
+
 void Topology::RecomputeCost(uint64_t dpid1, uint64_t dpid2)
 {
     auto it = m_linkCost.find(dpid1);
@@ -271,7 +287,13 @@ void Topology::RecomputeCost(uint64_t dpid1, uint64_t dpid2)
     if (!(base > 0.0)) base = 1.0;
     double cong  = LookupOrZero(m_linkCongestion, dpid1, dpid2);
     double mlDel = LookupOrZero(m_linkMlDelta, dpid1, dpid2);
-    double eff = base * (1.0 + cong) * (1.0 + mlDel);
+    // Additive ml_delta when an absolute scale is set: adding a fixed offset
+    // (not proportional to base) means a *uniform* delta penalises high-hop
+    // paths instead of cancelling out, so Dijkstra actually responds. Falls
+    // back to the legacy multiplicative form for non-ML runs (scale == 0).
+    double eff = (m_mlAbsCostScale > 0.0)
+                     ? base * (1.0 + cong) + m_mlAbsCostScale * mlDel
+                     : base * (1.0 + cong) * (1.0 + mlDel);
     if (!(eff > 0.0)) eff = 1e-3;
     m_linkCost[dpid1][dpid2] = eff;
     m_linkCost[dpid2][dpid1] = eff;
@@ -470,8 +492,15 @@ Topology::ComputeSpanningTree() const
     std::unordered_map<uint64_t, std::unordered_set<uint32_t>> result;
     if (m_graph.empty()) return result;
 
-    uint64_t root = m_graph.begin()->first;
-    for (const auto& kv : m_graph) root = std::min(root, kv.first);
+    // Root must be a powered-on switch; blocked (slept/dead) nodes are excluded
+    // from the tree entirely so flood ports never point at a blocked peer.
+    bool haveRoot = false;
+    uint64_t root = 0;
+    for (const auto& kv : m_graph) {
+        if (m_blockedNodes.count(kv.first)) continue;
+        if (!haveRoot || kv.first < root) { root = kv.first; haveRoot = true; }
+    }
+    if (!haveRoot) return result;
 
     std::unordered_set<uint64_t> visited;
     std::queue<uint64_t> q;
@@ -484,6 +513,7 @@ Topology::ComputeSpanningTree() const
         if (it == m_graph.end()) continue;
         for (uint64_t v : it->second) {
             if (visited.count(v)) continue;
+            if (m_blockedNodes.count(v)) continue;  // never flood toward a blocked node
             visited.insert(v);
             q.push(v);
             auto uIt = m_routing.find(u);

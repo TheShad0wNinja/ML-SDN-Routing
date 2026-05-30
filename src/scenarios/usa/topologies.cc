@@ -71,7 +71,7 @@ TopoSpec BuildUsaSpec(const std::string& backboneQueue, bool crippleEnabled) {
       {14, 21,  413.0, 0.000, backboneQueue, false, "1Gbps"}, // tier1-edge
       {21, 25,  913.0, 0.002, backboneQueue, false, "1Gbps"}, // edge-tier2
       {25, 30,  525.0, 0.000, backboneQueue, false, "1Gbps"}, // tier2-edge
-      {25, 24,  458.0, 0.000, backboneQueue, false, "2Gbps"}, // tier2-tier2
+      {25, 24,  458.0, 0.000, backboneQueue, true,  "2Gbps" }, // tier2-tier2 (failover material)
       {24, 18,  346.0, 0.000, backboneQueue, false, "2Gbps"}, // tier2-tier2
       {24, 28,  572.0, 0.000, backboneQueue, false, "1Gbps"}, // tier2-edge
       {14, 20,  569.0, 0.000, backboneQueue, false, "1Gbps"}, // tier1-edge
@@ -90,7 +90,7 @@ TopoSpec BuildUsaSpec(const std::string& backboneQueue, bool crippleEnabled) {
       {23, 27,  360.0, 0.000, backboneQueue, false, "500Mbps"}, // edge-edge
       {32, 33,  306.0, 0.000, backboneQueue, false, "500Mbps"}, // edge-edge
       { 2,  3,  907.0, 0.002, backboneQueue, false, "1Gbps"}, // edge-tier2
-      { 3,  4,  503.0, 0.000, backboneQueue, false, "2Gbps"}, // tier2-tier2
+      { 3,  4,  503.0, 0.000, backboneQueue, true,  "2Gbps" }, // tier2-tier2 (failover material)
       { 3,  6,  955.0, 0.003, backboneQueue, false, "10Gbps"}, // tier2-tier1
       { 8,  6,  598.0, 0.000, backboneQueue, false, "10Gbps"}, // tier2-tier1
       { 4,  6,  934.0, 0.003, backboneQueue, false, "5Gbps"}, // tier2-tier1
@@ -127,6 +127,7 @@ TopoSpec BuildUsaSpec(const std::string& backboneQueue, bool crippleEnabled) {
   spec.defaultCentralHost = 15;       // Chicago
   spec.defaultFlashCrowdDst = 15;     // Chicago
   spec.defaultBlackHoleSwitch = 22;   // Cleveland
+  spec.defaultKillSwitch = 8;         // Denver — well-connected tier2, reroutable
   return spec;
 }
 

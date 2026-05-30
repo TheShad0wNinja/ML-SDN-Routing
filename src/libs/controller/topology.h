@@ -37,6 +37,13 @@ public:
   double GetLinkMlDelta(uint64_t dpid1, uint64_t dpid2) const;
   void   SetLinkMlDelta(uint64_t dpid1, uint64_t dpid2, double delta);
 
+  // Absolute cost scale for the ML link-weight lever. When > 0, RecomputeCost
+  // applies the ml_delta *additively* (eff = base*(1+cong) + scale*ml_delta)
+  // instead of multiplicatively, so a uniform delta is no longer a Dijkstra
+  // no-op. Frozen once by the controller (median base cost) after discovery.
+  void SetMlAbsCostScale(double scale);
+  double GetMlAbsCostScale() const { return m_mlAbsCostScale; }
+
   // Egress-port capacity (bits/s) stashed when the controller sees
   // the first PORT_STATS reply; 0 if not yet known.
   double GetLinkCapacityBps(uint64_t srcDpid, uint64_t dstDpid) const;
@@ -72,6 +79,7 @@ public:
   // Nodes the ML node-sleep action has powered off. ShortestPath routes around
   // them (never transits a blocked node). Setting this clears the path cache.
   void SetBlockedNodes(const std::set<uint64_t>& blocked);
+  bool IsNodeBlocked(uint64_t dpid) const { return m_blockedNodes.count(dpid) != 0; }
 
   std::optional<uint64_t> GetPeerDpid(uint64_t dpid, uint32_t port) const;
   std::optional<uint32_t> GetPeerPort(uint64_t dpid, uint32_t port) const;
@@ -99,6 +107,10 @@ private:
   // Nodes powered off by the ML node-sleep action; Dijkstra never transits
   // them. Empty unless the node-sleep action is in use.
   std::set<uint64_t> m_blockedNodes;
+
+  // Absolute cost scale for additive ml_delta composition; 0 = legacy
+  // multiplicative form. See SetMlAbsCostScale.
+  double m_mlAbsCostScale = 0.0;
 
   // Link costs and delays
   std::unordered_map<uint64_t, std::unordered_map<uint64_t, double>> m_linkDelay;

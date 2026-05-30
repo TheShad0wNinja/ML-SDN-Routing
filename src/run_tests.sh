@@ -113,7 +113,7 @@ Modes:
                         (only that priority — others are untouched)
 
 Options:
-  --topology X          usa | fat-tree-k4 | two-switch-ping        (REQUIRED)
+  --topology X          usa | fat-tree-k4 | two-switch-ping | Sensor Cluster (REQUIRED)
                         Note: fat-tree-k4 has 1 section; --multiController
                         and --sections>1 are unsupported there.
   --simTime N           Simulation duration (s)                    (default: 600)
@@ -391,6 +391,11 @@ topology_cap() {
     fat-tree-k4:supports_fail)     echo 1 ;;
     fat-tree-k4:supports_crip)     echo 0 ;;
     fat-tree-k4:modes)             echo "central random" ;;
+    sensor-cluster:sections)          echo 1 ;;
+    sensor-cluster:supports_mixed_load) echo 1 ;;
+    sensor-cluster:supports_fail)     echo 1 ;;
+    sensor-cluster:supports_crip)     echo 0 ;;
+    sensor-cluster:modes)             echo "central random" ;;
     two-switch-ping:sections)      echo 1 ;;
     two-switch-ping:supports_mixed_load) echo 0 ;;
     two-switch-ping:supports_fail) echo 0 ;;

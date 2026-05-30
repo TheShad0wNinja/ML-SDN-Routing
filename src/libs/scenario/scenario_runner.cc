@@ -143,7 +143,6 @@ int RunScenario(ScenarioOptions& opts, TopoSpec topo,
   std::vector<LinkController::State*> failureLinks = builder.GetFailureLinks();
 
   builder.SetupIpStack();
-  if (!opts.multi.enabled) builder.PrePopulateArp();
   builder.InstallOpenFlow(ctrls, layout.switchesPerCtrl);
   for (uint32_t i = 0; i < NUM_SWITCHES; ++i) {
     builder.ConfigureSwitch(i, topo.nodes[i], ctrls[switchToSection[i]]);
@@ -151,46 +150,54 @@ int RunScenario(ScenarioOptions& opts, TopoSpec topo,
 
   double measureStart = 1.0 + opts.warmupS;
 
-  // Capture by reference: all locals live until Simulator::Run() returns,
-  // which is well after this lambda fires.
-  Simulator::Schedule(Seconds(opts.warmupS), [&]() {
-    if (!opts.multi.enabled) {
-      ctrls[0]->PreInstallAllPaths(builder.GetHostInfos());
-      return;
-    }
-    const uint32_t M = topo.sections.size();
-    std::vector<std::vector<ZmqOpenFlowController::HostInfo>> intra(M);
-    for (uint32_t h = 0; h < NUM_HOSTS; ++h) {
-      intra[switchToSection[topo.hostToSwitch[h]]].push_back(
-          builder.GetHostInfos()[h]);
-    }
-    for (uint32_t s = 0; s < M; ++s) {
-      ctrls[s]->PreInstallAllPaths(intra[s]);
-    }
-    for (uint32_t s = 0; s < M; ++s) {
-      std::vector<ZmqOpenFlowController::ExternalHostRoute> routes;
-      for (const auto& r : topo.interDomainRoutes) {
-        if (r.fromSection != s) continue;
-        uint64_t srcDpid = r.viaSwitch + 1;
-        uint64_t dstDpid = r.nextSwitch + 1;
-        uint32_t borderOutPort = builder.PortBetween(srcDpid, dstDpid);
-        if (borderOutPort == 0) {
-          std::cerr << "WARN: no physical link " << r.viaSwitch << "→"
-                    << r.nextSwitch << "; skipping route " << r.fromSection
-                    << "→" << r.toSection << "\n";
-          continue;
-        }
-        for (uint32_t h = 0; h < NUM_HOSTS; ++h) {
-          if (switchToSection[topo.hostToSwitch[h]] !=
-              static_cast<int>(r.toSection))
-            continue;
-          routes.push_back({builder.GetHostInfos()[h].mac, srcDpid,
-                            borderOutPort});
-        }
+  // Single-controller runs are fully reactive: hosts ARP normally, the
+  // controller proxy-ARPs / floods to learn host locations, and installs
+  // shortest-path flow-mods on the first packet of each flow using the
+  // LLDP-discovered link costs current at that moment (see HandlePacketIn /
+  // ForwardPacket). Nothing is pre-installed — the warmup window simply gives
+  // LLDP time to discover the full topology before traffic starts at
+  // measureStart, so the reactive paths are computed on the settled cost graph.
+  //
+  // multiController is different: each in-process controller only sees its own
+  // section, so cross-domain reachability can't be learned reactively. There we
+  // still proactively seed intra-section paths and install static inter-domain
+  // border routes after warmup. (Capture by reference: all locals outlive Run.)
+  if (opts.multi.enabled) {
+    Simulator::Schedule(Seconds(opts.warmupS), [&]() {
+      const uint32_t M = topo.sections.size();
+      std::vector<std::vector<ZmqOpenFlowController::HostInfo>> intra(M);
+      for (uint32_t h = 0; h < NUM_HOSTS; ++h) {
+        intra[switchToSection[topo.hostToSwitch[h]]].push_back(
+            builder.GetHostInfos()[h]);
       }
-      ctrls[s]->InstallExternalHostRoutes(routes);
-    }
-  });
+      for (uint32_t s = 0; s < M; ++s) {
+        ctrls[s]->PreInstallAllPaths(intra[s]);
+      }
+      for (uint32_t s = 0; s < M; ++s) {
+        std::vector<ZmqOpenFlowController::ExternalHostRoute> routes;
+        for (const auto& r : topo.interDomainRoutes) {
+          if (r.fromSection != s) continue;
+          uint64_t srcDpid = r.viaSwitch + 1;
+          uint64_t dstDpid = r.nextSwitch + 1;
+          uint32_t borderOutPort = builder.PortBetween(srcDpid, dstDpid);
+          if (borderOutPort == 0) {
+            std::cerr << "WARN: no physical link " << r.viaSwitch << "→"
+                      << r.nextSwitch << "; skipping route " << r.fromSection
+                      << "→" << r.toSection << "\n";
+            continue;
+          }
+          for (uint32_t h = 0; h < NUM_HOSTS; ++h) {
+            if (switchToSection[topo.hostToSwitch[h]] !=
+                static_cast<int>(r.toSection))
+              continue;
+            routes.push_back({builder.GetHostInfos()[h].mac, srcDpid,
+                              borderOutPort});
+          }
+        }
+        ctrls[s]->InstallExternalHostRoutes(routes);
+      }
+    });
+  }
 
   uint32_t centralHostIdx =
       Resolve(opts.traffic.centralHostIdx, topo.defaultCentralHost);
@@ -198,6 +205,8 @@ int RunScenario(ScenarioOptions& opts, TopoSpec topo,
       Resolve(opts.stress.flashCrowdDst, topo.defaultFlashCrowdDst);
   uint32_t blackHoleSwitchIdx =
       Resolve(opts.stress.blackHoleSwitchIdx, topo.defaultBlackHoleSwitch);
+  uint32_t killSwitchIdx =
+      Resolve(opts.stress.killSwitchIdx, topo.defaultKillSwitch);
 
   TrafficManager traffic(builder.GetHosts(), builder.GetHostIfaces(),
                          centralHostIdx, topo.hostGroups);
@@ -213,8 +222,16 @@ int RunScenario(ScenarioOptions& opts, TopoSpec topo,
   StressEvents stress(builder.GetHosts(), builder.GetSwitches(),
                       builder.GetHostIfaces(), failureLinks);
   if (opts.stress.enabled) {
-    stress.Schedule(measureStart, opts.simTime - measureStart,
-                    flashCrowdDst, blackHoleSwitchIdx);
+    // Resolve the kill target's owning controller; dpid convention is
+    // switchIndex + 1 (see ScenarioBuilder::ConfigureSwitch). The lambda is
+    // fired by StressEvents at the (seed-jittered) crisis time.
+    auto killFn = [&ctrls, &switchToSection,
+                   NUM_SWITCHES](uint32_t switchIdx) {
+      if (switchIdx >= NUM_SWITCHES) return;
+      ctrls[switchToSection[switchIdx]]->ForceDeplete(switchIdx + 1);
+    };
+    stress.Schedule(measureStart, opts.simTime - measureStart, flashCrowdDst,
+                    blackHoleSwitchIdx, killSwitchIdx, killFn);
   }
 
   FlowMonitorHelper flowmonHelper;
