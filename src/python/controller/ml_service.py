@@ -234,7 +234,7 @@ class LocalDDPGAgent:
         replay_capacity: int = 200_000,
         batch_size: int = 64,
         warmup: int = 100,
-        noise_sigma_init: float = 0.3,
+        noise_sigma_init: float = 0.2,
         noise_sigma_min: float = 0.10,
         force_noise_sigma: bool = False,
         action_var_weight: float = 0.05,
@@ -285,10 +285,11 @@ class LocalDDPGAgent:
         self._noise_sigma_init = float(noise_sigma_init)
         self._noise_sigma = float(noise_sigma_init)
         self._noise_sigma_min = float(noise_sigma_min)
-        # 0.9999/step anneals 0.30->0.10 floor in ~11k steps (~22 rounds at
-        # ~490 train-steps/episode), leaving an exploitation tail. The prior
-        # 0.99995 needed ~22k steps (~45 rounds) — sigma never sharpened within
-        # a realistic budget. See memory: project-exploration-noise-gaussian.
+        # 0.9999/step anneals 0.20->0.10 floor in ~7k steps (~14 rounds at
+        # ~490 train-steps/episode), leaving a longer exploitation tail. The
+        # init was lowered 0.30->0.20 to shorten the exploration phase under a
+        # tight round budget (the prior 0.99995 decay needed ~45 rounds and
+        # never sharpened). See memory: project-exploration-noise-gaussian.
         self._noise_sigma_decay = 0.9999
         # When the controller passed an explicit sigma (via --mlNoiseSigma),
         # the checkpoint's saved sigma must not override it on resume.
