@@ -191,9 +191,22 @@ ml_agent_dir_for_slot() {
   esac
 }
 
+# For every non-train ML run: redirect runtime artifacts (local.pt checkpoint
+# updates, metrics.csv, replay.pkl) to $base/deploy/s<slot>/ so the canonical
+# local.pt at the priority root is never overwritten by inference/eval runs.
+# No-op when ML=false, when already in deploy layout (multiController path),
+# or in train layout (training manages its own dirs).
+ensure_deploy_layout() {
+  $ML || return 0
+  [[ "$ML_LAYOUT" == "deploy" || "$ML_LAYOUT" == "train" ]] && return 0
+  ML_LAYOUT="deploy"
+  seed_deploy_dirs
+}
+
 # Copy the canonical $base/local.pt into each deploy section dir so every
 # controller in a --multiController run loads the same FedAvg'd weights.
-# Called from cmd_single before start_ml_service when ML_LAYOUT=deploy.
+# Called from cmd_single before start_ml_service when ML_LAYOUT=deploy,
+# and by ensure_deploy_layout for all other non-train ML runs.
 seed_deploy_dirs() {
   local base; base=$(ckpt_dir_for_priority "$PRIORITY")
   local src="$base/local.pt"
@@ -680,6 +693,7 @@ cmd_single() {
       seed_deploy_dirs
     fi
   fi
+  ensure_deploy_layout   # plain --ml single runs: keep priority root clean
   if $ML || $MULTI_CONTROLLER; then start_ml_service; fi
   local tag
   if $MULTI_CONTROLLER; then tag="multi"
@@ -689,6 +703,7 @@ cmd_single() {
 }
 
 cmd_compare() {
+  local _save_ml=$ML; ML=true; ensure_deploy_layout; ML=$_save_ml
   start_ml_service
   local save_ml=$ML
   ML=false
@@ -699,6 +714,7 @@ cmd_compare() {
 }
 
 cmd_presets() {
+  local _save_ml=$ML; ML=true; ensure_deploy_layout; ML=$_save_ml
   start_ml_service
   ML=false
   run_one "${TOPOLOGY}-baseline-${TRAFFIC_MODE}-seed${SEED}"
@@ -712,6 +728,7 @@ cmd_presets() {
 }
 
 cmd_seeds() {
+  ensure_deploy_layout
   if $ML; then start_ml_service; fi
   local base=$SEED
   local jobs=()
@@ -726,6 +743,7 @@ cmd_seeds() {
 }
 
 cmd_matrix() {
+  local _save_ml=$ML; ML=true; ensure_deploy_layout; ML=$_save_ml
   start_ml_service
   local base_seed=$SEED
   local jobs=()
@@ -746,6 +764,7 @@ cmd_eval() {
   EXPLORE=false
   LEARN=false
   RESUME=true
+  ensure_deploy_layout
   start_ml_service
   run_one "${TOPOLOGY}-eval-${PRIORITY}-${TRAFFIC_MODE}-seed${SEED}"
 }

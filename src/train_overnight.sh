@@ -23,6 +23,7 @@
 #   PRIORITY=energy     ROUNDS=30       WORKERS=8
 #   SEED=20042810         SIM_TIME=600    EVAL_SIM_TIME=300
 #   MIX="usa,fat-tree-k4,sensor-cluster"  FEDAVG_EVERY=50   RESET=0  (1 = wipe)
+#   WARMUP_S=50           MAX_CONCURRENT=20
 
 set -euo pipefail
 
@@ -52,14 +53,17 @@ ROUNDS="${ROUNDS:-30}"
 WORKERS="${WORKERS:-8}"
 SEED="${SEED:-20042810}"
 SIM_TIME="${SIM_TIME:-600}"
-EVAL_SIM_TIME="${EVAL_SIM_TIME:-300}"
+EVAL_SIM_TIME="${EVAL_SIM_TIME:-800}"
 MIX="${MIX:-usa,fat-tree-k4,sensor-cluster}"
+WARMUP_S="${WARMUP_S:-50}"
+MAX_CONCURRENT="${MAX_CONCURRENT:-20}"
 FEDAVG_EVERY="${FEDAVG_EVERY:-50}"
-RESET="${RESET:-0}"
+RESET="${RESET:-1}"
 
 echo "[train_overnight] start $(date '+%Y-%m-%d %H:%M:%S')"
 echo "[train_overnight]   priority=$PRIORITY rounds=$ROUNDS workers=$WORKERS mix='$MIX'"
 echo "[train_overnight]   seed=$SEED simTime=$SIM_TIME evalSimTime=$EVAL_SIM_TIME reset=$RESET"
+echo "[train_overnight]   warmupS=$WARMUP_S maxConcurrent=$MAX_CONCURRENT"
 
 # 1. Mixed-topology federated training (one global actor; per-worker critics).
 echo
@@ -71,7 +75,9 @@ train_args=(train
   --rounds "$ROUNDS"
   --seed "$SEED"
   --simTime "$SIM_TIME"
-  --fedAvgEverySteps "$FEDAVG_EVERY")
+  --warmupS "$WARMUP_S"
+  --fedAvgEverySteps "$FEDAVG_EVERY"
+  -- --maxConcurrent="$MAX_CONCURRENT")
 [[ "$RESET" == "1" ]] && train_args+=(--reset)
 "$RT" "${train_args[@]}"
 
@@ -88,7 +94,9 @@ for entry in "${_entries[@]}"; do
     --topology "$topo" \
     --priority "$PRIORITY" \
     --simTime "$EVAL_SIM_TIME" \
-    --seed "$SEED" || echo "[train_overnight] WARN: eval $topo failed (continuing)"
+    --warmupS "$WARMUP_S" \
+    --seed "$SEED" \
+    -- --maxConcurrent="$MAX_CONCURRENT" || echo "[train_overnight] WARN: eval $topo failed (continuing)"
 done
 
 # 3. Where to look.
