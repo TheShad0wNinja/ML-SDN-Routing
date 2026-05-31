@@ -171,7 +171,8 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
       // [-1, 1] regardless of how the user set them on the CLI.
       {
         double s = m_ml.en_w_power + m_ml.en_w_util + m_ml.en_w_footprint +
-                   m_ml.en_w_reserve + m_ml.en_w_balance + m_ml.en_w_churn;
+                   m_ml.en_w_reserve + m_ml.en_w_balance + m_ml.en_w_churn +
+                   m_ml.en_w_min_residual;
         if (s > 1e-9) {
           m_ml.en_w_power /= s;
           m_ml.en_w_util /= s;
@@ -179,6 +180,7 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
           m_ml.en_w_reserve /= s;
           m_ml.en_w_balance /= s;
           m_ml.en_w_churn /= s;
+          m_ml.en_w_min_residual /= s;
         }
       }
       break;
@@ -192,7 +194,10 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
                 << " footprint=" << m_ml.en_w_footprint
                 << " reserve=" << m_ml.en_w_reserve
                 << " balance=" << m_ml.en_w_balance
-                << " churn=" << m_ml.en_w_churn << ") sla_pdr=" << m_ml.sla_pdr
+                << " churn=" << m_ml.en_w_churn
+                << " min_residual=" << m_ml.en_w_min_residual
+                << " thresh=" << m_ml.min_residual_threshold
+                << ") sla_pdr=" << m_ml.sla_pdr
                 << " sla_delay=" << m_ml.sla_delay
                 << " pdr_hinge_w=" << m_ml.pdr_hinge_w
                 << " delay_hinge_w=" << m_ml.delay_hinge_w);
@@ -1528,10 +1533,10 @@ void ZmqOpenFlowController::MlSendHello() {
 
   std::ostringstream hello;
   hello << "{\"cmd\":\"hello\","
-        << "\"arch\":\"gnn-v5\","
+        << "\"arch\":\"gnn-v6\","
         << "\"num_switches\":" << numSwitches << ","
         << "\"num_links\":" << numLinks << ","
-        << "\"node_feat_dim\":2,"
+        << "\"node_feat_dim\":4,"
         << "\"edge_feat_dim\":3,"
         << "\"link_action_dim\":" << linkActionDim << ","
         << "\"node_action_dim\":" << nodeActionDim << ","
@@ -1611,9 +1616,13 @@ std::string ZmqOpenFlowController::BuildMlStatePayload() {
             : 1.0;
     double rttNs = m_echoRttNs.count(dpid) ? m_echoRttNs.at(dpid) : 0;
 
+    bool isSleeping = m_sleepSwitches.count(dpid) > 0;
+    bool isDead = m_deadNodes.count(dpid) > 0;
     if (!firstSw) s << ",";
     s << "{\"dpid\":" << dpid << ",\"depletion\":" << (1.0 - energyFrac)
-      << ",\"echo_rtt_ns\":" << rttNs << "}";
+      << ",\"echo_rtt_ns\":" << rttNs
+      << ",\"is_sleeping\":" << (isSleeping ? "true" : "false")
+      << ",\"is_dead\":" << (isDead ? "true" : "false") << "}";
     firstSw = false;
   }
   s << "],";
@@ -1891,7 +1900,35 @@ double ZmqOpenFlowController::ComputeMlReward() {
   // multiply by 2 to push it into [0, 1] range for weight comparability.
   double balancePenalty = std::clamp(2.0 * stddevResidual, 0.0, 1.0);
 
-  // ---- 8. Route-churn penalty ----
+  // ---- 8. Min-residual lifetime penalty ----
+  //   minFrac  = min_s( residual_j_s / initial_j_s )  over non-dead energy-tracked switches
+  //   L_pen    = clamp( (threshold − minFrac) / threshold , 0, 1 )   ∈ [0, 1]
+  // Hinge fires when the least-charged non-dead switch falls below
+  // m_ml.min_residual_threshold; rises linearly to 1 at depletion, zero above
+  // the threshold. Complements balancePenalty: balance says "drain evenly",
+  // this says "keep the weakest node alive" — together they prevent both
+  // over-concentration on one node AND fast overall drain.
+  double minResidualPenalty = 0.0;
+  {
+    // Get min powered node
+    double minFrac = 1.0;
+    for (const auto& [dpid, em] : m_switchEnergyModel) {
+      if (em.initial_energy_j <= 0.0) continue;
+      if (m_deadNodes.count(dpid)) continue;
+      auto reIt = m_switchResidualEnergy.find(dpid);
+      if (reIt == m_switchResidualEnergy.end()) continue;
+      double frac = std::clamp(reIt->second / em.initial_energy_j, 0.0, 1.0);
+      if (frac < minFrac) minFrac = frac;
+    }
+    // Check if it's under the min power
+    if (minFrac < m_ml.min_residual_threshold) {
+      minResidualPenalty = std::clamp(
+          (m_ml.min_residual_threshold - minFrac) / m_ml.min_residual_threshold,
+          0.0, 1.0);
+    }
+  }
+
+  // ---- 9. Route-churn penalty ----
   //   C_pen    = clamp( ‖a_t − a_{t-1}‖₁ / (n · 2·scale) , 0, 1 )   ∈ [0, 1]
   //   (L1 action swing ÷ max possible swing; computed in ApplyDeltaCosts for
   //    action a_t, consumed here one tick later at reward for state s_{t+1})
@@ -1931,6 +1968,7 @@ double ZmqOpenFlowController::ComputeMlReward() {
                            m_ml.en_w_footprint * footprintPenalty +
                            m_ml.en_w_reserve * reserveAwarePenalty +
                            m_ml.en_w_balance * balancePenalty +
+                           m_ml.en_w_min_residual * minResidualPenalty +
                            m_ml.en_w_churn * churnPenalty;
     double baseReward = 1.0 - 2.0 * energyPenalty;  // [-1, +1]
 
@@ -1957,7 +1995,8 @@ double ZmqOpenFlowController::ComputeMlReward() {
                  << " lossHinge=" << lossHinge << " delayHinge=" << delayHinge
                  << " | p=" << powerCost << " u=" << utilPenalty
                  << " f=" << footprintPenalty << " e=" << reserveAwarePenalty
-                 << " b=" << balancePenalty << " c=" << churnPenalty
+                 << " b=" << balancePenalty << " m=" << minResidualPenalty
+                 << " c=" << churnPenalty
                  << " d=" << delayQuality << " pdr=" << pdr
                  << " | P_W=" << currPowerW
                  << " stddev=" << stddevResidual);

@@ -115,14 +115,19 @@ struct MlConfig {
   // For the ENERGY preset the reward is NOT the legacy additive sum. Delivery
   // quality (loss/delay) is treated as a constraint via a hinge, not an additive
   // offset, so the controllable energy terms below get the full [-1, 1] range.
-  // The six sub-weights form a convex combination (should sum to ~1.0); they are
+  // The seven sub-weights form a convex combination (should sum to ~1.0); they are
   // renormalised at config time if they don't.
-  double en_w_power = 0.30;      // powerCost
-  double en_w_util = 0.25;       // utilPenalty
-  double en_w_footprint = 0.20;  // footprintPenalty
-  double en_w_reserve = 0.15;    // reserveAwarePenalty
-  double en_w_balance = 0.05;    // balancePenalty
-  double en_w_churn = 0.05;      // churnPenalty
+  double en_w_power = 0.25;           // powerCost
+  double en_w_util = 0.20;            // utilPenalty
+  double en_w_footprint = 0.15;       // footprintPenalty
+  double en_w_reserve = 0.10;         // reserveAwarePenalty
+  double en_w_balance = 0.05;         // balancePenalty
+  double en_w_churn = 0.05;           // churnPenalty
+  double en_w_min_residual = 0.20;    // min-residual lifetime penalty
+  // Hinge threshold for min-residual term: fires when the least-charged
+  // non-dead switch falls below this fraction (0.0–1.0). Penalty is 0 above
+  // the threshold and rises linearly to 1.0 at depletion.
+  double min_residual_threshold = 0.20;
   // QoS hinge: penalise only when quality drops below the SLA floor. Each hinge
   // is bounded to [0, 1] in ComputeMlReward, so a degraded-but-alive network
   // gets a smooth bounded penalty instead of instantly slamming the -1 clamp

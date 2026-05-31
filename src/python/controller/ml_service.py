@@ -14,7 +14,7 @@ Architecture
 Wire protocol (JSON over ZMQ REQ/REP)
 -------------------------------------
 - `{"cmd":"hello", "arch":"gnn-v5", "num_switches":N, "num_links":L,
-    "node_feat_dim":2, "edge_feat_dim":3, "link_action_dim":L,
+    "node_feat_dim":4, "edge_feat_dim":3, "link_action_dim":L,
     "node_action_dim":0, "action_dim":L, "seed":S,
     "resume":bool, "checkpoint_every_n_ticks":K}` → `{"ok":true}`
 - `{"cmd":"observe", "tick":t, "state":{...}, "prev_reward":r,
@@ -90,7 +90,7 @@ _FEDAVG_WAIT_TIMEOUT_S = float(
 # against per-link capacity, not against magic constants, so the GNN is
 # scale-invariant across heterogeneous topologies and the trained model
 # is deployable on stock OF1.3 hardware. Old checkpoints are incompatible.
-_ARCH_TAG = "gnn-v5"
+_ARCH_TAG = "gnn-v6"
 
 # Log-scale cap for unbounded RTT telemetry. log1p(1000) ≈ 6.91 — well past
 # typical rtt_ms (~1s pathological).
@@ -99,7 +99,7 @@ _MAX_LOG_RTT = math.log1p(1000.0)
 # GNN feature dims advertised by the C++ controller. Hardcoded here as defaults
 # so the agent can still be instantiated for smoke tests; the real values come
 # from the hello payload.
-_NODE_FEAT_DIM = 2
+_NODE_FEAT_DIM = 4
 _EDGE_FEAT_DIM = 3
 
 
@@ -533,9 +533,9 @@ class LocalDDPGAgent:
 def _build_graph_data(state: dict) -> "Data":
     """Build a torch_geometric Data object from the controller's state JSON.
 
-    Expected schema (from C++ BuildMlStatePayload, gnn-v3):
+    Expected schema (from C++ BuildMlStatePayload, gnn-v6):
       state.node_index = [dpid_0, dpid_1, ...]   (frozen canonical order)
-      state.per_switch = [{dpid, depletion, echo_rtt_ns}, ...]
+      state.per_switch = [{dpid, depletion, echo_rtt_ns, is_sleeping, is_dead}, ...]
       state.per_link   = [{src, dst, tx_bps, capacity_bps, utilization, cost,
                            base_cost, delay_ms,
                            src_tx_bps, src_utilization, src_drop_rate_bps,
@@ -543,7 +543,7 @@ def _build_graph_data(state: dict) -> "Data":
       state.residual_energy_stddev = float
 
     Returns Data with:
-      x                    [N, 2]   node features: depletion, log1p(rtt_ms)/X
+      x                    [N, 4]   node features: depletion, log1p(rtt_ms)/X, is_sleeping, is_dead
       edge_index           [2, 2L]  bidirectional message-passing edges
       edge_attr            [2L, 3]  features per direction (asymmetric):
                                      [drop_norm, utilization, cost_norm]
@@ -575,6 +575,8 @@ def _build_graph_data(state: dict) -> "Data":
         rtt_norm = math.log1p(rtt_ms) / _MAX_LOG_RTT
         x[idx, 0] = float(sw.get("depletion", 0.0))
         x[idx, 1] = float(rtt_norm)
+        x[idx, 2] = 1.0 if sw.get("is_sleeping", False) else 0.0
+        x[idx, 3] = 1.0 if sw.get("is_dead", False) else 0.0
 
     per_link = state.get("per_link", []) or []
     L = len(per_link)
