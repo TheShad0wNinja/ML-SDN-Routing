@@ -271,9 +271,21 @@ start_ml_service() {
     WORKER_AGENT_DIRS[$s]="$dir"
 
     if ml_port_listening "$port"; then
-      echo "[run_tests] ML service already on :$port — reusing (slot $s, dir $dir)."
-      WORKER_ML_PIDS[$s]=""
-      continue
+      if [[ "$ML_LAYOUT" == "train" ]]; then
+        # In train mode a stale service (e.g. leftover deploy/eval run) would
+        # have the wrong fedavg dir and worker_id — kill it and start fresh.
+        local stale_pid
+        stale_pid=$(lsof -ti tcp:"$port" 2>/dev/null | head -1 || true)
+        if [[ -n "$stale_pid" ]]; then
+          echo "[run_tests] Train mode: killing stale ML service on :$port (pid $stale_pid)."
+          kill -TERM "$stale_pid" 2>/dev/null || true
+          sleep 1
+        fi
+      else
+        echo "[run_tests] ML service already on :$port — reusing (slot $s, dir $dir)."
+        WORKER_ML_PIDS[$s]=""
+        continue
+      fi
     fi
 
     # Rotate any stale metrics.csv from a previous run so summarize_log
