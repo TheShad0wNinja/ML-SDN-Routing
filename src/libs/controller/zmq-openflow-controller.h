@@ -35,6 +35,9 @@ struct PortStatsEntry {
   // Derived rates in bits/s — updated on each PORT_STATS reply
   double rx_rate_bps = 0.0, tx_rate_bps = 0.0;
 
+  // Packets deleived and arriving at a host
+  uint64_t rx_pkts_delta = 0, tx_pkts_delta = 0;
+
   // Empirical per-port drop byte-rates (delta dropped packets × avg pkt size ×
   // 8 / dt). Computed from OF1.3-standard tx_dropped / rx_dropped counters
   double rx_drop_rate_bps = 0.0, tx_drop_rate_bps = 0.0;
@@ -97,8 +100,7 @@ struct MlConfig {
       1.0;  // route-churn penalty (L1 of action-vector delta between ticks)
 
   // Normalization references
-  double delay_ref_ms = 200.0;   // ms; baseline target
-  double loss_ref_bps = 1.0e6;   // bits/s; tolerable drop budget
+  double delay_ref_ms = 50.0;    // ms; peak per-switch delay → Q_delay=0 (SLA ceiling)
   double power_ref_w = 100.0;    // watts; baseline aggregate power
 
   // Active-switch footprint threshold. A switch counts as "active" if it
@@ -121,11 +123,15 @@ struct MlConfig {
   double en_w_reserve = 0.15;    // reserveAwarePenalty
   double en_w_balance = 0.05;    // balancePenalty
   double en_w_churn = 0.05;      // churnPenalty
-  // QoS hinge: penalise only when quality drops below the SLA floor.
-  double sla_pdr = 0.99;         // lossQuality floor (delivery)
+  // QoS hinge: penalise only when quality drops below the SLA floor. Each hinge
+  // is bounded to [0, 1] in ComputeMlReward, so a degraded-but-alive network
+  // gets a smooth bounded penalty instead of instantly slamming the -1 clamp
+  // (the old slope=15 made any sub-SLA delivery saturate the floor, killing the
+  // gradient and poisoning the replay buffer with action-independent -1s).
+  double sla_pdr = 0.99;         // true PDR floor (delivery ratio)
   double sla_delay = 0.90;       // delayQuality floor
-  double pdr_hinge_w = 15.0;     // slope of the loss hinge below SLA
-  double delay_hinge_w = 5.0;    // slope of the delay hinge below SLA
+  double pdr_hinge_w = 3.0;      // slope of the PDR hinge below SLA (bounded ≤1)
+  double delay_hinge_w = 3.0;    // slope of the delay hinge below SLA (bounded ≤1)
 
   // Per-node sleep action: a node-action value above this threshold powers the
   // switch off (routed around, zero idle + forwarding power). The actor emits

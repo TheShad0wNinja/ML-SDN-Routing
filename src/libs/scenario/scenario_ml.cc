@@ -26,8 +26,6 @@ void MlOptions::Register(CommandLine& cmd) {
   cmd.AddValue("mlKappa", "Reward weight κ (route-churn penalty)", kappa);
   cmd.AddValue("mlDelayRef", "Delay reference for normalization (ms)",
                delayRefMs);
-  cmd.AddValue("mlLossRef",  "Loss reference for normalization (bps)",
-               lossRefBps);
   cmd.AddValue("mlPowerRef", "Power reference for normalization (W)",
                powerRefW);
   cmd.AddValue("mlFootprintFloorBps",
@@ -46,7 +44,7 @@ void MlOptions::Register(CommandLine& cmd) {
                enBalance);
   cmd.AddValue("mlEnChurn", "ENERGY reward sub-weight: route churn", enChurn);
   cmd.AddValue("mlSlaPdr",
-               "ENERGY QoS hinge: lossQuality floor below which loss is penalised",
+               "ENERGY QoS hinge: true-PDR floor below which delivery is penalised",
                slaPdr);
   cmd.AddValue("mlSlaDelay",
                "ENERGY QoS hinge: delayQuality floor below which delay is penalised",
@@ -104,7 +102,6 @@ MlConfig MlOptions::BuildMlConfig(uint32_t seedIn) const {
   cfg.reward_theta = theta;
   cfg.reward_kappa = kappa;
   cfg.delay_ref_ms = delayRefMs;
-  cfg.loss_ref_bps = lossRefBps;
   cfg.power_ref_w = powerRefW;
   cfg.footprint_floor_bps = footprintFloorBps;
   cfg.footprint_frac = footprintFrac;

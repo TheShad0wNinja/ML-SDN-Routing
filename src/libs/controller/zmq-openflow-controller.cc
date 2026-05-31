@@ -943,6 +943,15 @@ void ZmqOpenFlowController::HandlePortStatsReply(
               : 0.0;
       ps.rx_drop_rate_bps = dRxDrop * avgRxPktB * 8.0 / dt;
       ps.tx_drop_rate_bps = dTxDrop * avgTxPktB * 8.0 / dt;
+
+      // Stash the raw packet deltas for the true-PDR reward term. On a
+      // host-facing port these are ingress (rx, host→net) and egress (tx,
+      // net→host) packet counts for this window.
+      ps.rx_pkts_delta = dRxPkts;
+      ps.tx_pkts_delta = dTxPkts;
+    } else {
+      ps.rx_pkts_delta = 0;
+      ps.tx_pkts_delta = 0;
     }
 
     // Update snapshot for next interval
@@ -1666,25 +1675,54 @@ double ZmqOpenFlowController::ComputeMlReward() {
   if (m_switchObs.empty()) return 0.0;
 
   // ---- 1. Delay quality term (absolute, normalized) ----
-  double currDelay = 0.0;
-  uint32_t currN = 0;
+  //   d_max    = max_i d_i                          (worst per-switch M/M/1 delay)
+  //   Q_delay  = 1 − clamp( d_max / d_ref , 0, 1 )  ∈ [0, 1]   (1 = no delay)
+  // src: o.d_ms per switch, set in ComputeSwitchObservations from the OF
+  //   PORT_STATS tx-rate → utilization → M/M/1 wait proxy. No real queue
+  //   readout exists in OF1.3, so delay is inferred, not measured.
+  // why peak (not mean): congestion is local — one melting-down switch averaged
+  //   against many idle ones reads "fine". Peak surfaces the worst egress, the
+  //   honest QoS signal. d_ref is the SLA ceiling at which quality hits 0.
+  double peakDelay = 0.0;
   for (const auto& [dpid, o] : m_switchObs) {
-    if (o.d_ms > 0) {
-      currDelay += o.d_ms;
-      ++currN;
+    if (o.d_ms > peakDelay) peakDelay = o.d_ms;
+  }
+  double delayRef = std::max(1.0, m_ml.delay_ref_ms);
+  double delayQuality = 1.0 - std::clamp(peakDelay / delayRef, 0.0, 1.0);
+
+  // ---- 2. True network delivery ratio (PDR) ----
+  //   H        = { (s,p) : port p of switch s is host-facing }
+  //   pdr      = clamp( Σ_{(s,p)∈H} txΔ_{s,p} / Σ_{(s,p)∈H} rxΔ_{s,p} , 0, 1 )
+  //   (egress pkts delivered to hosts ÷ ingress pkts injected by hosts, per tick)
+  // src: rx_pkts_delta/tx_pkts_delta per port, the raw PORT_STATS packet-count
+  //   deltas for this tick. Host-facing = !IsSwitchLinkPort (a port with no
+  //   discovered LLDP neighbour). rx on such a port = host→net, tx = net→host,
+  //   so the ratio is a real network-wide delivery fraction measured at edges.
+  // how: the single delivery signal for ALL presets — the ENERGY hinge and the
+  //   legacy additive β·pdr term both read it. Replaces the old drop-byte-rate
+  //   "lossQuality" proxy, which collapsed to ~0 under any congestion even when
+  //   TCP retransmits kept end-to-end delivery near 100%. ingress==0 (no offered
+  //   load) → pdr=1 (nothing to lose).
+  double ingressPkts = 0.0, egressPkts = 0.0;
+  for (const auto& [dpid, ports] : m_portStats) {
+    for (const auto& [pno, ps] : ports) {
+      if (m_topology.IsSwitchLinkPort(dpid, pno)) continue;  // inter-switch
+      ingressPkts += static_cast<double>(ps.rx_pkts_delta);
+      egressPkts += static_cast<double>(ps.tx_pkts_delta);
     }
   }
-  double meanCurr = (currN > 0) ? (currDelay / currN) : 0.0;
-  double delayRef = std::max(1.0, m_ml.delay_ref_ms);
-  double delayQuality = 1.0 - std::clamp(meanCurr / delayRef, 0.0, 1.0);
-
-  // ---- 2. Loss quality term (absolute, normalized) ----
-  double currLoss = 0.0;
-  for (const auto& [dpid, o] : m_switchObs) currLoss += o.L_bps;
-  double lossRef = std::max(1.0, m_ml.loss_ref_bps);
-  double lossQuality = 1.0 - std::clamp(currLoss / lossRef, 0.0, 1.0);
+  double pdr = (ingressPkts > 0.0)
+                   ? std::clamp(egressPkts / ingressPkts, 0.0, 1.0)
+                   : 1.0;
 
   // ---- 3. Power-consumption penalty ----
+  //   P_W      = Σ_{s : on, tracked} [ idle_w,s + (txBps_s / 8) · e_byte,s ]
+  //   P_cost   = clamp( P_W / P_ref , 0, 1 )       ∈ [0, 1]
+  //   (slept/untracked switches contribute 0 W → powering one off is a real win)
+  // src: idle_w + e_byte from the per-switch energy model (set once at scenario
+  //   setup via SetSwitchEnergyModel); txBps from OF PORT_STATS. This is the
+  //   *instantaneous* draw recomputed each tick, separate from the running
+  //   residual-energy drain done in ComputeSwitchObservations.
   // currPower_W approximates instantaneous aggregate draw: per-switch forwarding
   // power (tx rate × per-byte cost) plus the idle draw of every powered-on
   // switch. A slept switch (node-sleep action) contributes neither, so powering
@@ -1705,6 +1743,14 @@ double ZmqOpenFlowController::ComputeMlReward() {
   double powerCost = std::clamp(currPowerW / powerRef, 0.0, 1.0);
 
   // ---- 4. Utilization penalty (mean + peak) ----
+  //   u_l      = clamp( txBps_l / cap_l , 0, 1 )   per link l
+  //   ū        = mean_l u_l ,   u_max = max_l u_l
+  //   U_pen    = { THROUGHPUT: u_max
+  //               { ENERGY    : 0.8·ū + 0.2·u_max²
+  //               { BALANCED  : 0.5·ū + 0.5·u_max     ∈ [0, 1]
+  // src: per-link txBps from OF PORT_STATS (summed over the ports of switch a
+  //   facing peer b), cap from PORT_DESC speed. Walks m_mlLinkOrder (the frozen
+  //   link list) so the per-switch txBps map built here is reused by terms 5+6.
   double utilSum = 0.0, utilPeak = 0.0;
   uint32_t utilN = 0;
   // Also accumulate per-switch tx_bps for the reserve-aware term below.
@@ -1757,6 +1803,12 @@ double ZmqOpenFlowController::ComputeMlReward() {
   }
 
   // ---- 5. Active-switch footprint penalty ----
+  //   θ_act    = max( floor_bps , frac · Σ_s txBps_s )   (dynamic active thresh)
+  //   active   = #{ s : txBps_s ≥ θ_act }
+  //   F_pen    = active / |switches|                ∈ [0, 1]  (fewer on = better)
+  // src: switchTxBps (built in term 4 from PORT_STATS) vs a load-proportional
+  //   threshold. Rewards consolidating traffic onto few switches so the rest can
+  //   sleep; the dynamic threshold keeps it meaningful under heavy global load.
   // A switch counts as "active" if it forwards more than a dynamic threshold:
   // max(footprint_floor_bps, totalTxBps * footprint_frac). The old fixed 1 kbps
   // floor was at background LLDP/ARP level, so nearly every switch always read
@@ -1774,6 +1826,12 @@ double ZmqOpenFlowController::ComputeMlReward() {
   double footprintPenalty = static_cast<double>(activeCount) / totalSw;
 
   // ---- 6. Reserve-aware traffic penalty ----
+  //   frac_s   = clamp( residual_J_s / initial_J_s , 0, 1 )   (energy left)
+  //   R_pen    = Σ_s ( txBps_s / Σ txBps ) · (1 − frac_s)²    ∈ [0, 1]
+  //   (traffic share weighted by depletion² → pushes load off low-battery sw)
+  // src: txBps share from switchTxBps (term 4); frac from m_switchResidualEnergy
+  //   ÷ initial (residual is drained each tick in ComputeSwitchObservations).
+  //   Unlike footprint, this cares WHICH switches carry load, not how many.
   // For each switch, share_of_total_tx · (1 - residual_frac)². Quadratic
   // in (1 - residual_frac) so the penalty is near-zero for fresh switches
   // and spikes sharply for nearly-depleted ones. Drives traffic AWAY from
@@ -1797,6 +1855,11 @@ double ZmqOpenFlowController::ComputeMlReward() {
   }
 
   // ---- 7. Residual-energy variance (balance term) ----
+  //   σ        = stddev_s( frac_s )                 over energy-tracked switches
+  //   B_pen    = clamp( 2σ , 0, 1 )                 ∈ [0, 1]  (low = even drain)
+  // src: ComputeResidualEnergyStddev over residual/initial fracs. Term 6 says
+  //   "avoid the weak"; this says "drain everyone evenly" — together they spread
+  //   wear so no single battery dies far ahead of the rest.
   // stddev across all energy-tracked switches. Low stddev = even depletion;
   // forces the agent to round-robin its high-traffic paths over time.
   double stddevResidual = ComputeResidualEnergyStddev();
@@ -1805,6 +1868,11 @@ double ZmqOpenFlowController::ComputeMlReward() {
   double balancePenalty = std::clamp(2.0 * stddevResidual, 0.0, 1.0);
 
   // ---- 8. Route-churn penalty ----
+  //   C_pen    = clamp( ‖a_t − a_{t-1}‖₁ / (n · 2·scale) , 0, 1 )   ∈ [0, 1]
+  //   (L1 action swing ÷ max possible swing; computed in ApplyDeltaCosts for
+  //    action a_t, consumed here one tick later at reward for state s_{t+1})
+  // src: m_lastChurnNorm — the only term sourced from the AGENT's action, not
+  //   network telemetry. Penalises thrashing the link costs tick-to-tick.
   // Antidote for the "TCP exploit" — rapid action swings cause out-of-order
   // packets, TCP halves cwnd, and aggregate utilization/loss/power all drop,
   // which the other terms would otherwise *reward*. m_lastChurnNorm was
@@ -1816,6 +1884,17 @@ double ZmqOpenFlowController::ComputeMlReward() {
   double R_norm;
 
   if (m_ml.priority_preset == MlConfig::MlPriority::ENERGY) {
+    // ---- ENERGY combine (gated/hinged) ----
+    //   E_pen  = w_p·P_cost + w_u·U_pen + w_f·F_pen
+    //          + w_r·R_pen + w_b·B_pen + w_c·C_pen     ∈ [0,1]  (Σw = 1)
+    //   base   = 1 − 2·E_pen                            ∈ [−1, +1]
+    //   h_loss = min(1, max(0, sla_pdr   − pdr)     · w_pdr)    ∈ [0, 1]
+    //   h_del  = min(1, max(0, sla_delay − Q_delay) · w_delay)  ∈ [0, 1]
+    //   R      = clamp( base − h_loss − h_del , −1, +1 )
+    // how: energy terms (the levers the agent controls) set the score; delivery
+    //   is a one-sided GATE, not an additive goal — it contributes 0 while the
+    //   net meets SLA and only subtracts when pdr/delay fall below floor. Keeps
+    //   the whole gradient on energy in the common (healthy) case.
     // Gated/hinged energy reward. The controllable energy terms form a convex
     // combination (en_w_* renormalised to sum 1.0 in SetMlConfig), so the
     // energy penalty is in [0, 1] and base_reward spans the full [-1, +1].
@@ -1831,12 +1910,20 @@ double ZmqOpenFlowController::ComputeMlReward() {
                            m_ml.en_w_churn * churnPenalty;
     double baseReward = 1.0 - 2.0 * energyPenalty;  // [-1, +1]
 
-    double lossHinge = (lossQuality >= m_ml.sla_pdr)
-                           ? 0.0
-                           : (m_ml.sla_pdr - lossQuality) * m_ml.pdr_hinge_w;
-    double delayHinge = (delayQuality >= m_ml.sla_delay)
-                            ? 0.0
-                            : (m_ml.sla_delay - delayQuality) * m_ml.delay_hinge_w;
+    // One-sided SLA hinges on TRUE delivery (pdr) and the delay proxy. Each is
+    // bounded to [0, 1] so a degraded-but-alive network gets a smooth, bounded
+    // penalty (gradient stays alive) instead of saturating baseReward to the
+    // -1 floor. Only a genuinely collapsing network (both hinges maxed on top
+    // of a bad baseReward) reaches -1.
+    double lossHinge =
+        (pdr >= m_ml.sla_pdr)
+            ? 0.0
+            : std::min(1.0, (m_ml.sla_pdr - pdr) * m_ml.pdr_hinge_w);
+    double delayHinge =
+        (delayQuality >= m_ml.sla_delay)
+            ? 0.0
+            : std::min(1.0,
+                       (m_ml.sla_delay - delayQuality) * m_ml.delay_hinge_w);
 
     R_norm = std::clamp(baseReward - lossHinge - delayHinge, -1.0, 1.0);
 
@@ -1847,13 +1934,23 @@ double ZmqOpenFlowController::ComputeMlReward() {
                  << " | p=" << powerCost << " u=" << utilPenalty
                  << " f=" << footprintPenalty << " e=" << reserveAwarePenalty
                  << " b=" << balancePenalty << " c=" << churnPenalty
-                 << " d=" << delayQuality << " l=" << lossQuality
-                 << " | P_W=" << currPowerW << " stddev=" << stddevResidual);
+                 << " d=" << delayQuality << " pdr=" << pdr
+                 << " | P_W=" << currPowerW
+                 << " stddev=" << stddevResidual);
     return R_norm;
   }
 
-  // Legacy additive reward for BALANCED / THROUGHPUT / CUSTOM.
-  double R = m_ml.reward_alpha * delayQuality + m_ml.reward_beta * lossQuality -
+  // ---- Legacy additive combine (BALANCED / THROUGHPUT / CUSTOM) ----
+  //   R      = α·Q_delay + β·pdr − γ·P_cost − δ·U_pen
+  //          − ζ·F_pen − η·R_pen − θ·B_pen − κ·C_pen
+  //   R_max  =  α + β            (all positive terms = 1, all penalties = 0)
+  //   R_min  = −(γ+δ+ζ+η+θ+κ)    (all penalties = 1, quality terms = 0)
+  //   R_norm = 2·(R − R_min)/(R_max − R_min) − 1     affine bijection → [−1, +1]
+  // how: ACTIVE path for the BALANCED/THROUGHPUT/CUSTOM presets (not dead code —
+  //   only ENERGY takes the branch above). Every term is additive and weighted
+  //   by the per-preset α…κ set in SetMlConfig; delivery here IS a goal (β·pdr
+  //   adds in), the opposite of the energy gate. Affine rescale, no clamp needed.
+  double R = m_ml.reward_alpha * delayQuality + m_ml.reward_beta * pdr -
              m_ml.reward_gamma * powerCost - m_ml.reward_delta * utilPenalty -
              m_ml.reward_zeta * footprintPenalty -
              m_ml.reward_eta * reserveAwarePenalty -
@@ -1886,7 +1983,7 @@ double ZmqOpenFlowController::ComputeMlReward() {
 
   NS_LOG_DEBUG("[ML] reward tick="
                << m_mlTick << " R=" << R << " R_norm=" << R_norm << " d="
-               << delayQuality << " l=" << lossQuality << " p=" << powerCost
+               << delayQuality << " pdr=" << pdr << " p=" << powerCost
                << " u=" << utilPenalty << " f=" << footprintPenalty
                << " e=" << reserveAwarePenalty << " b=" << balancePenalty
                << " c=" << churnPenalty << " | P_W=" << currPowerW

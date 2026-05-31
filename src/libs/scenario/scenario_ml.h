@@ -19,7 +19,7 @@ struct MlOptions {
   std::string priority = "balanced";
   double alpha = 1.0, beta = 2.0, gamma = 1.5, delta = 1.0;
   double zeta = 0.5, eta = 1.5, theta = 1.0, kappa = 1.0;
-  double delayRefMs = 200.0, lossRefBps = 1.0e6, powerRefW = 100.0;
+  double delayRefMs = 50.0, powerRefW = 100.0;
   // Active-switch footprint threshold: max(floor, totalTxBps * frac).
   double footprintFloorBps = 50000.0, footprintFrac = 0.005;
   // ENERGY gated-reward shaping: convex energy sub-weights + QoS hinge.
