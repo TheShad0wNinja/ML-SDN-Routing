@@ -135,8 +135,10 @@ struct MlConfig {
 
   // Per-node sleep action: a node-action value above this threshold powers the
   // switch off (routed around, zero idle + forwarding power). The actor emits
-  // tanh outputs in [-1, 1], so 0.5 means "clearly wants it off".
-  double sleep_threshold = 0.5;
+  // Consecutive idle ticks (data traffic below the footprint threshold) before
+  // a switch is labelled asleep by the inactivity heuristic. Waking is
+  // immediate on any traffic, so this only gates the sleep direction.
+  uint32_t sleep_idle_ticks = 3;
 
   // ML Priority preset for reward weights
   enum MlPriority { BALANCED, THROUGHPUT, ENERGY, CUSTOM };
@@ -282,7 +284,7 @@ class ZmqOpenFlowController : public OFSwitch13Controller {
 
   void RecomputeAllRoutes();
   void RebuildSpanningTree();
-  // Recompute the topology's blocked set (slept ∪ dead) and every structure
+  // Recompute the topology's blocked set (dead nodes) and every structure
   // derived from it: spanning tree, flood groups, and unicast routes.
   void UpdateBlockedNodes();
 
@@ -308,11 +310,13 @@ class ZmqOpenFlowController : public OFSwitch13Controller {
   double CurrentActionScale() const;
   // Applies the model new link weight deltas
   void ApplyDeltaCosts(const std::vector<double>& deltas);
-  // Applies the per-node sleep action (one value per m_mlNodeOrder entry). A
-  // value above m_ml.sleep_threshold powers the switch off, unless it is in
-  // m_nonSleepable (articulation point or host-bearing). Updates m_sleepSwitches
-  // and the topology's blocked set, then recomputes routes.
-  void ApplySleepActions(const std::vector<double>& nodeVals);
+  // Deterministic inactivity heuristic (replaces the old policy-driven sleep).
+  // A switch carrying data traffic below the footprint threshold for
+  // m_ml.sleep_idle_ticks consecutive ticks is labelled asleep (idle power no
+  // longer counted); the first tick it carries traffic again it is woken.
+  // Host-bearing switches (m_nonSleepable) and dead nodes are never slept.
+  // Sleep is a passive energy label — it does NOT block routing or flooding.
+  void UpdateSleepStates();
 
   // Constants
   static constexpr uint32_t kMaxLldpProbe =
@@ -373,10 +377,14 @@ class ZmqOpenFlowController : public OFSwitch13Controller {
   // Energy Model
   std::unordered_map<uint64_t, SwitchEnergyModel> m_switchEnergyModel; // Dpid -> energy model
   std::unordered_map<uint64_t, double> m_switchResidualEnergy; // Dpid -> Remaining energy
-  // Switches the ML agent has powered off (node-sleep action). A slept switch
-  // draws no idle power, forwards no traffic, and is routed around. Never
-  // contains a non-sleepable switch. Empty unless the action is in use.
+  // Switches the inactivity heuristic has labelled asleep. A slept switch draws
+  // no idle power (energy drain + power-cost reward both skip it) but is NOT
+  // blocked: routing/flooding are untouched, it simply happens to carry no
+  // traffic. Never contains a non-sleepable switch. See UpdateSleepStates.
   std::set<uint64_t> m_sleepSwitches;
+  // Per-switch consecutive-idle-tick counter feeding the sleep heuristic. Reset
+  // to 0 the moment a switch carries traffic.
+  std::unordered_map<uint64_t, uint32_t> m_idleTicks;
   // Switches that have died (residual energy depleted to zero). Like slept
   // switches they are blocked from routing and flooding, but involuntarily and
   // permanently — they never wake. Drives the IoT battery-drain crisis.

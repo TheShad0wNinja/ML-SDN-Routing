@@ -51,10 +51,10 @@ void MlOptions::Register(CommandLine& cmd) {
                slaDelay);
   cmd.AddValue("mlPdrHingeW", "ENERGY QoS hinge slope for loss", pdrHingeW);
   cmd.AddValue("mlDelayHingeW", "ENERGY QoS hinge slope for delay", delayHingeW);
-  cmd.AddValue("mlSleepThreshold",
-               "Node-sleep action threshold: node value above this powers a "
-               "switch off (routed around, zero idle+forwarding power)",
-               sleepThreshold);
+  cmd.AddValue("mlSleepIdleTicks",
+               "Consecutive idle ticks (data traffic below the footprint "
+               "threshold) before a switch is labelled asleep (zero idle power)",
+               sleepIdleTicks);
   cmd.AddValue("mlExplore",
                "Enable Gaussian action noise", explore);
   cmd.AddValue("mlLearn",
@@ -115,7 +115,7 @@ MlConfig MlOptions::BuildMlConfig(uint32_t seedIn) const {
   cfg.sla_delay = slaDelay;
   cfg.pdr_hinge_w = pdrHingeW;
   cfg.delay_hinge_w = delayHingeW;
-  cfg.sleep_threshold = sleepThreshold;
+  cfg.sleep_idle_ticks = sleepIdleTicks;
   cfg.explore = explore;
   cfg.learn = learn;
   cfg.checkpoint_every_n_ticks = checkpointEveryNTicks;

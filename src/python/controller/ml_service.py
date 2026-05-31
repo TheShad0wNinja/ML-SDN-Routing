@@ -13,14 +13,14 @@ Architecture
 
 Wire protocol (JSON over ZMQ REQ/REP)
 -------------------------------------
-- `{"cmd":"hello", "arch":"gnn-v4", "num_switches":N, "num_links":L,
+- `{"cmd":"hello", "arch":"gnn-v5", "num_switches":N, "num_links":L,
     "node_feat_dim":2, "edge_feat_dim":3, "link_action_dim":L,
-    "node_action_dim":N, "action_dim":L+N, "seed":S,
+    "node_action_dim":0, "action_dim":L, "seed":S,
     "resume":bool, "checkpoint_every_n_ticks":K}` → `{"ok":true}`
 - `{"cmd":"observe", "tick":t, "state":{...}, "prev_reward":r,
-    "explore":bool}` → `{"action":[float * (L+N)]}`
-    The action vector is [edge cost-deltas (L) ‖ node sleep-values (N)]; C++
-    splits on link_action_dim / node_action_dim.
+    "explore":bool}` → `{"action":[float * L]}`
+    The action vector is the per-edge cost-deltas (L). Node sleep is no longer a
+    policy output — the C++ controller drives it from an inactivity heuristic.
 - `{"cmd":"get_weights"}` → `{"weights":{name: list, ...}}`   (federation hook)
 - `{"cmd":"set_weights", "weights":{...}}` → `{"ok":true}`     (federation hook)
 
@@ -90,7 +90,7 @@ _FEDAVG_WAIT_TIMEOUT_S = float(
 # against per-link capacity, not against magic constants, so the GNN is
 # scale-invariant across heterogeneous topologies and the trained model
 # is deployable on stock OF1.3 hardware. Old checkpoints are incompatible.
-_ARCH_TAG = "gnn-v4"
+_ARCH_TAG = "gnn-v5"
 
 # Log-scale cap for unbounded RTT telemetry. log1p(1000) ≈ 6.91 — well past
 # typical rtt_ms (~1s pathological).
@@ -110,20 +110,17 @@ _EDGE_FEAT_DIM = 3
 if _HAS_TORCH:
 
     class _Actor(nn.Module):
-        """Two-layer GATv2 encoder + per-edge head + per-node head.
+        """Two-layer GATv2 encoder + per-edge head.
 
-        Two action streams share the GAT encoder:
-          * edge stream — one action per canonical edge [E_total]: the per-link
-            cost delta (the original action).
-          * node stream — one action per node [N_total]: the per-switch sleep
-            propensity. C++ thresholds tanh(node) to power switches off.
+        One action stream: the edge stream — one action per canonical edge
+        [E_total], the per-link cost delta. (Node sleep was removed; it's now a
+        deterministic inactivity heuristic on the C++ side.)
 
-        forward() returns (edge_action, edge_logits, node_action, node_logits).
-        action = tanh(logits); the raw pre-tanh logits are exposed so the
-        saturation regulariser in train_step can penalise their magnitude (once
-        tanh saturates to +/-1 its derivative ~0 and no signal can pull it back).
-        For the wire the caller concatenates [edge_action ‖ node_action], which
-        matches the action_dim = L + N the C++ side expects.
+        forward() returns (edge_action, edge_logits). action = tanh(logits); the
+        raw pre-tanh logits are exposed so the saturation regulariser in
+        train_step can penalise their magnitude (once tanh saturates to +/-1 its
+        derivative ~0 and no signal can pull it back). The wire action is just
+        edge_action, matching action_dim = L on the C++ side.
         """
 
         def __init__(self, node_dim: int = _NODE_FEAT_DIM,
@@ -144,12 +141,6 @@ if _HAS_TORCH:
                 nn.ReLU(),
                 nn.Linear(hidden, 1),
             )
-            # Per-node sleep head off the same encoder embeddings.
-            self.node_head = nn.Sequential(
-                nn.Linear(hidden, hidden),
-                nn.ReLU(),
-                nn.Linear(hidden, 1),
-            )
 
         def forward(self, data):
             h = F.relu(self.ln1(self.gat1(data.x, data.edge_index, data.edge_attr)))
@@ -157,9 +148,7 @@ if _HAS_TORCH:
             src, dst = data.canonical_edge_index  # each [E_total]
             feats = torch.cat([h[src], h[dst], data.canonical_edge_attr], dim=-1)
             edge_logits = self.head(feats).squeeze(-1)
-            node_logits = self.node_head(h).squeeze(-1)  # [N_total]
-            return (torch.tanh(edge_logits), edge_logits,
-                    torch.tanh(node_logits), node_logits)
+            return torch.tanh(edge_logits), edge_logits
 
     class _Critic(nn.Module):
         """Two-layer GATv2 encoder + per-edge MLP + mean-edge pooling.
@@ -186,32 +175,23 @@ if _HAS_TORCH:
                 nn.ReLU(),
                 nn.Linear(hidden, hidden),
             )
-            # per-node Q contribution: [h_node ‖ node_action]
-            self.node_head = nn.Sequential(
-                nn.Linear(hidden + 1, hidden),
-                nn.ReLU(),
-                nn.Linear(hidden, hidden),
-            )
-            # global head: [pooled_edges ‖ pooled_nodes ‖ u] → scalar Q
+            # global head: [pooled_edges ‖ u] → scalar Q
             self.global_head = nn.Sequential(
-                nn.Linear(2 * hidden + 1, hidden),
+                nn.Linear(hidden + 1, hidden),
                 nn.ReLU(),
                 nn.Linear(hidden, 1),
             )
 
-        def forward(self, data, edge_action: torch.Tensor,
-                    node_action: torch.Tensor) -> torch.Tensor:
+        def forward(self, data, edge_action: torch.Tensor) -> torch.Tensor:
             h = F.relu(self.ln1(self.gat1(data.x, data.edge_index, data.edge_attr)))
             h = F.relu(self.ln2(self.gat2(h,      data.edge_index, data.edge_attr)))
             src, dst = data.canonical_edge_index
             feats = torch.cat([h[src], h[dst], data.canonical_edge_attr,
                                edge_action.unsqueeze(-1)], dim=-1)
             edge_repr = self.edge_head(feats)  # [E_total, hidden]
-            node_repr = self.node_head(
-                torch.cat([h, node_action.unsqueeze(-1)], dim=-1))  # [N_total, hidden]
 
-            # Mean-pool edges and nodes per graph. For an unbatched single-graph
-            # call data.batch is None, so we pool the whole thing.
+            # Mean-pool edges per graph. For an unbatched single-graph call
+            # data.batch is None, so we pool the whole thing.
             if getattr(data, "batch", None) is not None:
                 # Map each canonical edge to its graph via its source node.
                 edge_to_graph = data.batch[src]  # [E_total]
@@ -225,24 +205,13 @@ if _HAS_TORCH:
                     0, edge_to_graph,
                     torch.ones_like(edge_to_graph, dtype=edge_repr.dtype))
                 pooled_e = pooled_e / ecounts.clamp_min(1.0).unsqueeze(-1)
-                # Nodes map to graphs directly via data.batch.
-                pooled_n = torch.zeros(num_graphs, node_repr.size(1),
-                                       device=node_repr.device, dtype=node_repr.dtype)
-                pooled_n.index_add_(0, data.batch, node_repr)
-                ncounts = torch.zeros(num_graphs, device=node_repr.device,
-                                      dtype=node_repr.dtype)
-                ncounts.index_add_(
-                    0, data.batch,
-                    torch.ones_like(data.batch, dtype=node_repr.dtype))
-                pooled_n = pooled_n / ncounts.clamp_min(1.0).unsqueeze(-1)
                 u = data.u.view(num_graphs, 1)
             else:
                 pooled_e = edge_repr.mean(dim=0, keepdim=True)  # [1, hidden]
-                pooled_n = node_repr.mean(dim=0, keepdim=True)  # [1, hidden]
                 u = data.u.view(1, 1)
 
             return self.global_head(
-                torch.cat([pooled_e, pooled_n, u], dim=-1)).squeeze(-1)
+                torch.cat([pooled_e, u], dim=-1)).squeeze(-1)
 
 
 class LocalDDPGAgent:
@@ -339,34 +308,23 @@ class LocalDDPGAgent:
         s, a, r, s2 = zip(*batch)
         s_batch = Batch.from_data_list(list(s))
         s2_batch = Batch.from_data_list(list(s2))
-        # The stored action is the flat wire vector [edge_deltas (L) ‖ node (N)].
-        # PyG's Batch concatenates edges and nodes separately (each in list
-        # order), so we split each sample's action into its edge part and node
-        # part and concatenate them in the same per-stream order. N is the node
-        # count of the state graph; the node part is the last N entries.
-        edge_parts, node_parts = [], []
-        for si, ai in zip(s, a):
-            n_i = int(si.x.shape[0])
-            if n_i > 0:
-                edge_parts.append(ai[:-n_i])
-                node_parts.append(ai[-n_i:])
-            else:
-                edge_parts.append(ai)
-                node_parts.append(ai[:0])
-        edge_a = torch.from_numpy(np.concatenate(edge_parts, axis=0))
-        node_a = torch.from_numpy(np.concatenate(node_parts, axis=0))
+        # The stored action is the flat wire vector [edge_deltas (L)] — one entry
+        # per canonical edge. PyG's Batch concatenates edges in list order, so a
+        # plain concatenation of the per-sample actions lines up with the batched
+        # canonical_edge_index.
+        edge_a = torch.from_numpy(np.concatenate(list(a), axis=0))
         r_tensor = torch.tensor(r, dtype=torch.float32).unsqueeze(-1)
-        return s_batch, edge_a, node_a, r_tensor, s2_batch
+        return s_batch, edge_a, r_tensor, s2_batch
 
     def train_step(self):
         if len(self.replay) < max(self.warmup, self.batch_size):
             return None, None
 
-        s, edge_a, node_a, r, s2 = self._sample()
+        s, edge_a, r, s2 = self._sample()
         with torch.no_grad():
-            e2, _, n2, _ = self.actor_target(s2)
-            q_target = r + self.gamma * self.critic_target(s2, e2, n2).unsqueeze(-1)
-        q = self.critic(s, edge_a, node_a).unsqueeze(-1)
+            e2, _ = self.actor_target(s2)
+            q_target = r + self.gamma * self.critic_target(s2, e2).unsqueeze(-1)
+        q = self.critic(s, edge_a).unsqueeze(-1)
         critic_loss = F.mse_loss(q, q_target)
         self.critic_opt.zero_grad()
         critic_loss.backward()
@@ -381,11 +339,11 @@ class LocalDDPGAgent:
         #              after long training runs. Without this term, once the
         #              actor saturates to +/-1 the tanh derivative is ~0 and
         #              no further signal can pull it back.
-        edge_act, edge_logits, node_act, node_logits = self.actor(s)
-        q_loss = -self.critic(s, edge_act, node_act).mean()
-        # Anti-collapse regularisers span both action streams.
-        action = torch.cat([edge_act, node_act], dim=0)
-        logits = torch.cat([edge_logits, node_logits], dim=0)
+        edge_act, edge_logits = self.actor(s)
+        q_loss = -self.critic(s, edge_act).mean()
+        # Anti-collapse regularisers over the edge action stream.
+        action = edge_act
+        logits = edge_logits
         var_term = -self._var_weight * action.var(dim=0).mean()
         sat_term = self._sat_weight * (logits ** 2).mean()
         actor_loss = q_loss + var_term + sat_term
@@ -427,14 +385,13 @@ class LocalDDPGAgent:
     # Acting
     # ------------------------------------------------------------------
     def act(self, data: "Data", explore: bool = True) -> "np.ndarray":
-        """Return the flat wire action [edge_deltas (L) ‖ node_sleep (N)] for a
-        single graph — matching the action_dim = L + N the C++ side expects."""
+        """Return the flat wire action [edge_deltas (L)] for a single graph —
+        matching the action_dim = L the C++ side expects."""
         with torch.no_grad():
             # Wrap into a batch-of-one so downstream code can stay uniform.
             batch = Batch.from_data_list([data])
-            edge_act, _, node_act, _ = self.actor(batch)
-            a = torch.cat([edge_act, node_act], dim=0).cpu().numpy().astype(
-                np.float32)
+            edge_act, _ = self.actor(batch)
+            a = edge_act.cpu().numpy().astype(np.float32)
 
         if explore:
             noise = np.random.normal(0.0, self._noise_sigma,

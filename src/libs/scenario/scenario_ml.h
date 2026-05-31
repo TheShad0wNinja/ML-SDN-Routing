@@ -26,8 +26,8 @@ struct MlOptions {
   double enPower = 0.30, enUtil = 0.25, enFootprint = 0.20;
   double enReserve = 0.15, enBalance = 0.05, enChurn = 0.05;
   double slaPdr = 0.99, slaDelay = 0.90, pdrHingeW = 15.0, delayHingeW = 5.0;
-  // Per-node sleep action: node-action value above this powers a switch off.
-  double sleepThreshold = 0.5;
+  // Inactivity sleep: consecutive idle ticks before a switch is labelled asleep.
+  uint32_t sleepIdleTicks = 3;
   bool explore = true;
   bool learn = true;
   uint32_t checkpointEveryNTicks = 60;

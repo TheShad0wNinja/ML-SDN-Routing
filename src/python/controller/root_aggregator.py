@@ -41,7 +41,7 @@ import torch
 
 _WORKER_RE = re.compile(r"^worker_(\d+)_round_(\d+)\.pt$")
 _GLOBAL_RE = re.compile(r"^global_round_(\d+)\.pt$")
-_ARCH_TAG_DEFAULT = "gnn-v4"
+_ARCH_TAG_DEFAULT = "gnn-v5"
 
 
 def _find_workers_for_round(d: str, r: int) -> dict[int, str]:

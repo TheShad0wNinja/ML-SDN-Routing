@@ -1512,16 +1512,16 @@ void ZmqOpenFlowController::MlSendHello() {
   // payload shape at runtime. action_dim still maps 1:1 to m_mlLinkOrder.
   size_t numSwitches = m_mlNodeOrder.size();
   size_t numLinks = m_mlLinkOrder.size();
-  // Action vector is [link_deltas (L) ‖ node_sleep (N)]. The first L entries are
-  // per-link cost deltas (consumed by ApplyDeltaCosts); the last N are per-node
-  // sleep values (consumed by ApplySleepActions). Python splits on these dims.
+  // Action vector is link cost deltas only (length L). Node sleep is no longer
+  // a policy output — it's driven by the inactivity heuristic
+  // (UpdateSleepStates) on the C++ side — so node_action_dim is 0.
   size_t linkActionDim = numLinks;
-  size_t nodeActionDim = numSwitches;
+  size_t nodeActionDim = 0;
   size_t actionDim = linkActionDim + nodeActionDim;
 
   std::ostringstream hello;
   hello << "{\"cmd\":\"hello\","
-        << "\"arch\":\"gnn-v4\","
+        << "\"arch\":\"gnn-v5\","
         << "\"num_switches\":" << numSwitches << ","
         << "\"num_links\":" << numLinks << ","
         << "\"node_feat_dim\":2,"
@@ -1674,20 +1674,18 @@ std::string ZmqOpenFlowController::BuildMlStatePayload() {
 double ZmqOpenFlowController::ComputeMlReward() {
   if (m_switchObs.empty()) return 0.0;
 
-  // ---- 1. Delay quality term (absolute, normalized) ----
-  //   d_max    = max_i d_i                          (worst per-switch M/M/1 delay)
-  //   Q_delay  = 1 − clamp( d_max / d_ref , 0, 1 )  ∈ [0, 1]   (1 = no delay)
+  // ---- 1. Switch Delay quality term (absolute, normalized) ----
   // src: o.d_ms per switch, set in ComputeSwitchObservations from the OF
   //   PORT_STATS tx-rate → utilization → M/M/1 wait proxy. No real queue
   //   readout exists in OF1.3, so delay is inferred, not measured.
-  // why peak (not mean): congestion is local — one melting-down switch averaged
-  //   against many idle ones reads "fine". Peak surfaces the worst egress, the
-  //   honest QoS signal. d_ref is the SLA ceiling at which quality hits 0.
+  // Get the peak Switch Delay
   double peakDelay = 0.0;
   for (const auto& [dpid, o] : m_switchObs) {
     if (o.d_ms > peakDelay) peakDelay = o.d_ms;
   }
+  // Ensure peak ref has a minimum of 1ms and is our max delay
   double delayRef = std::max(1.0, m_ml.delay_ref_ms);
+  // Assign penalty based on how close peakDelay is to max delay ref
   double delayQuality = 1.0 - std::clamp(peakDelay / delayRef, 0.0, 1.0);
 
   // ---- 2. True network delivery ratio (PDR) ----
@@ -1703,6 +1701,7 @@ double ZmqOpenFlowController::ComputeMlReward() {
   //   "lossQuality" proxy, which collapsed to ~0 under any congestion even when
   //   TCP retransmits kept end-to-end delivery near 100%. ingress==0 (no offered
   //   load) → pdr=1 (nothing to lose).
+  // Compute total host ingress * eggress pkts
   double ingressPkts = 0.0, egressPkts = 0.0;
   for (const auto& [dpid, ports] : m_portStats) {
     for (const auto& [pno, ps] : ports) {
@@ -1711,6 +1710,7 @@ double ZmqOpenFlowController::ComputeMlReward() {
       egressPkts += static_cast<double>(ps.tx_pkts_delta);
     }
   }
+  // Calculated pdr using sent to host / received from host
   double pdr = (ingressPkts > 0.0)
                    ? std::clamp(egressPkts / ingressPkts, 0.0, 1.0)
                    : 1.0;
@@ -1727,11 +1727,14 @@ double ZmqOpenFlowController::ComputeMlReward() {
   // power (tx rate × per-byte cost) plus the idle draw of every powered-on
   // switch. A slept switch (node-sleep action) contributes neither, so powering
   // it off is a real reward win. Switches without an energy model contribute 0.
+  // Calculate how much total power has been used since the last second / ml tick
   double currPowerW = 0.0;
   for (const auto& [dpid, em] : m_switchEnergyModel) {
-    if (em.initial_energy_j <= 0) continue;
-    if (m_sleepSwitches.count(dpid)) continue;  // powered off → 0 W
-    currPowerW += em.idle_power_w;
+    if (em.initial_energy_j <= 0) continue; // Skip dead nodes
+    if (m_sleepSwitches.count(dpid)) continue;  // Skip sleeping nodes
+    currPowerW += em.idle_power_w; // Accumulate total energy 
+
+    // Calcaulate energy consumed due to transmission
     auto psIt = m_portStats.find(dpid);
     if (psIt == m_portStats.end()) continue;
     double txBps = 0.0;
@@ -1739,7 +1742,9 @@ double ZmqOpenFlowController::ComputeMlReward() {
     // power_W = bytes/s × J/byte = J/s = W.
     currPowerW += (txBps / 8.0) * em.energy_per_byte_j;
   }
+  // Ensure the power ref (Max allowed power) is atleast 1W
   double powerRef = std::max(1.0, m_ml.power_ref_w);
+  // Calculate cost by seeing how close current is compared to max
   double powerCost = std::clamp(currPowerW / powerRef, 0.0, 1.0);
 
   // ---- 4. Utilization penalty (mean + peak) ----
@@ -2092,44 +2097,64 @@ void ZmqOpenFlowController::ApplyDeltaCosts(const std::vector<double>& deltas) {
   if (anyChanged) RecomputeAllRoutes();
 }
 
-void ZmqOpenFlowController::ApplySleepActions(
-    const std::vector<double>& nodeVals) {
-  if (nodeVals.empty()) return;
-  size_t n = std::min(nodeVals.size(), m_mlNodeOrder.size());
-
-  std::set<uint64_t> newSleep;
-  uint32_t masked = 0;
-  for (size_t i = 0; i < n; ++i) {
-    if (nodeVals[i] <= m_ml.sleep_threshold) continue;
-    uint64_t dpid = m_mlNodeOrder[i];
-    // Hard mask: an articulation point or host-bearing switch can never sleep,
-    // regardless of what the policy requests — sleeping it would partition the
-    // network or strand a host.
-    if (m_nonSleepable.count(dpid)) {
-      ++masked;
-      continue;
-    }
-    newSleep.insert(dpid);
+void ZmqOpenFlowController::UpdateSleepStates() {
+  // Per-switch forwarded data rate (sum of port tx rates) and the global total.
+  std::unordered_map<uint64_t, double> switchTxBps;
+  double totalTxBps = 0.0;
+  for (const auto& [dpid, ports] : m_portStats) {
+    double txBps = 0.0;
+    for (const auto& [pno, ps] : ports) txBps += ps.tx_rate_bps;
+    switchTxBps[dpid] = txBps;
+    totalTxBps += txBps;
   }
 
-  if (newSleep == m_sleepSwitches) return;  // nothing changed this tick
+  // Same dynamic threshold the footprint reward term uses: its floor sits above
+  // LLDP/echo/ARP background, so control-plane chatter never counts as traffic.
+  double idleThreshold =
+      std::max(m_ml.footprint_floor_bps, totalTxBps * m_ml.footprint_frac);
 
-  NS_LOG_INFO("[ML-SLEEP] tick=" << m_mlTick << " asleep=" << newSleep.size()
-                                 << " (was " << m_sleepSwitches.size()
-                                 << ", masked=" << masked << ")");
-  m_sleepSwitches = std::move(newSleep);
-  // Route AND flood around the powered-off switches: this rebuilds the
-  // blocked-node set, the spanning tree, the flood groups, and the routing
-  // table together so broadcast/ARP never reaches a slept node.
-  UpdateBlockedNodes();
+  size_t before = m_sleepSwitches.size();
+  for (const auto& [dpid, sw] : m_switchMap) {
+    // Host-bearing switches can't physically power off; dead nodes are already
+    // gone. Neither is ever labelled asleep.
+    if (m_nonSleepable.count(dpid) || m_deadNodes.count(dpid)) {
+      m_idleTicks.erase(dpid);
+      m_sleepSwitches.erase(dpid);
+      continue;
+    }
+    double txBps = 0.0;
+    auto it = switchTxBps.find(dpid);
+    if (it != switchTxBps.end()) txBps = it->second;
+
+    if (txBps >= idleThreshold) {
+      // Carrying traffic: wake immediately and reset the idle counter.
+      m_idleTicks[dpid] = 0;
+      if (m_sleepSwitches.erase(dpid)) {
+        NS_LOG_INFO("[SLEEP-WAKE] tick=" << m_mlTick << " dpid=" << dpid
+                                         << " txBps=" << txBps);
+      }
+    } else {
+      // Idle: accrue ticks; sleep once the hysteresis window is reached.
+      uint32_t ticks = ++m_idleTicks[dpid];
+      if (ticks >= m_ml.sleep_idle_ticks && m_sleepSwitches.insert(dpid).second) {
+        NS_LOG_INFO("[SLEEP] tick=" << m_mlTick << " dpid=" << dpid
+                                    << " idleTicks=" << ticks);
+      }
+    }
+  }
+  if (m_sleepSwitches.size() != before) {
+    NS_LOG_INFO("[SLEEP] tick=" << m_mlTick << " asleep="
+                                << m_sleepSwitches.size() << " (was " << before
+                                << ")");
+  }
 }
 
-// Single owner of the topology's blocked set = slept ∪ dead. Recomputes every
-// derived structure (spanning tree, flood groups, unicast routes) so a blocked
-// switch is fully inert: it neither transits unicast nor receives broadcast.
+// Single owner of the topology's blocked set = dead nodes only. Recomputes
+// every derived structure (spanning tree, flood groups, unicast routes) so a
+// dead switch is fully inert: it neither transits unicast nor receives
+// broadcast. Slept switches are deliberately NOT blocked.
 void ZmqOpenFlowController::UpdateBlockedNodes() {
-  std::set<uint64_t> blocked = m_sleepSwitches;
-  blocked.insert(m_deadNodes.begin(), m_deadNodes.end());
+  std::set<uint64_t> blocked = m_deadNodes;
   m_topology.SetBlockedNodes(blocked);
   RebuildSpanningTree();  // also re-pushes flood groups for every switch
   RecomputeAllRoutes();
@@ -2178,10 +2203,11 @@ void ZmqOpenFlowController::MlTick() {
       NS_LOG_INFO("[ML] Frozen additive cost scale (median base) = "
                   << medianBase);
     }
-    // Freeze the set of switches the node-sleep action may never power off:
-    // articulation points of the switch graph (computed once here, O(V+E)) plus
-    // host-bearing switches marked at setup. Sleeping either would partition the
-    // network or strand a host, so they are hard-masked in ApplySleepActions.
+    // Freeze the set of switches the inactivity heuristic may never label
+    // asleep: articulation points of the switch graph (computed once here,
+    // O(V+E)) plus host-bearing switches marked at setup. A host-bearing switch
+    // can't physically power off; the articulation set is kept for parity even
+    // though sleep no longer blocks. Honoured in UpdateSleepStates.
     m_nonSleepable = m_topology.ComputeArticulationPoints();
     m_nonSleepable.insert(m_hostSwitches.begin(), m_hostSwitches.end());
     NS_LOG_INFO("[ML] Frozen node order: "
@@ -2191,6 +2217,10 @@ void ZmqOpenFlowController::MlTick() {
                 << "articulation+host)");
     MlSendHello();
   }
+
+  // Deterministic inactivity sleep labelling from the freshest port stats,
+  // before the reward reads m_sleepSwitches for its power term.
+  UpdateSleepStates();
 
   // Reward from previous tick's state vs current state.
   if (m_mlHavePrevObs) {
@@ -2233,17 +2263,13 @@ void ZmqOpenFlowController::MlTick() {
             }
           }
           if (!action.empty()) {
-            // Split [link_deltas (L) ‖ node_sleep (N)]. Older agents that only
-            // return L link deltas leave the node part empty (no sleep).
+            // The action is now link cost deltas only (length L). Sleep is no
+            // longer a policy output — it's driven by UpdateSleepStates below.
             size_t L = m_mlLinkOrder.size();
             std::vector<double> linkDeltas(
                 action.begin(),
                 action.begin() + std::min(L, action.size()));
-            std::vector<double> nodeVals;
-            if (action.size() > L)
-              nodeVals.assign(action.begin() + L, action.end());
             ApplyDeltaCosts(linkDeltas);
-            ApplySleepActions(nodeVals);
           }
         }  // end inner else (recv ok)
       }  // end outer else (send ok)

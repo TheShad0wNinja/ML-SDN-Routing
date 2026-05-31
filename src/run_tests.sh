@@ -343,7 +343,7 @@ start_aggregator() {
     exec python3 -u "$SCRIPT_DIR/python/controller/root_aggregator.py" \
       --dir "$FEDAVG_DIR" \
       --num-workers "$WORKERS" \
-      --arch-tag gnn-v4 \
+      --arch-tag gnn-v5 \
       --round-timeout-s "$FEDAVG_TIMEOUT" \
       --log-dir "$FEDAVG_AGG_LOG_DIR"
   ) >"$LOG_DIR/root-aggregator.log" 2>&1 &
