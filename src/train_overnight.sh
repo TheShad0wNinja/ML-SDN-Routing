@@ -20,7 +20,7 @@
 #
 # Deliberately simple: ONE priority, no priority sweep, no policy-collapse
 # validation. Tune via env vars (var = default):
-#   PRIORITY=balanced     ROUNDS=8        WORKERS=12
+#   PRIORITY=energy     ROUNDS=30       WORKERS=8
 #   SEED=20042810         SIM_TIME=600    EVAL_SIM_TIME=300
 #   MIX="usa,fat-tree-k4,sensor-cluster"  FEDAVG_EVERY=50   RESET=0  (1 = wipe)
 
@@ -47,9 +47,9 @@ shift  # drop the --run sentinel
 
 cd "$REPO_ROOT"
 
-PRIORITY="${PRIORITY:-balanced}"
-ROUNDS="${ROUNDS:-8}"
-WORKERS="${WORKERS:-12}"
+PRIORITY="${PRIORITY:-energy}"
+ROUNDS="${ROUNDS:-30}"
+WORKERS="${WORKERS:-8}"
 SEED="${SEED:-20042810}"
 SIM_TIME="${SIM_TIME:-600}"
 EVAL_SIM_TIME="${EVAL_SIM_TIME:-300}"
