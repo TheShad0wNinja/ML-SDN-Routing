@@ -120,6 +120,11 @@ double ZmqOpenFlowController::GetSwitchResidualEnergyJ(uint64_t dpid) const {
   return it->second;
 }
 
+double ZmqOpenFlowController::GetDeathTimeS(uint64_t dpid) const {
+  auto it = m_deathTimeS.find(dpid);
+  return (it != m_deathTimeS.end()) ? it->second : -1.0;
+}
+
 void ZmqOpenFlowController::ForceDeplete(uint64_t dpid) {
   auto it = m_switchResidualEnergy.find(dpid);
   if (it == m_switchResidualEnergy.end()) return;  // not energy-tracked
@@ -1059,8 +1064,10 @@ void ZmqOpenFlowController::ComputeSwitchObservations(uint64_t dpid) {
       // host switch, accept the partition — an intentional routing limit test).
       if (reIt->second <= 0.0 && !m_deadNodes.count(dpid)) {
         m_deadNodes.insert(dpid);
+        m_deathTimeS[dpid] = Simulator::Now().GetSeconds();
         NS_LOG_INFO("[ML-DEATH] dpid=" << dpid << " tick=" << m_mlTick
-                                       << " depleted — powered off");
+                                       << " T=" << m_deathTimeS[dpid]
+                                       << "s depleted — powered off");
         UpdateBlockedNodes();
       }
     }

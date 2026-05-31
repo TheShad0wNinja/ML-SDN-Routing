@@ -215,6 +215,8 @@ class ZmqOpenFlowController : public OFSwitch13Controller {
   // Read back energy state for reporting. Returns -1 if dpid not configured.
   double GetSwitchInitialEnergyJ(uint64_t dpid) const;
   double GetSwitchResidualEnergyJ(uint64_t dpid) const;
+  // Returns the sim-time (s) when dpid was depleted, or -1 if still alive.
+  double GetDeathTimeS(uint64_t dpid) const;
 
   // Crisis hook: force a switch's residual energy to zero so it dies on the
   // next stats tick (drives the IoT "battery drain" death deterministically,
@@ -389,6 +391,7 @@ class ZmqOpenFlowController : public OFSwitch13Controller {
   // switches they are blocked from routing and flooding, but involuntarily and
   // permanently — they never wake. Drives the IoT battery-drain crisis.
   std::set<uint64_t> m_deadNodes;
+  std::unordered_map<uint64_t, double> m_deathTimeS; // dpid → sim-time of first depletion
   // Switches the node-sleep action must never power off: articulation points of
   // the switch graph (computed once at first MlTick) plus host-bearing switches
   // (marked at setup). Sleeping any of these would partition the network or

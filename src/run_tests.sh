@@ -499,6 +499,17 @@ extract() {
 fmt_J()  { awk -v v="${1:-0}" 'BEGIN{printf (v>=1e6)?"%.2f MJ":"%.0f J", (v>=1e6)?v/1e6:v}'; }
 fmt_W()  { awk -v v="${1:-0}" 'BEGIN{printf (v>=1000)?"%.2f kW":"%.0f W", (v>=1000)?v/1000:v}'; }
 
+# Extract a single field from the Per-Class FlowMonitor table.
+# fld: 2=flows 3=tx 4=rx 5=loss_pct 6=delay_ms 7=p99_ms 8=mbps
+extract_class() {
+  local cls="$1" fld="$2" file="$3"
+  awk -v c="$cls" -v f="$fld" '
+    /=== Per-Class FlowMonitor ===/ { inb=1; next }
+    inb && /^=== /                  { inb=0 }
+    inb && NF>=8 && $1==c           { print $f; exit }
+  ' "$file"
+}
+
 summarize_log() {
   local f="$1" label="$2" metrics_override="${3:-}"
   local success rtt jitter delivery delay flows tx rx hops
@@ -518,6 +529,32 @@ summarize_log() {
   per_sw_consumed=$(extract '^[[:space:]]+Per-switch consumed[[:space:]]+:' "$f")
   per_sw_residual=$(extract '^[[:space:]]+Per-switch residual[[:space:]]+:' "$f")
   residual_frac=$(extract   '^[[:space:]]+Residual fraction[[:space:]]+:' "$f")
+
+  local lost_pkts
+  lost_pkts=$(extract '^[[:space:]]+Lost packets[[:space:]]*:' "$f")
+
+  local net_lifetime_s first_death_dpid min_residual_pct min_residual_dpid max_residual_pct max_residual_dpid
+  net_lifetime_s=$(extract   '^[[:space:]]+Network lifetime[[:space:]]*:'  "$f")
+  first_death_dpid=$(extract '^[[:space:]]+First death dpid[[:space:]]*:' "$f")
+  min_residual_pct=$(extract '^[[:space:]]+Min residual pct[[:space:]]*:' "$f")
+  min_residual_dpid=$(extract '^[[:space:]]+Min residual dpid[[:space:]]*:' "$f")
+  max_residual_pct=$(extract '^[[:space:]]+Max residual pct[[:space:]]*:' "$f")
+  max_residual_dpid=$(extract '^[[:space:]]+Max residual dpid[[:space:]]*:' "$f")
+
+  local bulk_flows bulk_tx bulk_rx bulk_loss bulk_delay bulk_p99 bulk_mbps
+  local iot_flows  iot_tx  iot_rx  iot_loss  iot_delay  iot_p99  iot_mbps
+  local video_flows video_tx video_rx video_loss video_delay video_p99 video_mbps
+  local voip_flows voip_tx  voip_rx  voip_loss  voip_delay  voip_p99  voip_mbps
+  local web_flows  web_tx   web_rx   web_loss   web_delay   web_p99   web_mbps
+  for cls in bulk iot video voip web; do
+    eval "${cls}_flows=\$(extract_class \"$cls\" 2 \"\$f\")"
+    eval "${cls}_tx=\$(extract_class    \"$cls\" 3 \"\$f\")"
+    eval "${cls}_rx=\$(extract_class    \"$cls\" 4 \"\$f\")"
+    eval "${cls}_loss=\$(extract_class  \"$cls\" 5 \"\$f\")"
+    eval "${cls}_delay=\$(extract_class \"$cls\" 6 \"\$f\")"
+    eval "${cls}_p99=\$(extract_class   \"$cls\" 7 \"\$f\")"
+    eval "${cls}_mbps=\$(extract_class  \"$cls\" 8 \"\$f\")"
+  done
 
   local jpermb=""
   if [[ -n "$energy" && -n "$rx" && "$rx" != "0" ]]; then
@@ -569,7 +606,7 @@ summarize_log() {
   echo
 
   # CSV: rotate aside if header changed (old flat schema, partial archive).
-  local expected_header="timestamp,label,topology,sim_time_s,traffic_mode,seed,controller,priority,mixed_load,failures,cripple,ping_success_pct,rtt_avg_ms,rtt_jitter_ms,pdr_pct,e2e_delay_avg_ms,flows,tx_pkts,rx_pkts,hop_count_avg,energy_total_j,energy_residual_j,power_avg_w,per_sw_consumed_j,per_sw_residual_j,residual_pct,j_per_mb,ml_reward_final,ml_reward_mean_last25,ml_critic_loss_final,ml_actor_loss_final,ml_ticks"
+  local expected_header="timestamp,label,topology,sim_time_s,traffic_mode,seed,controller,priority,mixed_load,failures,cripple,ping_success_pct,rtt_avg_ms,rtt_jitter_ms,pdr_pct,e2e_delay_avg_ms,flows,tx_pkts,rx_pkts,hop_count_avg,energy_total_j,energy_residual_j,power_avg_w,per_sw_consumed_j,per_sw_residual_j,residual_pct,j_per_mb,ml_reward_final,ml_reward_mean_last25,ml_critic_loss_final,ml_actor_loss_final,ml_ticks,lost_pkts,bulk_flows,bulk_tx,bulk_rx,bulk_loss_pct,bulk_delay_ms,bulk_p99_ms,bulk_mbps,iot_flows,iot_tx,iot_rx,iot_loss_pct,iot_delay_ms,iot_p99_ms,iot_mbps,video_flows,video_tx,video_rx,video_loss_pct,video_delay_ms,video_p99_ms,video_mbps,voip_flows,voip_tx,voip_rx,voip_loss_pct,voip_delay_ms,voip_p99_ms,voip_mbps,web_flows,web_tx,web_rx,web_loss_pct,web_delay_ms,web_p99_ms,web_mbps,net_lifetime_s,first_death_dpid,min_residual_pct,min_residual_dpid,max_residual_pct,max_residual_dpid"
   if [[ -f "$SUMMARY_CSV" ]] && [[ "$(head -n1 "$SUMMARY_CSV")" != "$expected_header" ]]; then
     local archived="${SUMMARY_CSV%.csv}.$(date +%Y%m%d-%H%M%S).csv"
     mv "$SUMMARY_CSV" "$archived"
@@ -578,7 +615,7 @@ summarize_log() {
   if [[ ! -f "$SUMMARY_CSV" ]]; then
     echo "$expected_header" >"$SUMMARY_CSV"
   fi
-  printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
+  printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
     "$(date -Iseconds)" "$label" "$TOPOLOGY" "$SIM_TIME" "$TRAFFIC_MODE" "$SEED" \
     "$($ML && echo ml || echo baseline)" "$($ML && echo "$PRIORITY" || echo -)" \
     "$($MIXED_LOAD && echo 1 || echo 0)" "$($FAILURES && echo 1 || echo 0)" "$($CRIPPLE && echo 1 || echo 0)" \
@@ -588,6 +625,15 @@ summarize_log() {
     "${per_sw_consumed:-}" "${per_sw_residual:-}" "${residual_frac:-}" "${jpermb:-}" \
     "${ml_reward_final:-}" "${ml_reward_mean:-}" "${ml_critic_loss:-}" "${ml_actor_loss:-}" \
     "${ml_ticks:-}" \
+    "${lost_pkts:-}" \
+    "${bulk_flows:-}"  "${bulk_tx:-}"  "${bulk_rx:-}"  "${bulk_loss:-}"  "${bulk_delay:-}"  "${bulk_p99:-}"  "${bulk_mbps:-}" \
+    "${iot_flows:-}"   "${iot_tx:-}"   "${iot_rx:-}"   "${iot_loss:-}"   "${iot_delay:-}"   "${iot_p99:-}"   "${iot_mbps:-}" \
+    "${video_flows:-}" "${video_tx:-}" "${video_rx:-}" "${video_loss:-}" "${video_delay:-}" "${video_p99:-}" "${video_mbps:-}" \
+    "${voip_flows:-}"  "${voip_tx:-}"  "${voip_rx:-}"  "${voip_loss:-}"  "${voip_delay:-}"  "${voip_p99:-}"  "${voip_mbps:-}" \
+    "${web_flows:-}"   "${web_tx:-}"   "${web_rx:-}"   "${web_loss:-}"   "${web_delay:-}"   "${web_p99:-}"   "${web_mbps:-}" \
+    "${net_lifetime_s:-}" "${first_death_dpid:-}" \
+    "${min_residual_pct:-}" "${min_residual_dpid:-}" \
+    "${max_residual_pct:-}" "${max_residual_dpid:-}" \
     >>"$SUMMARY_CSV"
 }
 

@@ -162,6 +162,12 @@ void PrintSwitchEnergy(const ScenarioReportInputs& in) {
                         && in.switchToSection.size() == numSwitches
                         && in.ctrls->size() > 1;
 
+  // Lifetime tracking
+  double minFrac = 2.0, maxFrac = -1.0;
+  uint64_t minDpid = 0, maxDpid = 0;
+  double firstDeathTime = -1.0;
+  uint64_t firstDeathDpid = 0;
+
   for (uint32_t i = 0; i < numSwitches; ++i) {
     uint64_t dpid = i + 1;
     int owner = isMulti ? in.switchToSection[i] : 0;
@@ -177,6 +183,16 @@ void PrintSwitchEnergy(const ScenarioReportInputs& in) {
               << std::right << std::setw(14) << std::fixed
               << std::setprecision(2) << consumed << std::setw(14) << avgW
               << std::endl;
+
+    double frac = (init > 0) ? resid / init : 0.0;
+    if (frac < minFrac) { minFrac = frac; minDpid = dpid; }
+    if (frac > maxFrac) { maxFrac = frac; maxDpid = dpid; }
+
+    double dt = (*in.ctrls)[owner]->GetDeathTimeS(dpid);
+    if (dt >= 0.0 && (firstDeathTime < 0.0 || dt < firstDeathTime)) {
+      firstDeathTime = dt;
+      firstDeathDpid = dpid;
+    }
   }
   if (tracked > 0 && in.simTime > 0) {
     double totalConsumed = totalInitialJ - totalResidualJ;
@@ -197,6 +213,20 @@ void PrintSwitchEnergy(const ScenarioReportInputs& in) {
     std::cout << "  Per-switch residual : " << (totalResidualJ / tracked)
               << " J" << std::endl;
     std::cout << "  Residual fraction : " << residualFrac << "%" << std::endl;
+    // Network lifetime
+    double lifetimeS = (firstDeathTime >= 0.0) ? firstDeathTime : in.simTime;
+    std::cout << "  Network lifetime  : " << lifetimeS << " s";
+    if (firstDeathTime < 0.0) std::cout << " (no deaths)";
+    std::cout << std::endl;
+    if (firstDeathTime >= 0.0) {
+      std::cout << "  First death dpid  : " << firstDeathDpid << std::endl;
+    }
+    std::cout << "  Min residual pct  : " << (minFrac * 100.0) << " %"
+              << std::endl;
+    std::cout << "  Min residual dpid : " << minDpid << std::endl;
+    std::cout << "  Max residual pct  : " << (maxFrac * 100.0) << " %"
+              << std::endl;
+    std::cout << "  Max residual dpid : " << maxDpid << std::endl;
   } else {
     std::cout << "  (no energy model configured)" << std::endl;
   }
