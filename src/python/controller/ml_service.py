@@ -13,7 +13,7 @@ Architecture
 
 Wire protocol (JSON over ZMQ REQ/REP)
 -------------------------------------
-- `{"cmd":"hello", "arch":"gnn-v5", "num_switches":N, "num_links":L,
+- `{"cmd":"hello", "arch":"gnn-v6", "num_switches":N, "num_links":L,
     "node_feat_dim":4, "edge_feat_dim":3, "link_action_dim":L,
     "node_action_dim":0, "action_dim":L, "seed":S,
     "resume":bool, "checkpoint_every_n_ticks":K}` → `{"ok":true}`
