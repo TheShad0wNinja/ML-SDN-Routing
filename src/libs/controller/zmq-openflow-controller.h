@@ -128,8 +128,8 @@ struct MlConfig {
   // gets a smooth bounded penalty instead of instantly slamming the -1 clamp
   // (the old slope=15 made any sub-SLA delivery saturate the floor, killing the
   // gradient and poisoning the replay buffer with action-independent -1s).
-  double sla_pdr = 0.99;         // true PDR floor (delivery ratio)
-  double sla_delay = 0.90;       // delayQuality floor
+  double sla_pdr = 0.99;         // true PDR floor (delivery ratio) %
+  double sla_delay = 0.90;       // delayQuality floor %
   double pdr_hinge_w = 3.0;      // slope of the PDR hinge below SLA (bounded ≤1)
   double delay_hinge_w = 3.0;    // slope of the delay hinge below SLA (bounded ≤1)
 

@@ -1742,12 +1742,12 @@ double ZmqOpenFlowController::ComputeMlReward() {
     // power_W = bytes/s × J/byte = J/s = W.
     currPowerW += (txBps / 8.0) * em.energy_per_byte_j;
   }
-  // Ensure the power ref (Max allowed power) is atleast 1W
+  // Ensure the power ref (Power Ceiling) is atleast 1W
   double powerRef = std::max(1.0, m_ml.power_ref_w);
-  // Calculate cost by seeing how close current is compared to max
+  // Calculate cost by seeing how close current is to ceiling
   double powerCost = std::clamp(currPowerW / powerRef, 0.0, 1.0);
 
-  // ---- 4. Utilization penalty (mean + peak) ----
+  // ---- 4. Link Utilization penalty (mean + peak) ----
   //   u_l      = clamp( txBps_l / cap_l , 0, 1 )   per link l
   //   ū        = mean_l u_l ,   u_max = max_l u_l
   //   U_pen    = { THROUGHPUT: u_max
@@ -1762,6 +1762,7 @@ double ZmqOpenFlowController::ComputeMlReward() {
   std::unordered_map<uint64_t, double> switchTxBps;
   double totalTxBps = 0.0;
   for (const auto& [a, b] : m_mlLinkOrder) {
+    // Get max capacity between two ports (Incase of uni-directional)
     double cap = std::max(m_topology.GetLinkCapacityBps(a, b),
                           m_topology.GetLinkCapacityBps(b, a));
     double txBps = 0.0;
@@ -1772,19 +1773,22 @@ double ZmqOpenFlowController::ComputeMlReward() {
         if (peer && *peer == b) txBps += ps.tx_rate_bps;
       }
     }
+    // Increment total and per switch tx bytes based on link traffic
     switchTxBps[a] += txBps;
     totalTxBps += txBps;
     if (cap > 0.0) {
+      // Util link used / capactity
       double u = std::clamp(txBps / cap, 0.0, 1.0);
       utilSum += u;
+      // Get peak utilization
       if (u > utilPeak) utilPeak = u;
       ++utilN;
     }
   }
+  // Calculate mean utilization
   double meanUtil = (utilN > 0) ? (utilSum / utilN) : 0.0;
-  // utilPenalty in [0,1]. Per-priority math: the analytic bounds in the
-  // affine rescale below stay valid because every branch produces a value
-  // in [0,1] (utilPeak^2 <= utilPeak <= 1, weighted convex sums).
+
+  // Calcualte penalty based on priority
   double utilPenalty;
   switch (m_ml.priority_preset) {
     case MlConfig::MlPriority::THROUGHPUT:
@@ -1794,10 +1798,8 @@ double ZmqOpenFlowController::ComputeMlReward() {
       break;
     case MlConfig::MlPriority::ENERGY:
       // Heavy on meanUtil (long detours waste joules) plus a quadratic
-      // peak term: near-zero penalty below ~50% peak (free consolidation)
-      // but spikes sharply as peak approaches 1.0, creating a soft ceiling
-      // that forces the agent to wake a secondary link before the primary
-      // collapses.
+      // peak term: if link util is getting too high, weight of the 20
+      // becomes higher. eg. 0.4^2 = .16 | .95^2 = .90
       utilPenalty = 0.8 * meanUtil + 0.2 * (utilPeak * utilPeak);
       break;
     case MlConfig::MlPriority::BALANCED:
@@ -1819,8 +1821,11 @@ double ZmqOpenFlowController::ComputeMlReward() {
   // floor was at background LLDP/ARP level, so nearly every switch always read
   // "active" and the consolidation signal was dead. The load-proportional term
   // lets switches register as idle even under heavy global load.
+  // Choose thereshoold based on either floor bps or a percentage of the current 
+  // Tx rate
   double activeThresholdBps =
       std::max(m_ml.footprint_floor_bps, totalTxBps * m_ml.footprint_frac);
+  // Count number of active switches baed on Threshold
   uint32_t activeCount = 0;
   for (const auto& [dpid, sw] : m_switchMap) {
     auto it = switchTxBps.find(dpid);
@@ -1828,9 +1833,10 @@ double ZmqOpenFlowController::ComputeMlReward() {
       ++activeCount;
   }
   double totalSw = std::max<size_t>(1, m_switchMap.size());
+  // Percentage of active switches compared to total switches
   double footprintPenalty = static_cast<double>(activeCount) / totalSw;
 
-  // ---- 6. Reserve-aware traffic penalty ----
+  // ---- 6. Residual-Energy aware traffic penalty ----
   //   frac_s   = clamp( residual_J_s / initial_J_s , 0, 1 )   (energy left)
   //   R_pen    = Σ_s ( txBps_s / Σ txBps ) · (1 − frac_s)²    ∈ [0, 1]
   //   (traffic share weighted by depletion² → pushes load off low-battery sw)
@@ -1846,15 +1852,20 @@ double ZmqOpenFlowController::ComputeMlReward() {
     for (const auto& [dpid, tx] : switchTxBps) {
       double frac = 1.0;
       auto emIt = m_switchEnergyModel.find(dpid);
+      // Ensure switch has energy model
       if (emIt != m_switchEnergyModel.end() &&
           emIt->second.initial_energy_j > 0) {
         auto reIt = m_switchResidualEnergy.find(dpid);
         if (reIt != m_switchResidualEnergy.end())
+          // Calculate % of energy left, 0 dead | 1 fulll
           frac = std::clamp(reIt->second / emIt->second.initial_energy_j, 0.0,
                             1.0);
       }
-      double share = tx / totalTxBps;
-      double depletion = 1.0 - frac;
+      // See how much of the total load the switch handles
+      double share = tx / totalTxBps; 
+      double depletion = 1.0 - frac; 
+      // The closer the switch is to dying, the heavier
+      // Depletion weight. It's bounded because of share
       reserveAwarePenalty += share * depletion * depletion;
     }
   }
@@ -1867,6 +1878,7 @@ double ZmqOpenFlowController::ComputeMlReward() {
   //   wear so no single battery dies far ahead of the rest.
   // stddev across all energy-tracked switches. Low stddev = even depletion;
   // forces the agent to round-robin its high-traffic paths over time.
+  // Ensure all nodes die at close times
   double stddevResidual = ComputeResidualEnergyStddev();
   // stddev is already in [0, 0.5] practically (residual_frac ∈ [0,1]);
   // multiply by 2 to push it into [0, 1] range for weight comparability.
@@ -1976,6 +1988,7 @@ double ZmqOpenFlowController::ComputeMlReward() {
                           m_ml.reward_theta + m_ml.reward_kappa;
   const double span = posBound + negBound;
   if (span > 0.0) {
+    // 2 * ((R - Rmin) / (Rmax - Rmin)) - 1
     R_norm = 2.0 * (R + negBound) / span - 1.0;
   } else {
     R_norm = 0.0;
@@ -1999,15 +2012,20 @@ double ZmqOpenFlowController::ComputeMlReward() {
 double ZmqOpenFlowController::ComputeResidualEnergyStddev() const {
   std::vector<double> fracs;
   fracs.reserve(m_switchEnergyModel.size());
+
   for (const auto& [dpid, em] : m_switchEnergyModel) {
-    if (em.initial_energy_j <= 0) continue;
+    if (em.initial_energy_j <= 0) continue; //Ensure switch has energy model
+    // Calculate ressidual energy left
     auto reIt = m_switchResidualEnergy.find(dpid);
     double frac = (reIt != m_switchResidualEnergy.end())
                       ? std::clamp(reIt->second / em.initial_energy_j, 0.0, 1.0)
                       : 1.0;
     fracs.push_back(frac);
   }
+  // Can't have variance with < 3 switches
   if (fracs.size() < 2) return 0.0;
+
+  // Calculate standard deviation
   double mean = 0.0;
   for (double f : fracs) mean += f;
   mean /= fracs.size();
@@ -2065,7 +2083,7 @@ void ZmqOpenFlowController::ApplyDeltaCosts(const std::vector<double>& deltas) {
     centerMean /= static_cast<double>(n);
   }
   bool anyChanged = false;
-  double churnL1 = 0.0;
+  double churnL1 = 0.0; // L1 means sum of vector = 1
   for (size_t i = 0; i < n; ++i) {
     double d = deltas[i] - centerMean;
     if (d > scale)
