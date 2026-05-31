@@ -114,6 +114,11 @@ int RunScenario(ScenarioOptions& opts, TopoSpec topo,
   const uint32_t NUM_SWITCHES = topo.nodes.size();
   const uint32_t NUM_HOSTS = topo.hostToSwitch.size();
 
+  // Apply topology-specific powerRef default when the user didn't override it
+  // via --mlPowerRef (MlOptions default is 100 W).
+  if (topo.defaultPowerRefW > 0.0 && opts.ml.powerRefW == 100.0)
+    opts.ml.powerRefW = topo.defaultPowerRefW;
+
   ControllerLayout layout =
       SetupControllers(opts.multi, opts.ml, topo, opts.seed);
   if (layout.ctrls.empty()) return 1;

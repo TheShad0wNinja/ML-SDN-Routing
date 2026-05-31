@@ -128,6 +128,7 @@ TopoSpec BuildUsaSpec(const std::string& backboneQueue, bool crippleEnabled) {
   spec.defaultFlashCrowdDst = 15;     // Chicago
   spec.defaultBlackHoleSwitch = 22;   // Cleveland
   spec.defaultKillSwitch = 8;         // Denver — well-connected tier2, reroutable
+  spec.defaultPowerRefW = 1000.0;     // ~3.5kW full sat; realistic peak ~1kW at 30% util
   return spec;
 }
 

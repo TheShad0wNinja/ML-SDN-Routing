@@ -71,6 +71,10 @@ struct TopoSpec {
   // Switch index drained to death by the IoT battery-drain crisis. Pick a
   // non-articulation switch on a redundant path so the agent can reroute.
   uint32_t defaultKillSwitch = 0;
+  // Normalization ceiling for the energy reward's powerCost term (W). Set by
+  // the topology factory to match realistic peak aggregate draw for that topo.
+  // 0 = leave MlOptions default (100 W) unchanged.
+  double defaultPowerRefW = 0.0;
 };
 
 std::vector<uint32_t> ParseIndexCsv(const std::string& csv);

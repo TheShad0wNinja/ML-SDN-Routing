@@ -68,6 +68,7 @@ TopoSpec BuildFatTreeK4Spec(const std::string& backboneQueue) {
   spec.defaultFlashCrowdDst = 0;
   spec.defaultBlackHoleSwitch = 4;  // pod-0 aggregation switch (host-free)
   spec.defaultKillSwitch = 8;       // pod-1 agg (host-free, reroutable via its twin)
+  spec.defaultPowerRefW = 10000.0;  // ~30kW full sat; realistic peak ~10kW at 30% util
   return spec;
 }
 

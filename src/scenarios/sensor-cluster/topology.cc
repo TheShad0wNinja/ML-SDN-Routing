@@ -96,6 +96,7 @@ TopoSpec BuildSensorClusterSpec(const std::string& backboneQueue) {
   spec.defaultFlashCrowdDst = 0;          // CH0 host
   spec.defaultBlackHoleSwitch = sn(0, 2); // a bridge sensor (host-free, reroutable)
   spec.defaultKillSwitch = sn(0, 3);      // a loaded bridge sensor (battery-drain)
+  spec.defaultPowerRefW = 5000.0;         // ~16kW full sat; realistic peak ~5kW at 30% util
   return spec;
 }
 
