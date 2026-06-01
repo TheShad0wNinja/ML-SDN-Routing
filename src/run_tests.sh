@@ -65,6 +65,7 @@ EXTRA_ARGS=()
 AUTO_ML=true
 NS3_VERBOSE=false
 ML_PORT_BASE=5555
+RUN_ID=""      # unique per-invocation token for deploy dir isolation
 
 # Agent directory layout. Switched by mode (not by WORKERS) so training scratch
 # never collides with deployment runtime.
@@ -186,20 +187,55 @@ ml_agent_dir_for_slot() {
   local base; base=$(ckpt_dir_for_priority "$PRIORITY")
   case "$ML_LAYOUT" in
     train)      echo "$base/train/w$1" ;;
-    deploy)     echo "$base/deploy/s$1" ;;
+    deploy)     echo "$base/deploy/$RUN_ID/s$1" ;;
     flat|*)     echo "$base" ;;
   esac
 }
 
-# For every non-train ML run: redirect runtime artifacts (local.pt checkpoint
-# updates, metrics.csv, replay.pkl) to $base/deploy/s<slot>/ so the canonical
-# local.pt at the priority root is never overwritten by inference/eval runs.
+# Generate a unique ID for this invocation (idempotent: no-op if already set).
+init_run_id() {
+  [[ -n "$RUN_ID" ]] && return
+  local rand
+  rand=$(tr -dc a-f0-9 </dev/urandom 2>/dev/null | head -c6 \
+         || printf '%06x' $(( (RANDOM * 65536 + RANDOM) & 0xFFFFFF )))
+  RUN_ID="$(date +%Y%m%d-%H%M%S)-${rand}"
+}
+
+# Find N consecutive TCP ports that are not currently bound, in 5560-9400.
+# Prints the base port; callers use base..base+N-1.
+pick_free_port_base() {
+  local n="${1:-1}"
+  local stride=$(( n < 1 ? 1 : n ))
+  local used
+  used=$(ss -ltn 2>/dev/null \
+         | awk 'NR>1 {split($4,a,":"); print a[length(a)]}' \
+         | sort -n)
+  local slots=$(( (9400 - 5560) / stride ))
+  local i base p ok
+  for ((i=0; i<40; i++)); do
+    base=$(( 5560 + (RANDOM % slots) * stride ))
+    ok=true
+    for ((p=base; p<base+stride; p++)); do
+      echo "$used" | grep -q "^${p}$" && { ok=false; break; }
+    done
+    $ok && { echo "$base"; return 0; }
+  done
+  echo "5555"  # last-resort fallback
+}
+
+# For every non-train ML run: redirect runtime artifacts (local.pt, metrics.csv,
+# replay.pkl) to $base/deploy/$RUN_ID/s<slot>/ — a unique per-invocation dir —
+# so concurrent eval/single runs never share files, ports, or metrics. The
+# canonical local.pt at the priority root is never overwritten. The deploy/
+# subtree can be deleted freely; the next run re-seeds from $base/local.pt.
 # No-op when ML=false, when already in deploy layout (multiController path),
 # or in train layout (training manages its own dirs).
 ensure_deploy_layout() {
   $ML || return 0
   [[ "$ML_LAYOUT" == "deploy" || "$ML_LAYOUT" == "train" ]] && return 0
   ML_LAYOUT="deploy"
+  init_run_id
+  ML_PORT_BASE=$(pick_free_port_base "$WORKERS")
   seed_deploy_dirs
 }
 
@@ -704,13 +740,20 @@ run_one() {
     fi
   ) 2>&1 | tee "$logfile"
 
-  # In train mode each run_one IS a single worker (slot == workerId), so scope
-  # the metrics summary to this worker's own dir ($base/train/w<slot>). Other
-  # layouts (flat single/eval, deploy multi-controller) keep the default
-  # priority-dir behaviour inside summarize_log.
+  # Scope metrics to exactly this run's files.
+  # - train:  each run_one is one worker → its own train/w<slot>/ dir
+  # - deploy: all slots for this run live under deploy/$RUN_ID/ → pass
+  #           that dir so aggregate_metrics pools s*/metrics.csv for this
+  #           run only (never mixes in files from other concurrent runs)
+  # - flat/baseline: ML=false, so summarize_log skips metrics entirely
   local metrics_override=""
-  if $ML && [[ "$ML_LAYOUT" == "train" ]]; then
-    metrics_override="$(ml_agent_dir_for_slot "$slot")"
+  if $ML; then
+    case "$ML_LAYOUT" in
+      train)  metrics_override="$(ml_agent_dir_for_slot "$slot")" ;;
+      deploy)
+        local _mbase; _mbase=$(ckpt_dir_for_priority "$PRIORITY")
+        metrics_override="$_mbase/deploy/$RUN_ID" ;;
+    esac
   fi
   summarize_log "$logfile" "$label" "$metrics_override"
 }
@@ -748,6 +791,8 @@ cmd_single() {
       WORKERS=$SECTIONS
       EXTRA_ARGS+=("--sections=$SECTIONS")
       ML_LAYOUT="deploy"
+      init_run_id
+      ML_PORT_BASE=$(pick_free_port_base "$WORKERS")
       seed_deploy_dirs
     fi
   fi

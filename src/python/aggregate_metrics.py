@@ -68,9 +68,10 @@ def find_metrics_csvs(path: Path) -> list[Path]:
         return []
     patterns = [
         "metrics.csv",
+        "s*/metrics.csv",           # deploy/<run_id>/ passed directly
         "w*/metrics.csv",
         "train/w*/metrics.csv",
-        "deploy/s*/metrics.csv",
+        "deploy/s*/metrics.csv",    # legacy: priority root passed (no run_id)
     ]
     seen: set[Path] = set()
     found: list[Path] = []
