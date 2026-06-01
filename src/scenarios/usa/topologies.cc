@@ -5,44 +5,50 @@ namespace ns3 {
 TopoSpec BuildUsaSpec(const std::string& backboneQueue, bool crippleEnabled) {
   TopoSpec spec;
   spec.label = "usa";
+  // initialEnergyJ bumped ~1.5× (edge 2e3→3e3, tier2 4e3→6e3, tier1 1e4→1.5e4)
+  // to match the fat-tree/sensor retune: keeps the energy reward well-defined
+  // for the zero-shot generalization runs without a USA edge node hitting the
+  // (now 0.35) lifetime hinge prematurely under heavy WAN load. Sleep has
+  // little authority here (every switch is host-bearing), so death is driven by
+  // the kill-switch crisis, not natural drain; energyPerByteJ unchanged.
   spec.nodes = {
-      {"Vancouver",    "edge",     "100Mbps", 10, 1e-6, 2e3},
-      {"Seattle",      "tier1",    "1Gbps",    2, 5e-7, 1e4},
-      {"Portland",     "edge",     "100Mbps", 10, 1e-6, 2e3},
-      {"Sunnyvale",    "tier2",    "500Mbps",  5, 8e-7, 4e3},
-      {"LosAngeles",   "tier2",    "500Mbps",  5, 8e-7, 4e3},
+      {"Vancouver",    "edge",     "100Mbps", 10, 1e-6, 3e3},
+      {"Seattle",      "tier1",    "1Gbps",    2, 5e-7, 1.5e4},
+      {"Portland",     "edge",     "100Mbps", 10, 1e-6, 3e3},
+      {"Sunnyvale",    "tier2",    "500Mbps",  5, 8e-7, 6e3},
+      {"LosAngeles",   "tier2",    "500Mbps",  5, 8e-7, 6e3},
       {"Missoula",     "crippled", "1Mbps",  100, 1.5e-6, 1e3},
-      {"SaltLakeCity", "tier1",    "1Gbps",    2, 5e-7, 1e4},
-      {"Phoenix",      "edge",     "100Mbps", 10, 1e-6, 2e3},
-      {"Denver",       "tier2",    "500Mbps",  5, 8e-7, 4e3},
-      {"Albuqerque",   "edge",     "100Mbps", 10, 1e-6, 2e3},
-      {"ElPaso",       "tier2",    "500Mbps",  5, 8e-7, 4e3},
-      {"Minneapolis",  "edge",     "100Mbps", 10, 1e-6, 2e3},
-      {"KansasCity",   "tier2",    "500Mbps",  5, 8e-7, 4e3},
-      {"Dallas",       "edge",     "100Mbps", 10, 1e-6, 2e3},
-      {"Houston",      "tier1",    "1Gbps",    2, 5e-7, 1e4},
-      {"Chicago",      "tier1",    "1Gbps",    2, 5e-7, 1e4},
-      {"Indianapolis", "edge",     "100Mbps", 10, 1e-6, 2e3},
-      {"Louisville",   "edge",     "100Mbps", 10, 1e-6, 2e3},
-      {"Nashville",    "tier2",    "500Mbps",  5, 8e-7, 4e3},
-      {"Memphis",      "edge",     "100Mbps", 10, 1e-6, 2e3},
-      {"Jackson",      "edge",     "100Mbps", 10, 1e-6, 2e3},
-      {"BatonRouge",   "edge",     "100Mbps", 10, 1e-6, 2e3},
-      {"Cleveland",    "tier2",    "500Mbps",  5, 8e-7, 4e3},
-      {"Pittsburgh",   "edge",     "100Mbps", 10, 1e-6, 2e3},
-      {"Atlanta",      "tier2",    "500Mbps",  5, 8e-7, 4e3},
-      {"Jacksonville", "tier2",    "500Mbps",  5, 8e-7, 4e3},
-      {"Buffalo",      "edge",     "100Mbps", 10, 1e-6, 2e3},
-      {"Ashburn",      "edge",     "100Mbps", 10, 1e-6, 2e3},
-      {"Raleigh",      "edge",     "100Mbps", 10, 1e-6, 2e3},
-      {"WashingtonDC", "tier2",    "500Mbps",  5, 8e-7, 4e3},
-      {"Miami",        "edge",     "100Mbps", 10, 1e-6, 2e3},
-      {"Philadelphia", "edge",     "100Mbps", 10, 1e-6, 2e3},
-      {"NewYork",      "edge",     "100Mbps", 10, 1e-6, 2e3},
-      {"Boston",       "edge",     "100Mbps", 10, 1e-6, 2e3},
+      {"SaltLakeCity", "tier1",    "1Gbps",    2, 5e-7, 1.5e4},
+      {"Phoenix",      "edge",     "100Mbps", 10, 1e-6, 3e3},
+      {"Denver",       "tier2",    "500Mbps",  5, 8e-7, 6e3},
+      {"Albuqerque",   "edge",     "100Mbps", 10, 1e-6, 3e3},
+      {"ElPaso",       "tier2",    "500Mbps",  5, 8e-7, 6e3},
+      {"Minneapolis",  "edge",     "100Mbps", 10, 1e-6, 3e3},
+      {"KansasCity",   "tier2",    "500Mbps",  5, 8e-7, 6e3},
+      {"Dallas",       "edge",     "100Mbps", 10, 1e-6, 3e3},
+      {"Houston",      "tier1",    "1Gbps",    2, 5e-7, 1.5e4},
+      {"Chicago",      "tier1",    "1Gbps",    2, 5e-7, 1.5e4},
+      {"Indianapolis", "edge",     "100Mbps", 10, 1e-6, 3e3},
+      {"Louisville",   "edge",     "100Mbps", 10, 1e-6, 3e3},
+      {"Nashville",    "tier2",    "500Mbps",  5, 8e-7, 6e3},
+      {"Memphis",      "edge",     "100Mbps", 10, 1e-6, 3e3},
+      {"Jackson",      "edge",     "100Mbps", 10, 1e-6, 3e3},
+      {"BatonRouge",   "edge",     "100Mbps", 10, 1e-6, 3e3},
+      {"Cleveland",    "tier2",    "500Mbps",  5, 8e-7, 6e3},
+      {"Pittsburgh",   "edge",     "100Mbps", 10, 1e-6, 3e3},
+      {"Atlanta",      "tier2",    "500Mbps",  5, 8e-7, 6e3},
+      {"Jacksonville", "tier2",    "500Mbps",  5, 8e-7, 6e3},
+      {"Buffalo",      "edge",     "100Mbps", 10, 1e-6, 3e3},
+      {"Ashburn",      "edge",     "100Mbps", 10, 1e-6, 3e3},
+      {"Raleigh",      "edge",     "100Mbps", 10, 1e-6, 3e3},
+      {"WashingtonDC", "tier2",    "500Mbps",  5, 8e-7, 6e3},
+      {"Miami",        "edge",     "100Mbps", 10, 1e-6, 3e3},
+      {"Philadelphia", "edge",     "100Mbps", 10, 1e-6, 3e3},
+      {"NewYork",      "edge",     "100Mbps", 10, 1e-6, 3e3},
+      {"Boston",       "edge",     "100Mbps", 10, 1e-6, 3e3},
   };
   if (!crippleEnabled) {
-    spec.nodes[5] = {"Missoula", "tier2", "500Mbps", 5, 8e-7, 4e3};
+    spec.nodes[5] = {"Missoula", "tier2", "500Mbps", 5, 8e-7, 6e3};
   }
   // Powered-on idle draw the node-sleep action can eliminate, by tier. Modest
   // starting points — tune as needed. A slept switch contributes neither idle

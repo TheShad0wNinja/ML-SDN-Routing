@@ -113,19 +113,28 @@ struct MlConfig {
   // For the ENERGY preset the reward is NOT the legacy additive sum. Delivery
   // quality (loss/delay) is treated as a constraint via a hinge, not an additive
   // offset, so the controllable energy terms below get the full [-1, 1] range.
-  // The seven sub-weights form a convex combination (should sum to ~1.0); they are
-  // renormalised at config time if they don't.
+  // The six sub-weights form a convex combination (should sum to ~1.0); they are
+  // renormalised at config time if they don't. Lifetime/min-residual is NOT in
+  // this combo — it is a one-sided barrier hinge (life_hinge_w below) subtracted
+  // outside baseReward, so aggregate energy savings can never buy back a node
+  // that is being driven to depletion.
   double en_w_power = 0.25;           // powerCost
   double en_w_util = 0.20;            // utilPenalty
   double en_w_footprint = 0.15;       // footprintPenalty
   double en_w_reserve = 0.10;         // reserveAwarePenalty
   double en_w_balance = 0.05;         // balancePenalty
   double en_w_churn = 0.05;           // churnPenalty
-  double en_w_min_residual = 0.20;    // min-residual lifetime penalty
-  // Hinge threshold for min-residual term: fires when the least-charged
-  // non-dead switch falls below this fraction (0.0–1.0). Penalty is 0 above
-  // the threshold and rises linearly to 1.0 at depletion.
-  double min_residual_threshold = 0.20;
+  // Min-residual lifetime barrier threshold: the hinge fires when the
+  // least-charged non-dead switch falls below this fraction (0.0–1.0). The
+  // raw deficit is 0 above the threshold and rises linearly to 1.0 at
+  // depletion; life_hinge_w scales it into the subtracted hinge. The hinge
+  // SATURATES (subtracts a full unit) once minFrac drops to the implicit
+  // floor = threshold·(1 − 1/life_hinge_w), so threshold + life_hinge_w
+  // together set both where the barrier starts AND where it maxes out — see
+  // life_hinge_w below. At 0.35 with w=1.4 the floor is 0.10, giving a smooth
+  // ramp across [0.35, 0.10] (the actionable, still-alive band) instead of the
+  // old 5pp window that saturated at 0.15 and gave the agent no warning.
+  double min_residual_threshold = 0.35;
   // QoS hinge: penalise only when quality drops below the SLA floor. Each hinge
   // is bounded to [0, 1] in ComputeMlReward, so a degraded-but-alive network
   // gets a smooth bounded penalty instead of instantly slamming the -1 clamp
@@ -135,6 +144,14 @@ struct MlConfig {
   double sla_delay = 0.90;       // delayQuality floor %
   double pdr_hinge_w = 3.0;      // slope of the PDR hinge below SLA (bounded ≤1)
   double delay_hinge_w = 3.0;    // slope of the delay hinge below SLA (bounded ≤1)
+  // Slope of the lifetime hinge below the threshold. Because lifeHinge =
+  // min(1, L_pen·w), this also sets the saturation floor = thr·(1 − 1/w): the
+  // residual fraction at which the barrier reaches a full reward unit. Pick it
+  // from the desired floor f via w = thr/(thr − f). thr=0.35, w=1.4 → f=0.10.
+  // (Was 4.0, which forced f=0.2625 with the old 0.20 threshold → the hinge
+  // saturated only 5pp below threshold, killing the gradient before the node
+  // could be saved.)
+  double life_hinge_w = 1.4;
 
   // Per-node sleep action: a node-action value above this threshold powers the
   // switch off (routed around, zero idle + forwarding power). The actor emits

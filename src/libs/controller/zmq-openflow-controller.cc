@@ -165,14 +165,12 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
       m_ml.reward_kappa = 1.5;
       break;
     case MlConfig::MlPriority::ENERGY:
-      // ENERGY no longer uses the legacy additive α–κ weights; ComputeMlReward
-      // takes a dedicated gated/hinged branch. Renormalise the six controllable
-      // energy sub-weights into a convex combination so base_reward stays in
-      // [-1, 1] regardless of how the user set them on the CLI.
+      // Renormalise the six controllable energy sub-weights into 
+      // a convex combination so base_reward stays in [-1, 1] 
+      // regardless of how the user set them on the CLI.
       {
         double s = m_ml.en_w_power + m_ml.en_w_util + m_ml.en_w_footprint +
-                   m_ml.en_w_reserve + m_ml.en_w_balance + m_ml.en_w_churn +
-                   m_ml.en_w_min_residual;
+                   m_ml.en_w_reserve + m_ml.en_w_balance + m_ml.en_w_churn;
         if (s > 1e-9) {
           m_ml.en_w_power /= s;
           m_ml.en_w_util /= s;
@@ -180,7 +178,6 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
           m_ml.en_w_reserve /= s;
           m_ml.en_w_balance /= s;
           m_ml.en_w_churn /= s;
-          m_ml.en_w_min_residual /= s;
         }
       }
       break;
@@ -195,9 +192,9 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
                 << " reserve=" << m_ml.en_w_reserve
                 << " balance=" << m_ml.en_w_balance
                 << " churn=" << m_ml.en_w_churn
-                << " min_residual=" << m_ml.en_w_min_residual
-                << " thresh=" << m_ml.min_residual_threshold
-                << ") sla_pdr=" << m_ml.sla_pdr
+                << ") life_hinge_w=" << m_ml.life_hinge_w
+                << " min_residual_thresh=" << m_ml.min_residual_threshold
+                << " sla_pdr=" << m_ml.sla_pdr
                 << " sla_delay=" << m_ml.sla_delay
                 << " pdr_hinge_w=" << m_ml.pdr_hinge_w
                 << " delay_hinge_w=" << m_ml.delay_hinge_w);
@@ -1922,6 +1919,7 @@ double ZmqOpenFlowController::ComputeMlReward() {
     }
     // Check if it's under the min power
     if (minFrac < m_ml.min_residual_threshold) {
+      // Calculate change from the threshold
       minResidualPenalty = std::clamp(
           (m_ml.min_residual_threshold - minFrac) / m_ml.min_residual_threshold,
           0.0, 1.0);
@@ -1951,11 +1949,14 @@ double ZmqOpenFlowController::ComputeMlReward() {
     //   base   = 1 − 2·E_pen                            ∈ [−1, +1]
     //   h_loss = min(1, max(0, sla_pdr   − pdr)     · w_pdr)    ∈ [0, 1]
     //   h_del  = min(1, max(0, sla_delay − Q_delay) · w_delay)  ∈ [0, 1]
-    //   R      = clamp( base − h_loss − h_del , −1, +1 )
+    //   h_life = min(1, L_pen · w_life)                          ∈ [0, 1]
+    //   R      = clamp( base − h_loss − h_del − h_life , −1, +1 )
     // how: energy terms (the levers the agent controls) set the score; delivery
-    //   is a one-sided GATE, not an additive goal — it contributes 0 while the
-    //   net meets SLA and only subtracts when pdr/delay fall below floor. Keeps
-    //   the whole gradient on energy in the common (healthy) case.
+    //   AND node-lifetime are one-sided GATES, not additive goals — each
+    //   contributes 0 while the net is healthy and only subtracts when pdr/delay
+    //   fall below floor or the weakest battery nears depletion. Keeps the whole
+    //   gradient on energy in the common case, but makes node death a barrier
+    //   the energy terms cannot offset (L_pen is NOT in the convex Σw combo).
     // Gated/hinged energy reward. The controllable energy terms form a convex
     // combination (en_w_* renormalised to sum 1.0 in SetMlConfig), so the
     // energy penalty is in [0, 1] and base_reward spans the full [-1, +1].
@@ -1968,7 +1969,6 @@ double ZmqOpenFlowController::ComputeMlReward() {
                            m_ml.en_w_footprint * footprintPenalty +
                            m_ml.en_w_reserve * reserveAwarePenalty +
                            m_ml.en_w_balance * balancePenalty +
-                           m_ml.en_w_min_residual * minResidualPenalty +
                            m_ml.en_w_churn * churnPenalty;
     double baseReward = 1.0 - 2.0 * energyPenalty;  // [-1, +1]
 
@@ -1987,12 +1987,25 @@ double ZmqOpenFlowController::ComputeMlReward() {
             : std::min(1.0,
                        (m_ml.sla_delay - delayQuality) * m_ml.delay_hinge_w);
 
-    R_norm = std::clamp(baseReward - lossHinge - delayHinge, -1.0, 1.0);
+    // Lifetime barrier hinge. minResidualPenalty is the depletion deficit of
+    // the weakest non-dead switch (0 above the threshold, → 1 at full
+    // depletion). Scaled by life_hinge_w and clamped to [0, 1], it is
+    // subtracted OUTSIDE the convex energy combo, so it is not normalised away
+    // and the energy terms cannot compensate for it: driving a node toward
+    // death removes up to a full reward unit no matter how many switches are
+    // slept. This turns node survival into a near-hard constraint rather than
+    // the diluted 1-of-7 additive term it used to be (which the footprint +
+    // power weights could profitably overpower → min_residual collapsed to 0).
+    double lifeHinge = std::min(1.0, minResidualPenalty * m_ml.life_hinge_w);
+
+    R_norm = std::clamp(baseReward - lossHinge - delayHinge - lifeHinge,
+                        -1.0, 1.0);
 
     NS_LOG_DEBUG("[ML] ENERGY reward tick="
                  << m_mlTick << " R_norm=" << R_norm
                  << " base=" << baseReward << " enPen=" << energyPenalty
                  << " lossHinge=" << lossHinge << " delayHinge=" << delayHinge
+                 << " lifeHinge=" << lifeHinge
                  << " | p=" << powerCost << " u=" << utilPenalty
                  << " f=" << footprintPenalty << " e=" << reserveAwarePenalty
                  << " b=" << balancePenalty << " m=" << minResidualPenalty

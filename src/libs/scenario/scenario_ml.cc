@@ -47,6 +47,10 @@ void MlOptions::Register(CommandLine& cmd) {
                slaDelay);
   cmd.AddValue("mlPdrHingeW", "ENERGY QoS hinge slope for loss", pdrHingeW);
   cmd.AddValue("mlDelayHingeW", "ENERGY QoS hinge slope for delay", delayHingeW);
+  cmd.AddValue("mlLifeHingeW",
+               "ENERGY lifetime barrier slope: scales the min-residual deficit "
+               "of the weakest non-dead switch into a subtracted hinge",
+               lifeHingeW);
   cmd.AddValue("mlSleepIdleTicks",
                "Consecutive idle ticks (data traffic below the footprint "
                "threshold) before a switch is labelled asleep (zero idle power)",
@@ -109,6 +113,7 @@ MlConfig MlOptions::BuildMlConfig(uint32_t seedIn) const {
   cfg.sla_delay = slaDelay;
   cfg.pdr_hinge_w = pdrHingeW;
   cfg.delay_hinge_w = delayHingeW;
+  cfg.life_hinge_w = lifeHingeW;
   cfg.sleep_idle_ticks = sleepIdleTicks;
   cfg.explore = explore;
   cfg.learn = learn;

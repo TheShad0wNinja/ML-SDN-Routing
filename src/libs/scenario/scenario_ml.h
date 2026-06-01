@@ -25,6 +25,7 @@ struct MlOptions {
   double enPower = 0.30, enUtil = 0.25, enFootprint = 0.20;
   double enReserve = 0.15, enBalance = 0.05, enChurn = 0.05;
   double slaPdr = 0.99, slaDelay = 0.90, pdrHingeW = 15.0, delayHingeW = 5.0;
+  double lifeHingeW = 1.4;  // min-residual lifetime barrier slope
   // Inactivity sleep: consecutive idle ticks before a switch is labelled asleep.
   uint32_t sleepIdleTicks = 3;
   bool explore = true;
@@ -34,7 +35,7 @@ struct MlOptions {
   std::string endpoint = "tcp://127.0.0.1:5555";
   // Pin Python agent's exploration sigma; negative = use default decay.
   double noiseSigmaInit = -1.0;
-  double noiseSigmaMin = 0.10;
+  double noiseSigmaMin = 0.01;
   // Actor anti-collapse knobs (passed to Python via HELLO).
   double actionVarWeight = 0.05;
   double saturationWeight = 0.001;

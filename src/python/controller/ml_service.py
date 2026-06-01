@@ -234,8 +234,8 @@ class LocalDDPGAgent:
         replay_capacity: int = 200_000,
         batch_size: int = 64,
         warmup: int = 100,
-        noise_sigma_init: float = 0.2,
-        noise_sigma_min: float = 0.10,
+        noise_sigma_init: float = 0.30,
+        noise_sigma_min: float = 0.01,
         force_noise_sigma: bool = False,
         action_var_weight: float = 0.05,
         saturation_weight: float = 0.001,
@@ -285,12 +285,12 @@ class LocalDDPGAgent:
         self._noise_sigma_init = float(noise_sigma_init)
         self._noise_sigma = float(noise_sigma_init)
         self._noise_sigma_min = float(noise_sigma_min)
-        # 0.9999/step anneals 0.20->0.10 floor in ~7k steps (~14 rounds at
-        # ~490 train-steps/episode), leaving a longer exploitation tail. The
-        # init was lowered 0.30->0.20 to shorten the exploration phase under a
-        # tight round budget (the prior 0.99995 decay needed ~45 rounds and
-        # never sharpened). See memory: project-exploration-noise-gaussian.
-        self._noise_sigma_decay = 0.9999
+        # steps_to_floor = ln(sigma_min/sigma_init) / ln(sigma_decay)
+        # rounds_to_floor = steps_to_floor / Steps per round (Sim Time)
+        # steps_to_floor = 18,309
+        # rounds_to_floor = 30 rounds 
+
+        self._noise_sigma_decay = 0.99980
         # When the controller passed an explicit sigma (via --mlNoiseSigma),
         # the checkpoint's saved sigma must not override it on resume.
         self._force_noise_sigma = bool(force_noise_sigma)
@@ -962,7 +962,7 @@ class MLService:
         # Anti-collapse knobs. Defaults match LocalDDPGAgent's __init__ so an
         # older controller that doesn't send these fields gets the same
         # behaviour as a new one with default flags.
-        noise_min = float(msg.get("noise_sigma_min", 0.10))
+        noise_min = float(msg.get("noise_sigma_min", 0.01))
         var_weight = float(msg.get("action_var_weight", 0.05))
         sat_weight = float(msg.get("saturation_weight", 0.001))
         reset_actor_req = bool(msg.get("reset_actor", False))

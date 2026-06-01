@@ -13,19 +13,23 @@ TopoSpec BuildFatTreeK4Spec(const std::string& backboneQueue) {
   // initialEnergyJ, idlePowerW. idlePowerW is the powered-on idle draw the
   // node-sleep action can eliminate; modest per-tier starting points — tune as
   // needed (a slept switch contributes neither idle nor forwarding power).
+  // initialEnergyJ bumped ~1.5× vs. the original (core 1e4→1.5e4, agg 4e3→6e3,
+  // edge 2e3→3e3) for headroom: fat-tree's energy story is sleep/consolidation
+  // (idlePowerW is the lever), not node death, so DC bursts shouldn't drain a
+  // switch to the lifetime hinge prematurely. energyPerByteJ unchanged.
   for (uint32_t c = 0; c < 4; ++c) {
     spec.nodes.push_back(
-        {"core" + std::to_string(c), "tier1", "1Gbps", 2, 5e-7, 1e4, 2.0});
+        {"core" + std::to_string(c), "tier1", "1Gbps", 2, 5e-7, 1.5e4, 2.0});
   }
   for (uint32_t p = 0; p < 4; ++p) {
     spec.nodes.push_back({"agg" + std::to_string(p) + "_0", "tier2", "500Mbps",
-                          5, 8e-7, 4e3, 1.0});
+                          5, 8e-7, 6e3, 1.0});
     spec.nodes.push_back({"agg" + std::to_string(p) + "_1", "tier2", "500Mbps",
-                          5, 8e-7, 4e3, 1.0});
+                          5, 8e-7, 6e3, 1.0});
     spec.nodes.push_back(
-        {"edge" + std::to_string(p) + "_0", "edge", "100Mbps", 10, 1e-6, 2e3, 0.5});
+        {"edge" + std::to_string(p) + "_0", "edge", "100Mbps", 10, 1e-6, 3e3, 0.5});
     spec.nodes.push_back(
-        {"edge" + std::to_string(p) + "_1", "edge", "100Mbps", 10, 1e-6, 2e3, 0.5});
+        {"edge" + std::to_string(p) + "_1", "edge", "100Mbps", 10, 1e-6, 3e3, 0.5});
   }
 
   const double dKm = 200.0;

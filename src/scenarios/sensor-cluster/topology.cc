@@ -47,11 +47,14 @@ TopoSpec BuildSensorClusterSpec(const std::string& backboneQueue) {
   for (uint32_t c = 0; c < C; ++c) {
     for (uint32_t j = 0; j < S; ++j) {
       // Sensor relays: host-free, sleepable. They carry the cheap inter-cluster
-      // traffic by default, so a loaded sensor depletes mid-sim (~300 s at a few
-      // Mbps); an idle one never dies. energyPerByteJ/initialEnergyJ tuned so
-      // death is reachable under load within a 600 s sim but not instant.
+      // traffic by default, so a loaded sensor depletes mid-sim; an idle one
+      // never dies. energyPerByteJ/initialEnergyJ tuned (1.2e-6 / 2000 J) so a
+      // moderately loaded relay survives a 600 s sim and only a sustained
+      // heavy/crisis relay dies, in the back third — ~80–130 ML ticks (1 s) of
+      // descent through the 35%→10% lifetime-hinge band, vs. ~2.5 min to death
+      // under a flash crowd with the old 1.5e-6 / 1200 J values.
       spec.nodes.push_back({"s" + std::to_string(c) + "_" + std::to_string(j),
-                            "sensor", "1Gbps", 15, 1.5e-6, 1200.0, 0.1});
+                            "sensor", "1Gbps", 15, 1.2e-6, 2000.0, 0.1});
     }
   }
 
