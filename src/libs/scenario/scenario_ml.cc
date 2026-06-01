@@ -5,12 +5,8 @@ namespace ns3 {
 void MlOptions::Register(CommandLine& cmd) {
   cmd.AddValue("ml", "Enable FDRL agent", enabled);
   cmd.AddValue("mlIntervalS", "Agent period (s)", intervalS);
-  cmd.AddValue("mlActionScale", "Final |dW| fraction (after taper)",
+  cmd.AddValue("mlActionScale", "|dW| scale fraction (fixed action bound)",
                actionScale);
-  cmd.AddValue("mlActionScaleStart",
-               "Initial |dW| fraction (during taper)", actionScaleStart);
-  cmd.AddValue("mlTaperTicks", "Ticks over which action_scale tapers",
-               taperTicks);
   cmd.AddValue("mlPriority",
                "Reward preset: balanced | throughput | energy | custom",
                priority);
@@ -91,8 +87,6 @@ MlConfig MlOptions::BuildMlConfig(uint32_t seedIn) const {
   cfg.enabled = enabled;
   cfg.interval_s = intervalS;
   cfg.action_scale = actionScale;
-  cfg.action_scale_start = actionScaleStart;
-  cfg.taper_ticks = taperTicks;
   cfg.reward_alpha = alpha;
   cfg.reward_beta = beta;
   cfg.reward_gamma = gamma;

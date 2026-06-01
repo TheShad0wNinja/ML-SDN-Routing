@@ -2084,20 +2084,11 @@ double ZmqOpenFlowController::ComputeResidualEnergyStddev() const {
   return std::sqrt(var);
 }
 
-double ZmqOpenFlowController::CurrentActionScale() const {
-  // Linear taper from action_scale_start → action_scale over taper_ticks.
-  if (m_ml.taper_ticks == 0) return m_ml.action_scale;
-  if (m_mlTick >= m_ml.taper_ticks) return m_ml.action_scale;
-  double t = static_cast<double>(m_mlTick) / m_ml.taper_ticks;
-  return m_ml.action_scale_start +
-         (m_ml.action_scale - m_ml.action_scale_start) * t;
-}
-
 void ZmqOpenFlowController::ApplyDeltaCosts(const std::vector<double>& deltas) {
   size_t n = std::min(deltas.size(), m_mlLinkOrder.size());
-  double scale = CurrentActionScale();
+  double scale = m_ml.action_scale;
   // [ML-ACTION] anti-collapse diagnostic: mean/std/min/max over the raw
-  // pre-clamp action vector. Grep this line to confirm the actor is no
+  // pre-scale action vector. Grep this line to confirm the actor is no
   // longer outputting a constant: post-fix you should see std > 0.05.
   if (n > 0) {
     double aSum = 0.0, aSumSq = 0.0;
@@ -2131,25 +2122,19 @@ void ZmqOpenFlowController::ApplyDeltaCosts(const std::vector<double>& deltas) {
   bool anyChanged = false;
   double churnL1 = 0.0; // L1 means sum of vector = 1
   for (size_t i = 0; i < n; ++i) {
-    double d = deltas[i] - centerMean;
-    if (d > scale)
-      d = scale;
-    else if (d < -scale)
-      d = -scale;
+    // Map the centered deltas into the action scale bounds
+    double d = (deltas[i] - centerMean) * scale;
 
     auto [a, b] = m_mlLinkOrder[i];
     double prev = m_topology.GetLinkMlDelta(a, b);
+    // Get the absolute sum of the diff values
     churnL1 += std::abs(d - prev);
     if (std::abs(d - prev) > 1e-9) {
       m_topology.SetLinkMlDelta(a, b, d);
       anyChanged = true;
     }
   }
-  // Normalize against the analytic max swing: each delta is clamped to
-  // [-scale, +scale], so per-link swing maxes at 2·scale and L1 over all
-  // links at n·2·scale. Dividing puts churn in [0, 1], comparable to every
-  // other normalized term in ComputeMlReward. Stashed for the *next* tick:
-  // consequences of action a_t show up in observation s_{t+1}.
+  // Normalize the swing by finding maxSwing, everything going from - to +
   const double maxSwing = static_cast<double>(n) * 2.0 * scale;
   m_lastChurnNorm = (maxSwing > 0.0)
                         ? std::clamp(churnL1 / maxSwing, 0.0, 1.0)

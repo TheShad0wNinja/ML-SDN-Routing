@@ -78,11 +78,9 @@ struct MlConfig {
   bool enabled = false;  // If ML model is enabled or not
   double interval_s = 1.0;  // ML ticks for updating route weights
 
-  // Action-scale taper: |ΔW| starts at action_scale_start, tapers linearly
-  // over taper_ticks to action_scale. Big swings early, fine-tune late.
-  double action_scale_start = 0.30;  // initial |ΔW| during taper
-  double action_scale = 0.10;        // final |ΔW| as fraction of base cost
-  uint32_t taper_ticks = 400;        // ticks over which to taper
+  // ml_delta = scale · (centered tanh output) 
+  //a linear map into the physical [-scale, +scale] 
+  double action_scale = 0.5;
 
   // Reward weights //
   // Positive Goals
@@ -313,8 +311,6 @@ class ZmqOpenFlowController : public OFSwitch13Controller {
   // Calculate standard deviation of residual_energy_frac across energy-tracked
   // switches. Used by the reward (balance term) and the state payload.
   double ComputeResidualEnergyStddev() const;
-  // Returns action_scale once tapered.
-  double CurrentActionScale() const;
   // Applies the model new link weight deltas
   void ApplyDeltaCosts(const std::vector<double>& deltas);
   // Deterministic inactivity heuristic (replaces the old policy-driven sleep).

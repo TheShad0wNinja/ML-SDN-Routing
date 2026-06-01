@@ -13,9 +13,8 @@ namespace ns3 {
 struct MlOptions {
   bool enabled = false;
   double intervalS = 1.0;
-  double actionScale = 0.20;
-  double actionScaleStart = 0.40;
-  uint32_t taperTicks = 200;
+  // [-actionScale, +actionScale] the amount model's output changes
+  double actionScale = 0.5;
   std::string priority = "balanced";
   double alpha = 1.0, beta = 2.0, gamma = 1.5, delta = 1.0;
   double zeta = 0.5, eta = 1.5, theta = 1.0, kappa = 1.0;
