@@ -154,15 +154,15 @@ void ZmqOpenFlowController::SetMlConfig(const MlConfig& cfg) {
       m_ml.reward_theta = 1.0;
       m_ml.reward_kappa = 1.0;
       break;
-    case MlConfig::MlPriority::THROUGHPUT: 
+    case MlConfig::MlPriority::THROUGHPUT:
       m_ml.reward_alpha = 2.5;
       m_ml.reward_beta = 3.0;
-      m_ml.reward_gamma = 0.5;
-      m_ml.reward_delta = 1.0;
-      m_ml.reward_zeta = 0.2;
-      m_ml.reward_eta = 0.8;
-      m_ml.reward_theta = 0.5;
-      m_ml.reward_kappa = 1.5;
+      m_ml.reward_gamma = 0.3;   // power: small residual energy awareness
+      m_ml.reward_delta = 1.0;   // bottleneck util (congestion proxy)
+      m_ml.reward_zeta = 0.0;    // footprint OFF — anti-throughput
+      m_ml.reward_eta = 0.2;     // reserve-aware: was 0.8 (energy lever)
+      m_ml.reward_theta = 0.2;   // energy-balance: was 0.5 (energy lever)
+      m_ml.reward_kappa = 1.0;   // churn: was 1.5; keep < none-of-the-rewards
       break;
     case MlConfig::MlPriority::ENERGY:
       // Renormalise the six controllable energy sub-weights into 
